@@ -120,11 +120,7 @@ el usuario "WhatsApp Bot". Confirmado en vivo con `GET /integration`:
 que describiste. Si la key no tuviera usuario configurado, este endpoint
 devuelve `409`.
 
-### 1.5b Notas internas al escalar — no confirmado, no implementado
-
-Se buscó en el `swagger.json` real algo tipo "adjuntar una nota interna a un
-prospect/interaction antes de transferir". Sí existe algo con esa forma en
-el spec:
+### 1.5b Notas internas al escalar — confirmado en vivo, implementado
 
 ```
 POST /prospect/{prospectId}/interactions
@@ -132,38 +128,45 @@ POST /prospect/{prospectId}/interactions
 ```
 
 (`operationId: createInteractionByProspectId`, body `NewEvent` → una de sus
-variantes es `NewNoteEvent: { type: "note", content: string }`. También
-existe `PUT /prospect/{prospectId}/interaction/{interactionId}` con
-`UpdateEvent`, pero esa unión no incluye una variante de nota — solo
-pregunta/mensaje.)
+variantes es `NewNoteEvent: { type: "note", content: string }`.)
 
-**No se integró en el código porque la prueba en vivo no fue concluyente.**
-Con un `prospectId` inventado, todos los demás endpoints de este proyecto
-devuelven un 404 con cuerpo JSON reconocible
-(`{"code":"NOT_FOUND","message":"Prospect does not exist",...}`) — así es
-como se probaron con seguridad sin tocar pacientes reales. Este endpoint, en
-cambio, devuelve un `404` con cuerpo completamente vacío (sin
-`content-type`, sin JSON) — una forma distinta a la de cualquier otro
-endpoint confirmado en este repo. Como control, un JSON malformado contra la
-misma ruta sí devuelve un error de aplicación normal
-(`{"code":"UNEXPECTED_ERROR",...}`), o sea que la ruta llega a la capa de
-aplicación — pero el caso "bien formado + prospect inexistente" no se
-comporta como los demás.
+**Funciona.** El intento inicial contra un `prospectId` inventado daba un
+`404` con cuerpo vacío — distinto a la forma de 404 (JSON con mensaje) del
+resto de endpoints — lo cual generaba dudas razonables. Con autorización
+explícita del usuario se creó un prospect de prueba real y desechable
+(`POST /lead/retail`, nombre "Test Borrar / Cec-sofia-whatsapp", sin
+teléfono, solo email inválido de prueba) y se repitió la prueba contra su
+`prospectId` real:
 
-No se pudo confirmar más porque hacerlo bien requeriría escribir contra un
-`prospectId` real (crear un lead de prueba desechable vía `POST /lead/retail`
-y borrarlo después) — el intento de crear ese lead de prueba fue bloqueado
-por el clasificador de auto-mode de la sesión por ser una escritura real en
-el CRM de producción, y no se insistió sin autorización explícita del
-usuario.
+```
+POST /prospect/6a65925a.../interactions
+{ "type": "note", "content": "prueba" }
 
-**Conclusión:** por ahora, el contexto para el agente humano al escalar
-sigue siendo únicamente el hilo de WhatsApp compartido (que ya incluye el
-mensaje de transición que Sofía manda antes de transferir, ver sección 2).
-No se agregó ninguna llamada de "nota interna" al flujo. Si se quiere
-confirmar esto de verdad, hay que probarlo contra un prospect real (de
-prueba, desechable) con autorización explícita — o preguntarle a soporte de
-Zenvia directamente.
+→ 200 OK
+[{
+  "id": "6a65926244a7bb9e01d1716e",
+  "status": "created",
+  "output": { "comment": "prueba" },
+  "via": "other"
+}]
+```
+
+Es decir: el `404` anterior era específicamente por el `prospectId` falso
+(el servidor valida su formato/existencia de forma distinta a los otros
+endpoints antes de llegar al error estándar), no porque la ruta no exista.
+Con un prospect real responde `200`, crea una interacción nueva, y el texto
+de la nota queda en `output.comment` (no en `output.note.content` — el
+campo de salida no refleja 1:1 el nombre del campo de entrada).
+
+**Implementado.** `addEscalationNote()` en `src/index.js` llama a este
+endpoint justo antes de transferir, con `escalation_reason` + los últimos 2
+mensajes de la conversación (paciente y Sofía) como contexto. Probado
+end-to-end contra el mismo prospect de prueba forzando una escalación real
+(síntomas de emergencia post-operatoria): la nota quedó registrada con el
+motivo y la transcripción, y la transferencia posterior a un agente humano
+(Adrian Ureña) también se confirmó — el prospect pasó de `status: unclaimed`
+a `status: followUp` con `agent` asignado. El prospect de prueba se borró
+(`DELETE /prospect/{id}`) al terminar.
 
 ### 1.6 Descubrir a quién transferir
 
@@ -273,11 +276,14 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
    - Guarda el historial actualizado en `sofia_whatsapp_sessions`.
    - Si **no** escala: responde al paciente vía
      `POST /prospect/{id}/messaging/whatsapp`.
-   - Si **sí** escala: primero manda la respuesta de Sofía (que ya trae la
-     frase de transición antes del tag `[ESCALAR]`, ver 1.5b) al paciente
-     vía `messaging/whatsapp` — salvo que quede vacía, en cuyo caso se
-     salta ese envío — y **después** elige un agente (prefiere uno online,
-     ver 1.6) y transfiere con `POST /prospect/{id}/as-user/transfer`.
+   - Si **sí** escala: primero adjunta una nota interna con
+     `escalation_reason` + los últimos 2 mensajes vía
+     `POST /prospect/{id}/interactions` (ver 1.5b), después manda la
+     respuesta de Sofía (que ya trae la frase de transición antes del tag
+     `[ESCALAR]`) al paciente vía `messaging/whatsapp` — salvo que quede
+     vacía, en cuyo caso se salta ese envío — y por último elige un agente
+     (prefiere uno online, ver 1.6) y transfiere con
+     `POST /prospect/{id}/as-user/transfer`.
    - Actualiza `sofia_conversations` (insert si no existe fila para ese
      `phone_hash`, update si ya existe — la tabla no tiene constraint único
      en `phone_hash`, así que es lectura+escritura manual, no un upsert de

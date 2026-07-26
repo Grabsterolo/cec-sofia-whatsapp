@@ -175,6 +175,9 @@ async function processInboundMessage({ text, phone, prospectId, agentId }, env) 
   await saveSession(env, phoneHash, updatedHistory);
 
   if (escalated) {
+    // Give the human agent context before they open the chat cold.
+    await addEscalationNote(env, prospectId, escalation_reason, updatedHistory.slice(-2));
+
     // Sofía already wrote a transition line before the [ESCALAR] tag (e.g.
     // "nuestro equipo de asesores le va a estar contactando") — send it
     // before handing off, so the patient isn't left hanging. Skip only if
@@ -418,6 +421,32 @@ async function sendWhatsappMessage(env, prospectId, content) {
   );
   if (!res.ok) {
     console.error("sendWhatsappMessage failed", res.status, await res.text());
+  }
+  return res;
+}
+
+// Attaches a "note"-type interaction to the prospect (POST
+// /prospect/{id}/interactions, live-confirmed — see README 1.5b) so the
+// human agent has context before opening the chat. Non-fatal on failure:
+// missing internal context is worse than blocking the handoff.
+async function addEscalationNote(env, prospectId, escalationReason, recentMessages) {
+  const transcript = recentMessages
+    .map((m) => `${m.role === "user" ? "Paciente" : "Sofía"}: ${m.content}`)
+    .join("\n");
+  const content =
+    `Escalado por Sofía (WhatsApp Bot). Motivo: ${escalationReason || "no especificado"}\n\n` +
+    transcript;
+
+  const res = await fetch(
+    `${ZENVIA_API_BASE}/prospect/${prospectId}/interactions?api-key=${env.ZENVIA_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "note", content }),
+    }
+  );
+  if (!res.ok) {
+    console.error("addEscalationNote failed", res.status, await res.text());
   }
   return res;
 }
