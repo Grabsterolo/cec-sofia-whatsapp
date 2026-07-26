@@ -137,6 +137,15 @@ function extractInboundFromInteraction(interaction) {
 // ---------------------------------------------------------------------------
 
 async function processInboundMessage({ text, phone, prospectId, agentId }, env) {
+  // Emergency kill switch: sofia_config.whatsapp_enabled, toggled from the
+  // dashboard. Checked before anything else — no reply, no claim, no
+  // sofia_conversations update — so it's an immediate global pause.
+  const sofiaConfig = await loadSofiaConfig(env);
+  if (!sofiaConfig.whatsapp_enabled) {
+    console.log(`Skipping inbound message: Sofía WhatsApp is paused (whatsapp_enabled=false), prospect ${prospectId}`);
+    return;
+  }
+
   // A human already has this conversation (Adrian, Angie, Ingrid, or
   // Jordan) — don't touch it at all: no reply, no claim, no
   // sofia_conversations update. Only proceed when the interaction is
@@ -186,7 +195,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId }, env) 
     return;
   }
 
-  const { system, knowledge_base } = await loadSofiaConfig(env);
+  const { system, knowledge_base } = sofiaConfig;
   const chunks = await ragSearch(env, history);
   const systemBlocks = buildSystemBlocks(system, knowledge_base, chunks);
 
@@ -247,7 +256,7 @@ function parseEscalation(rawText) {
 
 async function loadSofiaConfig(env) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_config?select=system_prompt,knowledge_base&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_config?select=system_prompt,knowledge_base,whatsapp_enabled&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -255,11 +264,12 @@ async function loadSofiaConfig(env) {
       },
     }
   );
-  if (!res.ok) return { system: "", knowledge_base: "" };
+  if (!res.ok) return { system: "", knowledge_base: "", whatsapp_enabled: true };
   const data = await res.json();
   return {
     system: data[0]?.system_prompt || "",
     knowledge_base: data[0]?.knowledge_base || "",
+    whatsapp_enabled: data[0]?.whatsapp_enabled ?? true,
   };
 }
 

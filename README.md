@@ -270,6 +270,12 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
 2. Parsea el body defensivamente (ver 1.7) y extrae mensajes entrantes de
    WhatsApp.
 3. Por cada mensaje:
+   - **Interruptor de emergencia:** lee `sofia_config.whatsapp_enabled`
+     (boolean, default `true` — toggle "Sofía al aire / Sofía en pausa" en
+     el dashboard de `cecmarketing`, sección Configurar a Sofía). Si es
+     `false`, se ignora el mensaje por completo antes de cualquier otra
+     cosa — ni respuesta, ni reclamo, ni escritura en Supabase, solo un
+     `console.log`. Es la primera revisión de todo el flujo.
    - **Si un humano ya tiene la conversación** (`agentId` de la interacción
      coincide con Adrian, Angie, Ingrid o Jordan): se ignora por completo —
      sin responder, sin reclamar, sin tocar `sofia_conversations`, solo un
