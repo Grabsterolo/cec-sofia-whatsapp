@@ -281,24 +281,35 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
      sin responder, sin reclamar, sin tocar `sofia_conversations`, solo un
      `console.log` breve. Solo se sigue procesando si `agentId` es
      `null`/sin asignar o ya es el de Sofia CEC.
+   - Hashea el teléfono con SHA-256 → `phone_hash` y consulta
+     `sofia_conversations` (`message_count`, `escalated`) para ese hash en
+     una sola llamada (`getConversationState()`).
+   - **Freno definitivo por conversación ya escalada:** si `escalated` ya
+     es `true` (por decisión de Sofía con `[ESCALAR]` o por haber llegado
+     antes al límite de turnos), se ignora el mensaje por completo — sin
+     RAG, sin Claude, sin reclamo, sin respuesta, solo un `console.log`.
+     No depende de que Zenvia ya haya reasignado `agentId` a un humano de
+     verdad — el transfer al grupo (ver 1.5c) no necesariamente lo hace de
+     inmediato, así que este chequeo cubre ese hueco.
    - Reclama la conversación como Sofia CEC (`POST
      /prospect/{id}/as-user/transfer` con `user` = `SOFIA_AGENT_ID`) apenas
      llega, salvo que la interacción ya venga asignada a Sofia CEC — así no
      queda mezclada en el pool "Sin asignar" de Zenvia mientras Sofía la
      atiende. Se lanza en paralelo con el resto del procesamiento, no
      bloquea.
-   - Hashea el teléfono con SHA-256 → `phone_hash`.
    - Lee/crea la sesión en `sofia_whatsapp_sessions` (upsert por
      `phone_hash`, que sí tiene constraint único).
    - Agrega el mensaje del paciente al historial, recorta a los últimos
      20 mensajes (~10 turnos) antes de mandarlo a Claude.
-   - **Límite de 10 turnos:** consulta `message_count` en
-     `sofia_conversations` para ese `phone_hash`. Si ya es `>= 10`, **no
-     llama a Claude** — manda un mensaje fijo ("Ya llevamos varios mensajes
-     conversando — le voy a pasar con nuestro equipo para que le ayuden
-     mejor con esto."), transfiere al grupo (ver 1.5c) y guarda
-     `escalated: true`, `escalation_reason: "límite de mensajes alcanzado"`.
-     Corta el flujo ahí.
+   - **Límite de 10 turnos:** si `message_count` (ya obtenido arriba) es
+     `>= 10`, **no llama a Claude** — manda uno de 3 mensajes fijos elegido
+     al azar (`pickMessageLimitReply()`, tono cálido: "Quiero asegurarme de
+     que le den la mejor ayuda posible con esto...", etc. — ver
+     `MESSAGE_LIMIT_REPLIES` en `src/index.js`), transfiere al grupo (ver
+     1.5c) y guarda `escalated: true`,
+     `escalation_reason: "límite de mensajes alcanzado"`. Corta el flujo
+     ahí — y de paso activa el freno del punto anterior para el resto de
+     la conversación.
    - Carga `sofia_config` (system_prompt + knowledge_base) desde Supabase.
    - RAG: embedding con `text-embedding-3-small` de los últimos 2 mensajes
      del usuario → `match_sofia_chunks` (top 6, threshold 0.5) → si no hay

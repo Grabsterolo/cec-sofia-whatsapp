@@ -26,8 +26,15 @@ const HUMAN_AGENT_IDS = new Set(HUMAN_AGENTS.map((a) => a.id));
 const MAX_HISTORY_MESSAGES = 20; // ~10 user/assistant turns
 const MAX_CONVERSATION_TURNS = 10; // sofia_conversations.message_count ceiling before forcing escalation
 
-const MESSAGE_LIMIT_REPLY =
-  "Ya llevamos varios mensajes conversando — le voy a pasar con nuestro equipo para que le ayuden mejor con esto.";
+const MESSAGE_LIMIT_REPLIES = [
+  "Quiero asegurarme de que le den la mejor ayuda posible con esto, así que la voy a poner en contacto con nuestro equipo — en breve le escriben.",
+  "Para que le puedan dar seguimiento como se merece, la voy a poner en contacto con nuestro equipo — en un momentito le contactan.",
+  "Con gusto la conecto con nuestro equipo para que le ayuden mejor con esto — en breve le escriben.",
+];
+
+function pickMessageLimitReply() {
+  return MESSAGE_LIMIT_REPLIES[Math.floor(Math.random() * MESSAGE_LIMIT_REPLIES.length)];
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -157,6 +164,19 @@ async function processInboundMessage({ text, phone, prospectId, agentId }, env) 
     return;
   }
 
+  const phoneHash = await sha256Hex(phone);
+  const conversationState = await getConversationState(env, phoneHash);
+
+  // Hard stop once a conversation has been escalated — by Sofía's own
+  // [ESCALAR] decision or by hitting the message limit below — regardless
+  // of whether Zenvia has actually reassigned agentId to a human yet (the
+  // group transfer doesn't necessarily do that immediately). No RAG, no
+  // Claude, no claim, no reply.
+  if (conversationState.escalated) {
+    console.log(`Skipping inbound message: conversation for prospect ${prospectId} is already escalated`);
+    return;
+  }
+
   // Claim the conversation as Sofía right away so it leaves the shared "Sin
   // asignar" pool while she's handling it, instead of sitting there mixed
   // in with conversations that actually need a human. Skip the call
@@ -169,26 +189,24 @@ async function processInboundMessage({ text, phone, prospectId, agentId }, env) 
       ? transferProspectToAgent(env, prospectId, SOFIA_AGENT_ID)
       : Promise.resolve();
 
-  const phoneHash = await sha256Hex(phone);
-
   const session = await getOrCreateSession(env, phoneHash);
   const history = [...session.messages, { role: "user", content: text }].slice(
     -MAX_HISTORY_MESSAGES
   );
 
-  const messageCount = await getConversationMessageCount(env, phoneHash);
-  if (messageCount >= MAX_CONVERSATION_TURNS) {
+  if (conversationState.messageCount >= MAX_CONVERSATION_TURNS) {
+    const limitReply = pickMessageLimitReply();
     await claimPromise;
-    await sendWhatsappMessage(env, prospectId, MESSAGE_LIMIT_REPLY);
+    await sendWhatsappMessage(env, prospectId, limitReply);
     await transferProspectToGroup(env, prospectId, CEC_GROUP_ID);
 
-    const updatedHistory = [...history, { role: "assistant", content: MESSAGE_LIMIT_REPLY }].slice(
+    const updatedHistory = [...history, { role: "assistant", content: limitReply }].slice(
       -MAX_HISTORY_MESSAGES
     );
     await saveSession(env, phoneHash, updatedHistory);
     await upsertConversation(env, {
       phoneHash,
-      lastMessage: MESSAGE_LIMIT_REPLY,
+      lastMessage: limitReply,
       escalated: true,
       escalationReason: "límite de mensajes alcanzado",
     });
@@ -442,9 +460,9 @@ async function saveSession(env, phoneHash, messages) {
   });
 }
 
-async function getConversationMessageCount(env, phoneHash) {
+async function getConversationState(env, phoneHash) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count,escalated&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -452,9 +470,12 @@ async function getConversationMessageCount(env, phoneHash) {
       },
     }
   );
-  if (!res.ok) return 0;
+  if (!res.ok) return { messageCount: 0, escalated: false };
   const rows = await res.json();
-  return rows[0]?.message_count ?? 0;
+  return {
+    messageCount: rows[0]?.message_count ?? 0,
+    escalated: rows[0]?.escalated ?? false,
+  };
 }
 
 // sofia_conversations has no unique constraint on phone_hash (only on `id`),
