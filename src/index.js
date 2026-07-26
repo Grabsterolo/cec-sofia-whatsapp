@@ -8,6 +8,11 @@ const WHATSAPP_CHANNEL = "whatsapp";
 // Not secret — confirmed live via GET /groups.
 const CEC_GROUP_ID = "620bdb7ddc95c70003482762";
 
+// WhatsApp Bot's own agent ID (GET /as-user/transfer, live-confirmed) — same
+// user the integration acts as. Used to claim a conversation out of the
+// "Sin asignar" pool the moment Sofía picks it up.
+const WHATSAPP_BOT_AGENT_ID = "624353d6ed44c7429615e36e";
+
 // Human agents eligible for escalation transfer (GET /as-user/transfer, live-confirmed).
 // Excludes the bot accounts (WhatsApp Bot, FB Messenger Bot, Instagram Bot).
 const HUMAN_AGENTS = [
@@ -117,14 +122,28 @@ function extractInboundFromInteraction(interaction) {
   const prospectId = interaction.prospectId;
   if (!text || !phone || !prospectId) return null;
 
-  return { text, phone, prospectId, interactionId: interaction.id };
+  const agentId = interaction.agentId ?? interaction.agent?.id ?? null;
+
+  return { text, phone, prospectId, interactionId: interaction.id, agentId };
 }
 
 // ---------------------------------------------------------------------------
 // Core processing
 // ---------------------------------------------------------------------------
 
-async function processInboundMessage({ text, phone, prospectId }, env) {
+async function processInboundMessage({ text, phone, prospectId, agentId }, env) {
+  // Claim the conversation as WhatsApp Bot right away so it leaves the
+  // shared "Sin asignar" pool while Sofía is handling it, instead of sitting
+  // there mixed in with conversations that actually need a human. Skip the
+  // call entirely when the interaction is already assigned to WhatsApp Bot
+  // (the common case after the first message in a conversation) to avoid an
+  // unnecessary transfer on every turn. Kicked off here and awaited later so
+  // it runs alongside the RAG + Claude calls instead of blocking them.
+  const claimPromise =
+    agentId !== WHATSAPP_BOT_AGENT_ID
+      ? transferProspectToAgent(env, prospectId, WHATSAPP_BOT_AGENT_ID)
+      : Promise.resolve();
+
   const phoneHash = await sha256Hex(phone);
 
   const session = await getOrCreateSession(env, phoneHash);
@@ -137,6 +156,12 @@ async function processInboundMessage({ text, phone, prospectId }, env) {
   const systemBlocks = buildSystemBlocks(system, knowledge_base, chunks);
 
   const claudeData = await callClaude(env, systemBlocks, history);
+
+  // Make sure the claim call (kicked off above) has actually finished before
+  // this invocation ends — Workers don't guarantee in-flight fetches
+  // complete once the handler returns without an explicit await.
+  await claimPromise;
+
   // claude-sonnet-5 returns extended thinking by default, so content[0] is
   // often a {type: "thinking"} block rather than the reply — find the text
   // block explicitly instead of assuming it's first.
