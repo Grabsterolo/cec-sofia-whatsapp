@@ -143,7 +143,7 @@ function extractInboundFromInteraction(interaction) {
 // Core processing
 // ---------------------------------------------------------------------------
 
-async function processInboundMessage({ text, phone, prospectId, agentId }, env) {
+async function processInboundMessage({ text, phone, prospectId, agentId, interactionId }, env) {
   // Emergency kill switch: sofia_config.whatsapp_enabled, toggled from the
   // dashboard. Checked before anything else — no reply, no claim, no
   // sofia_conversations update — so it's an immediate global pause.
@@ -153,28 +153,37 @@ async function processInboundMessage({ text, phone, prospectId, agentId }, env) 
     return;
   }
 
-  // A human already has this conversation (Adrian, Angie, Ingrid, or
-  // Jordan) — don't touch it at all: no reply, no claim, no
-  // sofia_conversations update. Only proceed when the interaction is
-  // unassigned (null) or already assigned to Sofía herself.
-  if (agentId && HUMAN_AGENT_IDS.has(agentId)) {
-    console.log(
-      `Skipping inbound message: prospect ${prospectId} is already assigned to a human agent (${agentId})`
-    );
-    return;
-  }
-
   const phoneHash = await sha256Hex(phone);
   const conversationState = await getConversationState(env, phoneHash);
 
-  // Hard stop once a conversation has been escalated — by Sofía's own
-  // [ESCALAR] decision or by hitting the message limit below — regardless
-  // of whether Zenvia has actually reassigned agentId to a human yet (the
-  // group transfer doesn't necessarily do that immediately). No RAG, no
-  // Claude, no claim, no reply.
-  if (conversationState.escalated) {
-    console.log(`Skipping inbound message: conversation for prospect ${prospectId} is already escalated`);
-    return;
+  // Zenvia hands out a new interactionId whenever a closed conversation is
+  // reopened (or on a genuinely new contact, where there's no stored id at
+  // all — lastInteractionId is null). That's the real signal for "this is
+  // fresh territory for Sofía", not message_count or escalated on their
+  // own: a conversation can look "escalated" or "over the limit" from a
+  // previous, already-closed round and still deserve a clean slate now.
+  const isNewConversation = interactionId !== conversationState.lastInteractionId;
+
+  if (!isNewConversation) {
+    // Same open conversation as before — the existing gates apply.
+    // A human already has it (Adrian, Angie, Ingrid, or Jordan) — don't
+    // touch it at all: no reply, no claim, no sofia_conversations update.
+    if (agentId && HUMAN_AGENT_IDS.has(agentId)) {
+      console.log(
+        `Skipping inbound message: prospect ${prospectId} is already assigned to a human agent (${agentId})`
+      );
+      return;
+    }
+
+    // Hard stop once this (still-open) conversation has been escalated —
+    // by Sofía's own [ESCALAR] decision or by hitting the message limit
+    // below — regardless of whether Zenvia has actually reassigned agentId
+    // to a human yet (the group transfer doesn't necessarily do that
+    // immediately). No RAG, no Claude, no claim, no reply.
+    if (conversationState.escalated) {
+      console.log(`Skipping inbound message: conversation for prospect ${prospectId} is already escalated`);
+      return;
+    }
   }
 
   // Claim the conversation as Sofía right away so it leaves the shared "Sin
@@ -184,6 +193,8 @@ async function processInboundMessage({ text, phone, prospectId, agentId }, env) 
   // case after the first message in a conversation) to avoid an
   // unnecessary transfer on every turn. Kicked off here and awaited later
   // so it runs alongside the RAG + Claude calls instead of blocking them.
+  // Only reached when we're actually going to process the message — both
+  // gates above return before this point when they trigger.
   const claimPromise =
     agentId !== SOFIA_AGENT_ID
       ? transferProspectToAgent(env, prospectId, SOFIA_AGENT_ID)
@@ -194,7 +205,12 @@ async function processInboundMessage({ text, phone, prospectId, agentId }, env) 
     -MAX_HISTORY_MESSAGES
   );
 
-  if (conversationState.messageCount >= MAX_CONVERSATION_TURNS) {
+  // A new/reopened conversation starts its turn count from zero, even if
+  // the stored row still has a high count or escalated=true from the
+  // previous (closed) round — that state belongs to the old interaction.
+  const effectiveMessageCount = isNewConversation ? 0 : conversationState.messageCount;
+
+  if (effectiveMessageCount >= MAX_CONVERSATION_TURNS) {
     const limitReply = pickMessageLimitReply();
     await claimPromise;
     await sendWhatsappMessage(env, prospectId, limitReply);
@@ -209,6 +225,8 @@ async function processInboundMessage({ text, phone, prospectId, agentId }, env) 
       lastMessage: limitReply,
       escalated: true,
       escalationReason: "límite de mensajes alcanzado",
+      interactionId,
+      resetCounters: isNewConversation,
     });
     return;
   }
@@ -257,6 +275,8 @@ async function processInboundMessage({ text, phone, prospectId, agentId }, env) 
     lastMessage: reply,
     escalated,
     escalationReason: escalation_reason,
+    interactionId,
+    resetCounters: isNewConversation,
   });
 }
 
@@ -462,7 +482,7 @@ async function saveSession(env, phoneHash, messages) {
 
 async function getConversationState(env, phoneHash) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count,escalated&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count,escalated,last_interaction_id&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -470,17 +490,28 @@ async function getConversationState(env, phoneHash) {
       },
     }
   );
-  if (!res.ok) return { messageCount: 0, escalated: false };
+  if (!res.ok) return { messageCount: 0, escalated: false, lastInteractionId: null };
   const rows = await res.json();
   return {
     messageCount: rows[0]?.message_count ?? 0,
     escalated: rows[0]?.escalated ?? false,
+    lastInteractionId: rows[0]?.last_interaction_id ?? null,
   };
 }
 
 // sofia_conversations has no unique constraint on phone_hash (only on `id`),
 // so this does a manual read-then-write instead of a PostgREST upsert.
-async function upsertConversation(env, { phoneHash, lastMessage, escalated, escalationReason }) {
+// resetCounters is set for a brand-new/reopened interaction (see
+// processInboundMessage): message_count starts fresh from 0 instead of
+// continuing the old (closed) conversation's count.
+async function upsertConversation(env, {
+  phoneHash,
+  lastMessage,
+  escalated,
+  escalationReason,
+  interactionId,
+  resetCounters,
+}) {
   const headers = {
     apikey: env.SUPABASE_SERVICE_ROLE_KEY,
     Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
@@ -493,6 +524,8 @@ async function upsertConversation(env, { phoneHash, lastMessage, escalated, esca
   );
   const existing = existingRes.ok ? await existingRes.json() : [];
 
+  const baselineMessageCount = resetCounters ? 0 : existing[0]?.message_count ?? 0;
+
   if (existing[0]) {
     await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_conversations?id=eq.${existing[0].id}`, {
       method: "PATCH",
@@ -501,7 +534,8 @@ async function upsertConversation(env, { phoneHash, lastMessage, escalated, esca
         last_message: lastMessage,
         escalated,
         escalation_reason: escalationReason,
-        message_count: (existing[0].message_count ?? 0) + 1,
+        message_count: baselineMessageCount + 1,
+        last_interaction_id: interactionId,
       }),
     });
   } else {
@@ -515,6 +549,7 @@ async function upsertConversation(env, { phoneHash, lastMessage, escalated, esca
         escalated,
         escalation_reason: escalationReason,
         message_count: 1,
+        last_interaction_id: interactionId,
       }),
     });
   }

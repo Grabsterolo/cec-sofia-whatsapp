@@ -276,40 +276,59 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
      `false`, se ignora el mensaje por completo antes de cualquier otra
      cosa — ni respuesta, ni reclamo, ni escritura en Supabase, solo un
      `console.log`. Es la primera revisión de todo el flujo.
-   - **Si un humano ya tiene la conversación** (`agentId` de la interacción
-     coincide con Adrian, Angie, Ingrid o Jordan): se ignora por completo —
-     sin responder, sin reclamar, sin tocar `sofia_conversations`, solo un
-     `console.log` breve. Solo se sigue procesando si `agentId` es
-     `null`/sin asignar o ya es el de Sofia CEC.
    - Hashea el teléfono con SHA-256 → `phone_hash` y consulta
-     `sofia_conversations` (`message_count`, `escalated`) para ese hash en
-     una sola llamada (`getConversationState()`).
-   - **Freno definitivo por conversación ya escalada:** si `escalated` ya
-     es `true` (por decisión de Sofía con `[ESCALAR]` o por haber llegado
-     antes al límite de turnos), se ignora el mensaje por completo — sin
-     RAG, sin Claude, sin reclamo, sin respuesta, solo un `console.log`.
-     No depende de que Zenvia ya haya reasignado `agentId` a un humano de
-     verdad — el transfer al grupo (ver 1.5c) no necesariamente lo hace de
-     inmediato, así que este chequeo cubre ese hueco.
+     `sofia_conversations` (`message_count`, `escalated`,
+     `last_interaction_id`) para ese hash en una sola llamada
+     (`getConversationState()`).
+   - **¿Conversación nueva o reabierta?** Zenvia asigna un `interactionId`
+     nuevo cada vez que una conversación cerrada se reabre (o de entrada,
+     en un contacto nuevo, donde no hay `last_interaction_id` guardado
+     todavía). Esa es la señal real de "esto es territorio nuevo para
+     Sofía" — no `message_count` ni `escalated` por sí solos, porque esos
+     campos pueden venir de una ronda anterior ya cerrada. Si el
+     `interactionId` entrante es distinto al `last_interaction_id`
+     guardado (`isNewConversation`), se saltan por completo los dos
+     chequeos de abajo y se procesa como si fuera la primera vez —
+     `message_count` efectivo arranca en 0 para esta corrida, y el
+     `upsert` final resetea `escalated: false` (más lo que decida Sofía en
+     este turno) y reemplaza `message_count`/`last_interaction_id` con los
+     valores frescos.
+   - Si **no** es una conversación nueva (mismo `interactionId` que la vez
+     pasada), aplican los dos chequeos existentes, en orden:
+     - **Si un humano ya tiene la conversación** (`agentId` de la
+       interacción coincide con Adrian, Angie, Ingrid o Jordan): se ignora
+       por completo — sin responder, sin reclamar, sin tocar
+       `sofia_conversations`, solo un `console.log` breve.
+     - **Freno definitivo por conversación ya escalada:** si `escalated`
+       ya es `true` (por decisión de Sofía con `[ESCALAR]` o por haber
+       llegado antes al límite de turnos, dentro de esta misma
+       conversación abierta), se ignora el mensaje por completo — sin RAG,
+       sin Claude, sin reclamo, sin respuesta, solo un `console.log`. No
+       depende de que Zenvia ya haya reasignado `agentId` a un humano de
+       verdad — el transfer al grupo (ver 1.5c) no necesariamente lo hace
+       de inmediato, así que este chequeo cubre ese hueco mientras la
+       conversación siga con el mismo `interactionId`.
    - Reclama la conversación como Sofia CEC (`POST
      /prospect/{id}/as-user/transfer` con `user` = `SOFIA_AGENT_ID`) apenas
      llega, salvo que la interacción ya venga asignada a Sofia CEC — así no
      queda mezclada en el pool "Sin asignar" de Zenvia mientras Sofía la
      atiende. Se lanza en paralelo con el resto del procesamiento, no
-     bloquea.
+     bloquea. Solo se llega a este punto cuando sí vamos a procesar el
+     mensaje — ambos chequeos de arriba cortan el flujo antes si aplican.
    - Lee/crea la sesión en `sofia_whatsapp_sessions` (upsert por
      `phone_hash`, que sí tiene constraint único).
    - Agrega el mensaje del paciente al historial, recorta a los últimos
      20 mensajes (~10 turnos) antes de mandarlo a Claude.
-   - **Límite de 10 turnos:** si `message_count` (ya obtenido arriba) es
-     `>= 10`, **no llama a Claude** — manda uno de 3 mensajes fijos elegido
-     al azar (`pickMessageLimitReply()`, tono cálido: "Quiero asegurarme de
-     que le den la mejor ayuda posible con esto...", etc. — ver
+   - **Límite de 10 turnos:** si el `message_count` efectivo (0 si es
+     conversación nueva, el valor guardado si no) es `>= 10`, **no llama a
+     Claude** — manda uno de 3 mensajes fijos elegido al azar
+     (`pickMessageLimitReply()`, tono cálido: "Quiero asegurarme de que le
+     den la mejor ayuda posible con esto...", etc. — ver
      `MESSAGE_LIMIT_REPLIES` en `src/index.js`), transfiere al grupo (ver
      1.5c) y guarda `escalated: true`,
      `escalation_reason: "límite de mensajes alcanzado"`. Corta el flujo
      ahí — y de paso activa el freno del punto anterior para el resto de
-     la conversación.
+     esta conversación (mientras siga con el mismo `interactionId`).
    - Carga `sofia_config` (system_prompt + knowledge_base) desde Supabase.
    - RAG: embedding con `text-embedding-3-small` de los últimos 2 mensajes
      del usuario → `match_sofia_chunks` (top 6, threshold 0.5) → si no hay
@@ -341,7 +360,10 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
      `phone_hash`, update si ya existe — la tabla no tiene constraint único
      en `phone_hash`, así que es lectura+escritura manual, no un upsert de
      PostgREST): `last_message`, `escalated`, `escalation_reason`,
-     `message_count += 1`.
+     `last_interaction_id` (siempre se actualiza al `interactionId`
+     entrante), y `message_count` — que suma +1 sobre el valor guardado en
+     conversaciones normales, o arranca de 0+1 si `isNewConversation` era
+     `true` (`resetCounters` en `upsertConversation()`).
 4. Responde `200` a Zenvia siempre que el body haya parseado como JSON
    (incluso si el procesamiento downstream falló para algún mensaje) —
    evita que Zenvia reintente y duplique respuestas al paciente. Los errores
