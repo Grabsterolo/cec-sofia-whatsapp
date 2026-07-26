@@ -280,6 +280,10 @@ async function callClaude(env, systemBlocks, history) {
       // Promo pricing through 2026-08-31 — re-evaluate the model choice after that.
       model: "claude-sonnet-5",
       max_tokens: 1024,
+      // claude-sonnet-5 runs adaptive thinking by default, which put the
+      // reply text in content[1] instead of content[0] (see callers of
+      // this function). Disabling it keeps content[0] a plain text block.
+      thinking: { type: "disabled" },
       system: systemBlocks,
       messages: history,
     }),
