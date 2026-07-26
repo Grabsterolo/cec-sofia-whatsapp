@@ -24,10 +24,18 @@ No se hizo deploy ni se registró ningún webhook durante el desarrollo.
 
 Esta sección documenta la exploración en vivo hecha con la API key nueva
 (permisos: Webhooks, Read + Write Endpoints, Mensajes Conversacionales,
-Actuar en nombre de un usuario — usuario "WhatsApp Bot"). Todas las llamadas
-de exploración fueron **GET** (de solo lectura); no se modificó ni se envió
-ningún mensaje real a través de la cuenta de producción del CEC durante esta
-investigación.
+Actuar en nombre de un usuario — usuario "WhatsApp Bot" al momento de la
+exploración inicial). Todas las llamadas de exploración fueron **GET** (de
+solo lectura); no se modificó ni se envió ningún mensaje real a través de la
+cuenta de producción del CEC durante esta investigación.
+
+> **Cambio de identidad (2026-07-30):** el "Actuar como" de la integración
+> se cambió en Zenvia de "WhatsApp Bot" a un asesor real llamado
+> **"Sofia CEC"** (`6a65946e85b682f18c9d3dd7`). El código usa ese ID
+> (constante `SOFIA_AGENT_ID` en `src/index.js`); los ejemplos de esta
+> sección que mencionan "WhatsApp Bot" con el ID viejo
+> (`624353d6ed44c7429615e36e`) documentan cómo se descubrió el mecanismo, no
+> el estado actual — la forma de la API no cambió, solo qué agente es.
 
 ### 1.1 Producto y dominio
 
@@ -180,7 +188,8 @@ a `status: followUp` con `agent` asignado. El prospect de prueba se borró
   | Angie Barboza | `6244ca9a8dcc736594aa3f28` |
   | Ingrid Calderón | `6447ff23812154a143050118` |
   | Jordan Murillo | `620bdb7ddc95c7000348276c` |
-  | WhatsApp Bot 🤖 (no usar) | `624353d6ed44c7429615e36e` |
+  | WhatsApp Bot 🤖 (viejo, ya no se usa) | `624353d6ed44c7429615e36e` |
+  | Sofia CEC (identidad actual de la IA, no usar como destino de escalación) | `6a65946e85b682f18c9d3dd7` |
 
 - **Bonus no pedido pero útil:** `GET /group/{groupId}/agents/online` sí
   existe y devuelve quién está conectado ahora mismo (`{"agents":[...],
@@ -253,12 +262,12 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
 2. Parsea el body defensivamente (ver 1.7) y extrae mensajes entrantes de
    WhatsApp.
 3. Por cada mensaje:
-   - Reclama la conversación como WhatsApp Bot (`POST
-     /prospect/{id}/as-user/transfer` con `user` = el propio agente
-     WhatsApp Bot) apenas llega, salvo que la interacción ya venga asignada
-     a WhatsApp Bot — así no queda mezclada en el pool "Sin asignar" de
-     Zenvia mientras Sofía la atiende. Se lanza en paralelo con el resto del
-     procesamiento, no bloquea.
+   - Reclama la conversación como Sofia CEC (`POST
+     /prospect/{id}/as-user/transfer` con `user` = `SOFIA_AGENT_ID`) apenas
+     llega, salvo que la interacción ya venga asignada a Sofia CEC — así no
+     queda mezclada en el pool "Sin asignar" de Zenvia mientras Sofía la
+     atiende. Se lanza en paralelo con el resto del procesamiento, no
+     bloquea.
    - Hashea el teléfono con SHA-256 → `phone_hash`.
    - Lee/crea la sesión en `sofia_whatsapp_sessions` (upsert por
      `phone_hash`, que sí tiene constraint único).

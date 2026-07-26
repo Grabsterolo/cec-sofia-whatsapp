@@ -8,13 +8,13 @@ const WHATSAPP_CHANNEL = "whatsapp";
 // Not secret — confirmed live via GET /groups.
 const CEC_GROUP_ID = "620bdb7ddc95c70003482762";
 
-// WhatsApp Bot's own agent ID (GET /as-user/transfer, live-confirmed) — same
-// user the integration acts as. Used to claim a conversation out of the
-// "Sin asignar" pool the moment Sofía picks it up.
-const WHATSAPP_BOT_AGENT_ID = "624353d6ed44c7429615e36e";
+// Sofía's own agent ID in Zenvia ("Sofia CEC" — the "Actuar como" identity
+// the integration acts as, no longer "WhatsApp Bot"). Used to claim a
+// conversation out of the "Sin asignar" pool the moment Sofía picks it up.
+const SOFIA_AGENT_ID = "6a65946e85b682f18c9d3dd7";
 
 // Human agents eligible for escalation transfer (GET /as-user/transfer, live-confirmed).
-// Excludes the bot accounts (WhatsApp Bot, FB Messenger Bot, Instagram Bot).
+// Excludes Sofía's own agent identity and other bot accounts (FB Messenger Bot, Instagram Bot).
 const HUMAN_AGENTS = [
   { id: "65fdf6b1d40c421938223798", name: "Adrian Ureña" },
   { id: "6244ca9a8dcc736594aa3f28", name: "Angie Barboza" },
@@ -132,16 +132,16 @@ function extractInboundFromInteraction(interaction) {
 // ---------------------------------------------------------------------------
 
 async function processInboundMessage({ text, phone, prospectId, agentId }, env) {
-  // Claim the conversation as WhatsApp Bot right away so it leaves the
-  // shared "Sin asignar" pool while Sofía is handling it, instead of sitting
-  // there mixed in with conversations that actually need a human. Skip the
-  // call entirely when the interaction is already assigned to WhatsApp Bot
-  // (the common case after the first message in a conversation) to avoid an
-  // unnecessary transfer on every turn. Kicked off here and awaited later so
-  // it runs alongside the RAG + Claude calls instead of blocking them.
+  // Claim the conversation as Sofía right away so it leaves the shared "Sin
+  // asignar" pool while she's handling it, instead of sitting there mixed
+  // in with conversations that actually need a human. Skip the call
+  // entirely when the interaction is already assigned to Sofía (the common
+  // case after the first message in a conversation) to avoid an
+  // unnecessary transfer on every turn. Kicked off here and awaited later
+  // so it runs alongside the RAG + Claude calls instead of blocking them.
   const claimPromise =
-    agentId !== WHATSAPP_BOT_AGENT_ID
-      ? transferProspectToAgent(env, prospectId, WHATSAPP_BOT_AGENT_ID)
+    agentId !== SOFIA_AGENT_ID
+      ? transferProspectToAgent(env, prospectId, SOFIA_AGENT_ID)
       : Promise.resolve();
 
   const phoneHash = await sha256Hex(phone);
@@ -468,7 +468,7 @@ async function addEscalationNote(env, prospectId, escalationReason, recentMessag
     .map((m) => `${m.role === "user" ? "Paciente" : "Sofía"}: ${m.content}`)
     .join("\n");
   const content =
-    `Escalado por Sofía (WhatsApp Bot). Motivo: ${escalationReason || "no especificado"}\n\n` +
+    `Escalado por Sofía CEC. Motivo: ${escalationReason || "no especificado"}\n\n` +
     transcript;
 
   const res = await fetch(
