@@ -206,6 +206,88 @@ confirmado contra el `swagger.json` real). Cualquiera del equipo que esté
 disponible lo puede tomar desde el pool del grupo — ya no hace falta la
 lógica de "elegir quién está online" que existía antes.
 
+### 1.5d Investigación — ¿marcar "no leído" y/o etiquetas? (solo lectura del spec, nada implementado)
+
+Investigación puntual pedida para evaluar dos ideas antes de decidir si se
+integran. **Nada de esto está en el código todavía.**
+
+#### ¿"No leído" al transferir? — no existe, no hay nada parecido
+
+Búsqueda exhaustiva en el `swagger.json` real por `unread`, `read`, `seen`,
+`viewed`, `pending`, `flag` en nombres de campo y descripciones. **No existe
+ningún campo, endpoint o mecanismo para marcar un prospect/interaction como
+"no leído" o "pendiente de revisar".** El único uso de "read" en todo el
+spec es el scope `prospects:read` y el status `"read"` dentro del enum de
+estado de **entrega** de un mensaje de WhatsApp
+(`pending, sent, received, read, failed, deleted` — eso es si el paciente
+leyó el mensaje, no si el agente humano revisó la conversación).
+
+Dos mecanismos **adyacentes** que sí existen y podrían servir como
+alternativa, sin ser lo mismo que lo pedido:
+
+1. **`ProspectStatus`** (`unclaimed | new | followUp | processing |
+   archived`, ver `Prospect.status` en el spec) — cambia solo con las
+   transferencias/reclamos que ya hacemos. Confirmado en vivo en la prueba
+   de la ronda anterior: al transferir a un agente humano, el prospect pasó
+   de `unclaimed` a `followUp` con `agent` asignado. Es plausible que esto
+   ya sea lo que hace que la conversación se vea "pendiente" en el panel de
+   Zenvia — no confirmado visualmente, habría que revisar el panel.
+2. **`POST /apps/notifications`** (`operationId: sendNotification`, scope
+   `notifications` — ya habilitado en la key) — manda una notificación push
+   real al panel/app de Zenvia, dirigida a un usuario puntual o a un rol
+   (`owner | agent | admin`), en Android/iOS/desktop:
+   ```
+   POST /apps/notifications?api-key=...
+   {
+     "type": "string (libre)",
+     "target": { "user": ["<agentId>", ...] } // o { "role": ["agent"] }
+     "platforms": { "android": {}, "ios": {}, "desktop": {} }
+   }
+   ```
+   Esto sí podría usarse para "avisar activamente" al transferir — no es un
+   marcador persistente de "no leído", es una notificación push puntual.
+
+#### ¿Etiquetas/tags sobre un prospect? — sí existe, y sí es de escritura
+
+```
+POST /prospect/{prospectId}/as-user/label?api-key=...
+{ "label": "<key de una etiqueta existente>" }
+
+→ 200, devuelve el Prospect actualizado
+```
+
+- `operationId: labelProspect`, scope `integration:act-as-user` (ya
+  habilitado en la key, mismo scope que usamos para reclamar/transferir).
+- El valor de `label` no es texto libre — tiene que ser el `key` de una
+  etiqueta ya configurada en la cuenta. Para verla:
+  ```
+  GET /as-user/labels?api-key=...
+  → [{ "key": "cold", "name": "Frío" }, { "key": "hot", "name": "Caliente" }, ...]
+  ```
+  Se confirmó en vivo (llamada de solo lectura, sin tocar ningún prospect)
+  — la cuenta del CEC tiene **~80 etiquetas configuradas**, casi todas de
+  interés/procedimiento para marketing y seguimiento comercial: temperatura
+  de lead (`cold`/`warm`/`hot` → Frío/Tibio/Caliente), procedimientos
+  específicos (`bodytite`, `morpheus`, `otoplastia`, `radiesse`,
+  `toxinaBotulinica`, etc.), doctores (`drHerrera`, `controlDrSolis`...),
+  y algunas operativas (`datosIncorrectos`, `precio`, `correo`). **No hay
+  ninguna etiqueta existente con semántica de "pendiente de revisar" o
+  similar** — si se quisiera usar esto para eso, habría que pedirle al
+  equipo que cree una etiqueta nueva (ej. "Revisar — Sofía") desde el panel
+  de Zenvia, porque las etiquetas no se crean por API, solo se **aplican**
+  las que ya existen (no se encontró un `POST` para crear/gestionar
+  etiquetas, solo `GET /as-user/labels` para listarlas y `POST .../label`
+  para aplicar una a un prospect puntual).
+
+Modelos legacy `Category`/`CategoriesByIndustry` (del client PHP viejo,
+ver sección 1 más arriba): en el spec actual solo sobrevive `Category`
+(`Prospect.category`, un string de solo lectura sobre el prospect —
+"unique name identifier of the prospect category", ligado a la creación
+del lead vía `POST /lead/*`, no algo que se pueda cambiar después vía API
+sobre un prospect existente) y `GET /leads/categories` (categorías
+disponibles para creación de leads, no para etiquetar prospects ya
+existentes). `CategoriesByIndustry` ya no aparece en el spec actual.
+
 ### 1.7 Forma del payload del webhook (⚠️ no confirmada al 100%)
 
 Zenvia **no publica** el schema del payload que empuja a la `callback_url`
