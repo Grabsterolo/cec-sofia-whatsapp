@@ -1,0 +1,11 @@
+name = "cec-sofia-whatsapp"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+# Secrets (set manually, never in this file or in git):
+#   wrangler secret put ZENVIA_API_KEY
+#   wrangler secret put SUPABASE_URL
+#   wrangler secret put SUPABASE_SERVICE_ROLE_KEY
+#   wrangler secret put OPENAI_API_KEY
+#   wrangler secret put ANTHROPIC_API_KEY
+#   wrangler secret put WEBHOOK_SHARED_SECRET   # optional, see README
