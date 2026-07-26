@@ -233,19 +233,39 @@ alternativa, sin ser lo mismo que lo pedido:
    ya sea lo que hace que la conversación se vea "pendiente" en el panel de
    Zenvia — no confirmado visualmente, habría que revisar el panel.
 2. **`POST /apps/notifications`** (`operationId: sendNotification`, scope
-   `notifications` — ya habilitado en la key) — manda una notificación push
-   real al panel/app de Zenvia, dirigida a un usuario puntual o a un rol
-   (`owner | agent | admin`), en Android/iOS/desktop:
+   `notifications`) — manda una notificación push real al panel/app de
+   Zenvia, dirigida a un usuario puntual o a un rol (`owner | agent |
+   admin`), en Android/iOS/desktop:
    ```
    POST /apps/notifications?api-key=...
    {
      "type": "string (libre)",
      "target": { "user": ["<agentId>", ...] } // o { "role": ["agent"] }
-     "platforms": { "android": {}, "ios": {}, "desktop": {} }
+     "platforms": { "android": {...}, "ios": {...}, "desktop": {...} }
    }
    ```
-   Esto sí podría usarse para "avisar activamente" al transferir — no es un
-   marcador persistente de "no leído", es una notificación push puntual.
+   El spec deja `android`/`ios`/`desktop` como objetos completamente
+   abiertos, sin propiedades documentadas — no hay forma de confirmar el
+   formato exacto del contenido solo leyendo el spec.
+
+   **⚠️ Probado en vivo (con autorización explícita, `target.user` con un
+   ObjectId inexistente — mismo truco que con los prospects de prueba, no
+   le llegó nada a nadie real) y actualmente no funciona, sin importar el
+   payload:**
+   ```
+   400 { "code": "UNEXPECTED_ERROR", "message": "This app does not have the
+   permissions to send notifications", "summary": "ValidationError" }
+   ```
+   Esto **no es un error de formato** — es un permiso a nivel de la
+   integración/app en Zenvia, distinto del scope `notifications` de la API
+   key (que es el que usa la suscripción a webhooks, una función totalmente
+   distinta que coincide de nombre por casualidad). Para que esto funcione
+   de verdad, la integración del CEC necesitaría estar registrada como
+   "Custom App" con permiso de notificaciones desde el panel de Zenvia —
+   eso no se puede hacer por API, es una acción manual del lado de Zenvia.
+   Mientras tanto, cualquier llamada a este endpoint va a fallar siempre
+   con el mismo 400, así que si se integra debe ser estrictamente
+   best-effort (ver 1.5e).
 
 #### ¿Etiquetas/tags sobre un prospect? — sí existe, y sí es de escritura
 
@@ -265,12 +285,8 @@ POST /prospect/{prospectId}/as-user/label?api-key=...
   → [{ "key": "cold", "name": "Frío" }, { "key": "hot", "name": "Caliente" }, ...]
   ```
   Se confirmó en vivo (llamada de solo lectura, sin tocar ningún prospect)
-  — la cuenta del CEC tiene **~80 etiquetas configuradas**, casi todas de
-  interés/procedimiento para marketing y seguimiento comercial: temperatura
-  de lead (`cold`/`warm`/`hot` → Frío/Tibio/Caliente), procedimientos
-  específicos (`bodytite`, `morpheus`, `otoplastia`, `radiesse`,
-  `toxinaBotulinica`, etc.), doctores (`drHerrera`, `controlDrSolis`...),
-  y algunas operativas (`datosIncorrectos`, `precio`, `correo`). **No hay
+  — la cuenta del CEC tiene **77 etiquetas configuradas**, casi todas de
+  interés/procedimiento para marketing y seguimiento comercial. **No hay
   ninguna etiqueta existente con semántica de "pendiente de revisar" o
   similar** — si se quisiera usar esto para eso, habría que pedirle al
   equipo que cree una etiqueta nueva (ej. "Revisar — Sofía") desde el panel
@@ -278,6 +294,95 @@ POST /prospect/{prospectId}/as-user/label?api-key=...
   las que ya existen (no se encontró un `POST` para crear/gestionar
   etiquetas, solo `GET /as-user/labels` para listarlas y `POST .../label`
   para aplicar una a un prospect puntual).
+
+  <details>
+  <summary>Lista completa de las 77 etiquetas (key → nombre), capturada 2026-07-26</summary>
+
+  | key | nombre |
+  |---|---|
+  | cold | Frío |
+  | warm | Tibio |
+  | hot | Caliente |
+  | bodytite | Bodytite |
+  | morpheus | Morpheus |
+  | valoracionSenosDrChacon | Valoración Senos (Dr. Chacon) |
+  | valoracionSenosDrSolis | Valoración Senos (Dr. Solis) |
+  | valoracionCorporal | Valoración Corporal |
+  | toxinaBotulinica | Toxina Botulínica |
+  | valoracionRinoplastia | Valoración Rinoplastia |
+  | radiesse | Radiesse |
+  | valoracionDraMilenaJimenez | Valoración Dras |
+  | carboxiterapia | Carboxiterapia |
+  | oxyGeneo | OxyGeneo |
+  | masajePostCirugia | Masaje Post Cirugía |
+  | bodyFx | Body FX |
+  | depilacion | Depilación |
+  | controlDrSolis | Control Dr. Solis |
+  | controlDrChacon | Control Dr. Chacon |
+  | peelingFacial | Peeling Facial |
+  | otoplastia | Otoplastia |
+  | precio | Precio |
+  | valoracionFacialDrChacon | Valoracion lifting |
+  | redensity1 | Redensity 1 |
+  | redensity2 | Redensity 2 |
+  | valoracionDrJeffrySolis | Valoracion Dr. Jeffry Solis |
+  | valoracionDeSenos | Valoracion de Senos |
+  | rellenos | Rellenos |
+  | cosmelan | Cosmelan |
+  | accutite | Accutite |
+  | mesoxeomin | Mesoxeomin |
+  | facetite | Facetite |
+  | correo | Correo |
+  | valoracionConEsteticista | Valoracion con Esteticista |
+  | tratamientosFaciales | Tratamientos Faciales |
+  | formaV | Forma V |
+  | dermatologia | Dermatología |
+  | drHerrera | Dr. Herrera |
+  | trilipo | Trilipo |
+  | trifraccional | Trifraccional |
+  | mesoterapia | Mesoterapia |
+  | co2 | Co2 |
+  | voluderm | Voluderm |
+  | pinkIntimate | Pink Intimate |
+  | enzimas | Enzimas |
+  | datosIncorrectos | Datos Incorrectos |
+  | plasmage | Plasmage |
+  | dermamelan | Dermamelan |
+  | presoterapia | Presoterapia |
+  | blefaroplastia | Blefaroplastia |
+  | controlDrHerrera | Control Dr. Herrera |
+  | controlDrJeffrySolis | Control Dr. Jeffry Solis |
+  | nutricion | Nutrición |
+  | mia | MIA |
+  | laserPicoSegundo | Láser pico segundo |
+  | hydrafacial | Hydrafacial |
+  | plasmaRicoEnPlaquetas | Plasma rico en plaquetas |
+  | radiofrecuenciaFacial | Radiofrecuencia facial |
+  | dermapen | Dermapen |
+  | controlPostCosmelan | Control post cosmelan |
+  | controlDraMonge | Control Dra Monge |
+  | lobuloplastia | Lobuloplastia |
+  | ultrasonido | Ultrasonido |
+  | best | BEST |
+  | labioplastia | Labioplastia |
+  | infoGeneral | Info general |
+  | lipomas | Lipomas |
+  | nutricionista | Nutricionista |
+  | harmony | Harmonyca |
+  | celluma | Celluma |
+  | nctf | NCTF |
+  | liftera | Liftera |
+  | exosomas | Exosomas |
+  | sueroterapia | Sueroterapia |
+  | peptidos | Péptidos |
+  | ultherapy | Ultherapy |
+  | naturalLift | Natural lift |
+
+  Esta lista puede cambiar con el tiempo (el equipo la administra desde el
+  panel de Zenvia) — el Worker **no** usa esta tabla estática, siempre
+  llama a `GET /as-user/labels` en vivo antes de clasificar (ver 1.5e), así
+  que queda automáticamente al día.
+  </details>
 
 Modelos legacy `Category`/`CategoriesByIndustry` (del client PHP viejo,
 ver sección 1 más arriba): en el spec actual solo sobrevive `Category`
@@ -287,6 +392,48 @@ del lead vía `POST /lead/*`, no algo que se pueda cambiar después vía API
 sobre un prospect existente) y `GET /leads/categories` (categorías
 disponibles para creación de leads, no para etiquetar prospects ya
 existentes). `CategoriesByIndustry` ya no aparece en el spec actual.
+
+### 1.5e Agilidad para asesores al escalar — implementado
+
+Cuando `escalated` es `true` (por `[ESCALAR]` de Sofía o por el límite de
+10 mensajes), **antes de transferir al grupo**, `runEscalationAgility()` en
+`src/index.js` corre tres pasos, todos **best-effort** — ninguno puede
+bloquear ni retrasar lo importante (responder al paciente, transferir):
+
+1. **Clasificación con Haiku** (`claude-haiku-4-5`, no Sonnet — es
+   clasificación simple, no conversación): le pasa el historial completo
+   de la conversación y la lista de etiquetas reales (`GET
+   /as-user/labels` en vivo, no la tabla estática de arriba) y le pide un
+   JSON con `label` (el `key` exacto de una etiqueta, o `null`),
+   `procedure_interest` (resumen corto) y `sentiment`
+   (`positivo`/`neutral`/`negativo`). El `label` que devuelva se valida
+   contra la lista real antes de usarlo — si Haiku inventa un key que no
+   existe, se trata como `null`.
+2. Si `label` no es `null`: `POST /prospect/{id}/as-user/label` con esa
+   key (confirmado funcional, ver 1.5d).
+3. `POST /apps/notifications` (ver 1.5d) — **actualmente siempre falla**
+   con 400 por el permiso de "Custom App" no habilitado en Zenvia. Se deja
+   la llamada igual porque es best-effort y no cuesta nada que falle; va a
+   empezar a funcionar sola en cuanto se habilite el permiso del lado de
+   Zenvia, sin tocar código.
+
+`procedure_interest` y `sentiment` que devuelve Haiku se guardan en
+`sofia_conversations` en el mismo `upsert` final, junto con `escalated` y
+`escalation_reason`.
+
+**Bug encontrado y arreglado durante las pruebas:** Haiku a veces envuelve
+el JSON en un fence de markdown (` ```json ... ``` `) pese a que el prompt
+le pide no hacerlo — `classifyEscalationWithHaiku()` le quita el fence
+antes de parsear.
+
+Probado con `wrangler dev --remote` + `prospectId` falso, forzando ambos
+caminos de escalación (por `[ESCALAR]` y por límite de mensajes): en
+ambos, el flujo llegó completo hasta `transferProspectToGroup` pese a que
+etiquetado y notificación fallaron con 404/400 esperados (ID falso /
+permiso no habilitado), y Haiku devolvió clasificaciones sensatas
+(ej. `sentiment: "negativo"` para un mensaje de emergencia post-operatoria,
+`procedure_interest: "Botox"` para una pregunta sobre Botox) que quedaron
+guardadas correctamente en Supabase.
 
 ### 1.7 Forma del payload del webhook (⚠️ no confirmada al 100%)
 
@@ -406,11 +553,14 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
      Claude** — manda uno de 3 mensajes fijos elegido al azar
      (`pickMessageLimitReply()`, tono cálido: "Quiero asegurarme de que le
      den la mejor ayuda posible con esto...", etc. — ver
-     `MESSAGE_LIMIT_REPLIES` en `src/index.js`), transfiere al grupo (ver
-     1.5c) y guarda `escalated: true`,
-     `escalation_reason: "límite de mensajes alcanzado"`. Corta el flujo
-     ahí — y de paso activa el freno del punto anterior para el resto de
-     esta conversación (mientras siga con el mismo `interactionId`).
+     `MESSAGE_LIMIT_REPLIES` en `src/index.js`), corre la agilidad para
+     asesores (`runEscalationAgility()`, ver 1.5e — best-effort, nunca
+     bloquea), transfiere al grupo (ver 1.5c) y guarda `escalated: true`,
+     `escalation_reason: "límite de mensajes alcanzado"` +
+     `procedure_interest`/`sentiment` de lo que devolvió Haiku. Corta el
+     flujo ahí — y de paso activa el freno del punto anterior para el
+     resto de esta conversación (mientras siga con el mismo
+     `interactionId`).
    - Carga `sofia_config` (system_prompt + knowledge_base) desde Supabase.
    - RAG: embedding con `text-embedding-3-small` de los últimos 2 mensajes
      del usuario → `match_sofia_chunks` (top 6, threshold 0.5) → si no hay
@@ -436,8 +586,9 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
      `POST /prospect/{id}/interactions` (ver 1.5b), después manda la
      respuesta de Sofía (que ya trae la frase de transición antes del tag
      `[ESCALAR]`) al paciente vía `messaging/whatsapp` — salvo que quede
-     vacía, en cuyo caso se salta ese envío — y por último transfiere al
-     **grupo** (ver 1.5c), no a un agente específico.
+     vacía, en cuyo caso se salta ese envío —, corre la agilidad para
+     asesores (`runEscalationAgility()`, ver 1.5e) y por último transfiere
+     al **grupo** (ver 1.5c), no a un agente específico.
    - Actualiza `sofia_conversations` (insert si no existe fila para ese
      `phone_hash`, update si ya existe — la tabla no tiene constraint único
      en `phone_hash`, así que es lectura+escritura manual, no un upsert de
@@ -445,7 +596,9 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
      `last_interaction_id` (siempre se actualiza al `interactionId`
      entrante), y `message_count` — que suma +1 sobre el valor guardado en
      conversaciones normales, o arranca de 0+1 si `isNewConversation` era
-     `true` (`resetCounters` en `upsertConversation()`).
+     `true` (`resetCounters` en `upsertConversation()`). También guarda
+     `procedure_interest` y `sentiment` — `null` salvo que se haya
+     escalado en este turno (ver 1.5e).
 4. Responde `200` a Zenvia siempre que el body haya parseado como JSON
    (incluso si el procesamiento downstream falló para algún mensaje) —
    evita que Zenvia reintente y duplique respuestas al paciente. Los errores

@@ -211,9 +211,15 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   const effectiveMessageCount = isNewConversation ? 0 : conversationState.messageCount;
 
   if (effectiveMessageCount >= MAX_CONVERSATION_TURNS) {
+    const limitReasonText = "límite de mensajes alcanzado";
     const limitReply = pickMessageLimitReply();
     await claimPromise;
     await sendWhatsappMessage(env, prospectId, limitReply);
+    const limitAgility = await runEscalationAgility(env, {
+      prospectId,
+      history,
+      escalationReason: limitReasonText,
+    });
     await transferProspectToGroup(env, prospectId, CEC_GROUP_ID);
 
     const updatedHistory = [...history, { role: "assistant", content: limitReply }].slice(
@@ -224,9 +230,11 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       phoneHash,
       lastMessage: limitReply,
       escalated: true,
-      escalationReason: "límite de mensajes alcanzado",
+      escalationReason: limitReasonText,
       interactionId,
       resetCounters: isNewConversation,
+      procedureInterest: limitAgility.procedureInterest,
+      sentiment: limitAgility.sentiment,
     });
     return;
   }
@@ -254,6 +262,8 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   );
   await saveSession(env, phoneHash, updatedHistory);
 
+  let agility = { procedureInterest: null, sentiment: null };
+
   if (escalated) {
     // Give the human agent context before they open the chat cold.
     await addEscalationNote(env, prospectId, escalation_reason, updatedHistory.slice(-2));
@@ -265,6 +275,11 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     if (reply) {
       await sendWhatsappMessage(env, prospectId, reply);
     }
+    agility = await runEscalationAgility(env, {
+      prospectId,
+      history: updatedHistory,
+      escalationReason: escalation_reason,
+    });
     await transferProspectToGroup(env, prospectId, CEC_GROUP_ID);
   } else {
     await sendWhatsappMessage(env, prospectId, reply);
@@ -277,6 +292,8 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     escalationReason: escalation_reason,
     interactionId,
     resetCounters: isNewConversation,
+    procedureInterest: agility.procedureInterest,
+    sentiment: agility.sentiment,
   });
 }
 
@@ -511,6 +528,8 @@ async function upsertConversation(env, {
   escalationReason,
   interactionId,
   resetCounters,
+  procedureInterest,
+  sentiment,
 }) {
   const headers = {
     apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -536,6 +555,8 @@ async function upsertConversation(env, {
         escalation_reason: escalationReason,
         message_count: baselineMessageCount + 1,
         last_interaction_id: interactionId,
+        procedure_interest: procedureInterest ?? null,
+        sentiment: sentiment ?? null,
       }),
     });
   } else {
@@ -550,6 +571,8 @@ async function upsertConversation(env, {
         escalation_reason: escalationReason,
         message_count: 1,
         last_interaction_id: interactionId,
+        procedure_interest: procedureInterest ?? null,
+        sentiment: sentiment ?? null,
       }),
     });
   }
@@ -598,6 +621,147 @@ async function addEscalationNote(env, prospectId, escalationReason, recentMessag
     console.error("addEscalationNote failed", res.status, await res.text());
   }
   return res;
+}
+
+// ---------------------------------------------------------------------------
+// Escalation agility: label + classify + notify (all best-effort — see
+// runEscalationAgility, none of this may block or delay transferring the
+// conversation to the group).
+// ---------------------------------------------------------------------------
+
+async function getAvailableLabels(env) {
+  try {
+    const res = await fetch(`${ZENVIA_API_BASE}/as-user/labels?api-key=${env.ZENVIA_API_KEY}`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch (err) {
+    console.error("getAvailableLabels failed", err);
+    return [];
+  }
+}
+
+// Cheap classification pass with Haiku (not Sonnet — this is a simple
+// tagging task, not a conversational one) so a human agent gets a running
+// start: which label fits, what the patient actually wants, and how they
+// seem to be feeling. Never throws — always returns a usable (possibly
+// all-null) result.
+async function classifyEscalationWithHaiku(env, history, availableLabels) {
+  try {
+    const labelsContext = availableLabels.map((l) => `${l.key}: ${l.name}`).join("\n");
+    const transcript = history
+      .map((m) => `${m.role === "user" ? "Paciente" : "Sofía"}: ${m.content}`)
+      .join("\n");
+
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 300,
+        system:
+          "Eres un clasificador de conversaciones de WhatsApp para una clínica de cirugía plástica. " +
+          "Responde ÚNICAMENTE con un objeto JSON válido (sin texto adicional, sin markdown), con " +
+          'exactamente estas claves: "label" (el key EXACTO de una de las etiquetas provistas que mejor ' +
+          'describa el interés del paciente, o null si ninguna calza bien — nunca inventes un key que no ' +
+          'esté en la lista), "procedure_interest" (resumen muy corto, 2-4 palabras, del procedimiento o ' +
+          'tema de interés del paciente, ej. "rinoplastia", "precio botox"), "sentiment" ("positivo", ' +
+          '"neutral" o "negativo", según el tono general del paciente en la conversación).',
+        messages: [
+          {
+            role: "user",
+            content: `Etiquetas disponibles (usa el key exacto, columna izquierda):\n${labelsContext}\n\nConversación:\n${transcript}`,
+          },
+        ],
+      }),
+    });
+    const data = await response.json();
+    const textBlock = (data?.content || []).find((b) => b.type === "text");
+    // Haiku sometimes wraps the JSON in a ```json ... ``` fence despite the
+    // system prompt asking it not to — strip that before parsing.
+    const cleanedText = (textBlock?.text ?? "{}").replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+    const parsed = JSON.parse(cleanedText);
+
+    const label = availableLabels.some((l) => l.key === parsed.label) ? parsed.label : null;
+    return {
+      label,
+      procedureInterest: parsed.procedure_interest || null,
+      sentiment: parsed.sentiment || null,
+    };
+  } catch (err) {
+    console.error("classifyEscalationWithHaiku failed", err);
+    return { label: null, procedureInterest: null, sentiment: null };
+  }
+}
+
+async function addLabelToProspect(env, prospectId, label) {
+  try {
+    const res = await fetch(
+      `${ZENVIA_API_BASE}/prospect/${prospectId}/as-user/label?api-key=${env.ZENVIA_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ label }),
+      }
+    );
+    if (!res.ok) {
+      console.error("addLabelToProspect failed", res.status, await res.text());
+    }
+  } catch (err) {
+    console.error("addLabelToProspect threw", err);
+  }
+}
+
+// ⚠️ As of 2026-07-26, this call reliably fails with 400 "This app does not
+// have the permissions to send notifications" — the CEC integration isn't
+// registered as a Custom App with push-notification permission in Zenvia
+// (separate from the "notifications" API-key scope used for webhook
+// subscriptions, despite the confusingly identical name). Left in, since
+// it's best-effort and harmless when it fails, and it'll start working the
+// moment that permission is granted from the Zenvia side — see README 1.5d.
+async function sendEscalationNotification(env, escalationReason) {
+  try {
+    const title = "Sofía escaló una conversación";
+    const body = escalationReason || "Revisar conversación de WhatsApp";
+    const platformPayload = { title, body };
+    const res = await fetch(`${ZENVIA_API_BASE}/apps/notifications?api-key=${env.ZENVIA_API_KEY}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        type: "sofia_escalation",
+        target: { role: ["agent"] },
+        platforms: { android: platformPayload, ios: platformPayload, desktop: platformPayload },
+      }),
+    });
+    if (!res.ok) {
+      console.error("sendEscalationNotification failed", res.status, await res.text());
+    }
+  } catch (err) {
+    console.error("sendEscalationNotification threw", err);
+  }
+}
+
+// Orchestrates the whole "agility for advisors" step at escalation time:
+// label the prospect, classify interest/sentiment, push a notification.
+// Deliberately never throws and never blocks the caller for long on a
+// single failing step — the main flow (reply to patient, transfer to
+// group) must never depend on any of this working.
+async function runEscalationAgility(env, { prospectId, history, escalationReason }) {
+  try {
+    const labels = await getAvailableLabels(env);
+    const classification = await classifyEscalationWithHaiku(env, history, labels);
+    if (classification.label) {
+      await addLabelToProspect(env, prospectId, classification.label);
+    }
+    await sendEscalationNotification(env, escalationReason);
+    return classification;
+  } catch (err) {
+    console.error("runEscalationAgility failed", err);
+    return { label: null, procedureInterest: null, sentiment: null };
+  }
 }
 
 async function transferProspectToAgent(env, prospectId, agentId) {
