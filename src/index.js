@@ -175,6 +175,13 @@ async function processInboundMessage({ text, phone, prospectId, agentId }, env) 
   await saveSession(env, phoneHash, updatedHistory);
 
   if (escalated) {
+    // Sofía already wrote a transition line before the [ESCALAR] tag (e.g.
+    // "nuestro equipo de asesores le va a estar contactando") — send it
+    // before handing off, so the patient isn't left hanging. Skip only if
+    // there's truly nothing to send (Sofía wrote nothing before the tag).
+    if (reply) {
+      await sendWhatsappMessage(env, prospectId, reply);
+    }
     const agent = await pickAgentForEscalation(env);
     await transferProspectToAgent(env, prospectId, agent.id);
   } else {

@@ -120,6 +120,51 @@ el usuario "WhatsApp Bot". Confirmado en vivo con `GET /integration`:
 que describiste. Si la key no tuviera usuario configurado, este endpoint
 devuelve `409`.
 
+### 1.5b Notas internas al escalar — no confirmado, no implementado
+
+Se buscó en el `swagger.json` real algo tipo "adjuntar una nota interna a un
+prospect/interaction antes de transferir". Sí existe algo con esa forma en
+el spec:
+
+```
+POST /prospect/{prospectId}/interactions
+{ "type": "note", "content": "texto de la nota" }
+```
+
+(`operationId: createInteractionByProspectId`, body `NewEvent` → una de sus
+variantes es `NewNoteEvent: { type: "note", content: string }`. También
+existe `PUT /prospect/{prospectId}/interaction/{interactionId}` con
+`UpdateEvent`, pero esa unión no incluye una variante de nota — solo
+pregunta/mensaje.)
+
+**No se integró en el código porque la prueba en vivo no fue concluyente.**
+Con un `prospectId` inventado, todos los demás endpoints de este proyecto
+devuelven un 404 con cuerpo JSON reconocible
+(`{"code":"NOT_FOUND","message":"Prospect does not exist",...}`) — así es
+como se probaron con seguridad sin tocar pacientes reales. Este endpoint, en
+cambio, devuelve un `404` con cuerpo completamente vacío (sin
+`content-type`, sin JSON) — una forma distinta a la de cualquier otro
+endpoint confirmado en este repo. Como control, un JSON malformado contra la
+misma ruta sí devuelve un error de aplicación normal
+(`{"code":"UNEXPECTED_ERROR",...}`), o sea que la ruta llega a la capa de
+aplicación — pero el caso "bien formado + prospect inexistente" no se
+comporta como los demás.
+
+No se pudo confirmar más porque hacerlo bien requeriría escribir contra un
+`prospectId` real (crear un lead de prueba desechable vía `POST /lead/retail`
+y borrarlo después) — el intento de crear ese lead de prueba fue bloqueado
+por el clasificador de auto-mode de la sesión por ser una escritura real en
+el CRM de producción, y no se insistió sin autorización explícita del
+usuario.
+
+**Conclusión:** por ahora, el contexto para el agente humano al escalar
+sigue siendo únicamente el hilo de WhatsApp compartido (que ya incluye el
+mensaje de transición que Sofía manda antes de transferir, ver sección 2).
+No se agregó ninguna llamada de "nota interna" al flujo. Si se quiere
+confirmar esto de verdad, hay que probarlo contra un prospect real (de
+prueba, desechable) con autorización explícita — o preguntarle a soporte de
+Zenvia directamente.
+
 ### 1.6 Descubrir a quién transferir
 
 - `GET /agents?group=<groupId>` y `GET /as-user/transfer` devuelven la lista
@@ -205,6 +250,12 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
 2. Parsea el body defensivamente (ver 1.7) y extrae mensajes entrantes de
    WhatsApp.
 3. Por cada mensaje:
+   - Reclama la conversación como WhatsApp Bot (`POST
+     /prospect/{id}/as-user/transfer` con `user` = el propio agente
+     WhatsApp Bot) apenas llega, salvo que la interacción ya venga asignada
+     a WhatsApp Bot — así no queda mezclada en el pool "Sin asignar" de
+     Zenvia mientras Sofía la atiende. Se lanza en paralelo con el resto del
+     procesamiento, no bloquea.
    - Hashea el teléfono con SHA-256 → `phone_hash`.
    - Lee/crea la sesión en `sofia_whatsapp_sessions` (upsert por
      `phone_hash`, que sí tiene constraint único).
@@ -215,15 +266,18 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
      del usuario → `match_sofia_chunks` (top 6, threshold 0.5) → si no hay
      chunks, cae a mandar el `knowledge_base` completo. Mismo patrón que
      `chat.js`, incluyendo qué bloques llevan `cache_control: ephemeral`.
-   - Llama a Claude (`claude-sonnet-5`, `max_tokens: 1024`, prompt caching
-     habilitado).
+   - Llama a Claude (`claude-sonnet-5`, `max_tokens: 1024`,
+     `thinking: {type: "disabled"}`, prompt caching habilitado).
    - Parsea `[ESCALAR: motivo]` de la respuesta (mismo regex tolerante que
      el fix en `chat.js`), lo remueve del texto.
    - Guarda el historial actualizado en `sofia_whatsapp_sessions`.
    - Si **no** escala: responde al paciente vía
      `POST /prospect/{id}/messaging/whatsapp`.
-   - Si **sí** escala: elige un agente (prefiere uno online, ver 1.6) y
-     transfiere con `POST /prospect/{id}/as-user/transfer`.
+   - Si **sí** escala: primero manda la respuesta de Sofía (que ya trae la
+     frase de transición antes del tag `[ESCALAR]`, ver 1.5b) al paciente
+     vía `messaging/whatsapp` — salvo que quede vacía, en cuyo caso se
+     salta ese envío — y **después** elige un agente (prefiere uno online,
+     ver 1.6) y transfiere con `POST /prospect/{id}/as-user/transfer`.
    - Actualiza `sofia_conversations` (insert si no existe fila para ese
      `phone_hash`, update si ya existe — la tabla no tiene constraint único
      en `phone_hash`, así que es lectura+escritura manual, no un upsert de
