@@ -137,7 +137,11 @@ async function processInboundMessage({ text, phone, prospectId }, env) {
   const systemBlocks = buildSystemBlocks(system, knowledge_base, chunks);
 
   const claudeData = await callClaude(env, systemBlocks, history);
-  const rawText = claudeData?.content?.[0]?.text ?? "";
+  // claude-sonnet-5 returns extended thinking by default, so content[0] is
+  // often a {type: "thinking"} block rather than the reply — find the text
+  // block explicitly instead of assuming it's first.
+  const textBlock = (claudeData?.content || []).find((b) => b.type === "text");
+  const rawText = textBlock?.text ?? "";
   const { reply, escalated, escalation_reason } = parseEscalation(rawText);
 
   const updatedHistory = [...history, { role: "assistant", content: reply }].slice(
