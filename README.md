@@ -269,6 +269,14 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
      del usuario → `match_sofia_chunks` (top 6, threshold 0.5) → si no hay
      chunks, cae a mandar el `knowledge_base` completo. Mismo patrón que
      `chat.js`, incluyendo qué bloques llevan `cache_control: ephemeral`.
+   - Agrega un bloque final de sistema con la fecha/hora actual en Costa
+     Rica (offset fijo UTC-6, sin horario de verano — `formatCostaRicaDateTime()`
+     en `src/index.js`), **sin** `cache_control` y siempre al final, después
+     de los bloques cacheados — si fuera antes invalidaría el caché en cada
+     mensaje. El `system_prompt` en Supabase tiene una regla de saludo
+     ("Buenos días" / "Buenas tardes" / "Buenas noches") que depende de esto;
+     sin este bloque Claude no tiene forma de saber la hora real y saludaba
+     mal (confirmado en producción: "buenas tardes" de noche).
    - Llama a Claude (`claude-sonnet-5`, `max_tokens: 1024`,
      `thinking: {type: "disabled"}`, prompt caching habilitado).
    - Parsea `[ESCALAR: motivo]` de la respuesta (mismo regex tolerante que

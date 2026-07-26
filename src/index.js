@@ -299,7 +299,41 @@ function buildSystemBlocks(system, knowledge_base, chunks) {
     });
   }
 
+  // No cache_control on this one, and it must stay last: it changes on every
+  // request, so putting it before a cached block would invalidate the cache
+  // prefix on every single message. system_prompt has a greeting rule that
+  // depends on knowing the current hour in Costa Rica — without this block
+  // Claude has no way to know it and defaults incorrectly (e.g. "buenas
+  // tardes" at night).
+  systemBlocks.push({
+    type: "text",
+    text: `Fecha y hora actual en Costa Rica: ${formatCostaRicaDateTime()}.`,
+  });
+
   return systemBlocks;
+}
+
+// Costa Rica is UTC-6 year-round (no DST), so a fixed offset is exact —
+// same approach cecmarketing/functions/api/chat.js uses for its hour-of-day
+// greeting context.
+function formatCostaRicaDateTime(date = new Date()) {
+  const crDate = new Date(date.getTime() - 6 * 60 * 60 * 1000);
+  const weekdays = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
+  const months = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+  ];
+
+  const weekday = weekdays[crDate.getUTCDay()];
+  const day = crDate.getUTCDate();
+  const month = months[crDate.getUTCMonth()];
+  const year = crDate.getUTCFullYear();
+  const hour24 = crDate.getUTCHours();
+  const minute = String(crDate.getUTCMinutes()).padStart(2, "0");
+  const period = hour24 >= 12 ? "pm" : "am";
+  const hour12 = hour24 % 12 || 12;
+
+  return `${weekday} ${day} de ${month} de ${year}, ${hour12}:${minute}${period}`;
 }
 
 async function callClaude(env, systemBlocks, history) {
