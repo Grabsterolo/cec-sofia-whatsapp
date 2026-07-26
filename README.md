@@ -191,12 +191,20 @@ a `status: followUp` con `agent` asignado. El prospect de prueba se borró
   | WhatsApp Bot 🤖 (viejo, ya no se usa) | `624353d6ed44c7429615e36e` |
   | Sofia CEC (identidad actual de la IA, no usar como destino de escalación) | `6a65946e85b682f18c9d3dd7` |
 
-- **Bonus no pedido pero útil:** `GET /group/{groupId}/agents/online` sí
-  existe y devuelve quién está conectado ahora mismo (`{"agents":[...],
-  "officeHours": true}`). El Worker lo usa para preferir un agente humano
-  que esté online antes de caer al fallback pseudo-aleatorio (ver
-  `pickAgentForEscalation` en `src/index.js` — tiene un TODO explícito sobre
-  las limitaciones de esto).
+- `GET /group/{groupId}/agents/online` existe y devuelve quién está
+  conectado ahora mismo (`{"agents":[...], "officeHours": true}`) —
+  **ya no se usa**. La escalación dejó de elegir un agente humano
+  específico (ver 1.5c) y ahora transfiere directo al grupo, así que
+  `pickAgentForEscalation()` se eliminó del código.
+
+### 1.5c Escalación al grupo, no a un agente específico
+
+Al escalar, el Worker ya no elige un agente humano puntual — transfiere el
+prospect al grupo completo con `POST /prospect/{prospectId}/transfer`
+(`{ "group": "620bdb7ddc95c70003482762" }`, scope `prospects:read`,
+confirmado contra el `swagger.json` real). Cualquiera del equipo que esté
+disponible lo puede tomar desde el pool del grupo — ya no hace falta la
+lógica de "elegir quién está online" que existía antes.
 
 ### 1.7 Forma del payload del webhook (⚠️ no confirmada al 100%)
 
@@ -262,6 +270,11 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
 2. Parsea el body defensivamente (ver 1.7) y extrae mensajes entrantes de
    WhatsApp.
 3. Por cada mensaje:
+   - **Si un humano ya tiene la conversación** (`agentId` de la interacción
+     coincide con Adrian, Angie, Ingrid o Jordan): se ignora por completo —
+     sin responder, sin reclamar, sin tocar `sofia_conversations`, solo un
+     `console.log` breve. Solo se sigue procesando si `agentId` es
+     `null`/sin asignar o ya es el de Sofia CEC.
    - Reclama la conversación como Sofia CEC (`POST
      /prospect/{id}/as-user/transfer` con `user` = `SOFIA_AGENT_ID`) apenas
      llega, salvo que la interacción ya venga asignada a Sofia CEC — así no
@@ -273,6 +286,13 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
      `phone_hash`, que sí tiene constraint único).
    - Agrega el mensaje del paciente al historial, recorta a los últimos
      20 mensajes (~10 turnos) antes de mandarlo a Claude.
+   - **Límite de 10 turnos:** consulta `message_count` en
+     `sofia_conversations` para ese `phone_hash`. Si ya es `>= 10`, **no
+     llama a Claude** — manda un mensaje fijo ("Ya llevamos varios mensajes
+     conversando — le voy a pasar con nuestro equipo para que le ayuden
+     mejor con esto."), transfiere al grupo (ver 1.5c) y guarda
+     `escalated: true`, `escalation_reason: "límite de mensajes alcanzado"`.
+     Corta el flujo ahí.
    - Carga `sofia_config` (system_prompt + knowledge_base) desde Supabase.
    - RAG: embedding con `text-embedding-3-small` de los últimos 2 mensajes
      del usuario → `match_sofia_chunks` (top 6, threshold 0.5) → si no hay
@@ -298,9 +318,8 @@ tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
      `POST /prospect/{id}/interactions` (ver 1.5b), después manda la
      respuesta de Sofía (que ya trae la frase de transición antes del tag
      `[ESCALAR]`) al paciente vía `messaging/whatsapp` — salvo que quede
-     vacía, en cuyo caso se salta ese envío — y por último elige un agente
-     (prefiere uno online, ver 1.6) y transfiere con
-     `POST /prospect/{id}/as-user/transfer`.
+     vacía, en cuyo caso se salta ese envío — y por último transfiere al
+     **grupo** (ver 1.5c), no a un agente específico.
    - Actualiza `sofia_conversations` (insert si no existe fila para ese
      `phone_hash`, update si ya existe — la tabla no tiene constraint único
      en `phone_hash`, así que es lectura+escritura manual, no un upsert de

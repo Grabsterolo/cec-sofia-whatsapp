@@ -21,8 +21,13 @@ const HUMAN_AGENTS = [
   { id: "6447ff23812154a143050118", name: "Ingrid Calderón" },
   { id: "620bdb7ddc95c7000348276c", name: "Jordan Murillo" },
 ];
+const HUMAN_AGENT_IDS = new Set(HUMAN_AGENTS.map((a) => a.id));
 
 const MAX_HISTORY_MESSAGES = 20; // ~10 user/assistant turns
+const MAX_CONVERSATION_TURNS = 10; // sofia_conversations.message_count ceiling before forcing escalation
+
+const MESSAGE_LIMIT_REPLY =
+  "Ya llevamos varios mensajes conversando — le voy a pasar con nuestro equipo para que le ayuden mejor con esto.";
 
 export default {
   async fetch(request, env, ctx) {
@@ -132,6 +137,17 @@ function extractInboundFromInteraction(interaction) {
 // ---------------------------------------------------------------------------
 
 async function processInboundMessage({ text, phone, prospectId, agentId }, env) {
+  // A human already has this conversation (Adrian, Angie, Ingrid, or
+  // Jordan) — don't touch it at all: no reply, no claim, no
+  // sofia_conversations update. Only proceed when the interaction is
+  // unassigned (null) or already assigned to Sofía herself.
+  if (agentId && HUMAN_AGENT_IDS.has(agentId)) {
+    console.log(
+      `Skipping inbound message: prospect ${prospectId} is already assigned to a human agent (${agentId})`
+    );
+    return;
+  }
+
   // Claim the conversation as Sofía right away so it leaves the shared "Sin
   // asignar" pool while she's handling it, instead of sitting there mixed
   // in with conversations that actually need a human. Skip the call
@@ -150,6 +166,25 @@ async function processInboundMessage({ text, phone, prospectId, agentId }, env) 
   const history = [...session.messages, { role: "user", content: text }].slice(
     -MAX_HISTORY_MESSAGES
   );
+
+  const messageCount = await getConversationMessageCount(env, phoneHash);
+  if (messageCount >= MAX_CONVERSATION_TURNS) {
+    await claimPromise;
+    await sendWhatsappMessage(env, prospectId, MESSAGE_LIMIT_REPLY);
+    await transferProspectToGroup(env, prospectId, CEC_GROUP_ID);
+
+    const updatedHistory = [...history, { role: "assistant", content: MESSAGE_LIMIT_REPLY }].slice(
+      -MAX_HISTORY_MESSAGES
+    );
+    await saveSession(env, phoneHash, updatedHistory);
+    await upsertConversation(env, {
+      phoneHash,
+      lastMessage: MESSAGE_LIMIT_REPLY,
+      escalated: true,
+      escalationReason: "límite de mensajes alcanzado",
+    });
+    return;
+  }
 
   const { system, knowledge_base } = await loadSofiaConfig(env);
   const chunks = await ragSearch(env, history);
@@ -185,8 +220,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId }, env) 
     if (reply) {
       await sendWhatsappMessage(env, prospectId, reply);
     }
-    const agent = await pickAgentForEscalation(env);
-    await transferProspectToAgent(env, prospectId, agent.id);
+    await transferProspectToGroup(env, prospectId, CEC_GROUP_ID);
   } else {
     await sendWhatsappMessage(env, prospectId, reply);
   }
@@ -398,6 +432,21 @@ async function saveSession(env, phoneHash, messages) {
   });
 }
 
+async function getConversationMessageCount(env, phoneHash) {
+  const res = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count&limit=1`,
+    {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+  if (!res.ok) return 0;
+  const rows = await res.json();
+  return rows[0]?.message_count ?? 0;
+}
+
 // sofia_conversations has no unique constraint on phone_hash (only on `id`),
 // so this does a manual read-then-write instead of a PostgREST upsert.
 async function upsertConversation(env, { phoneHash, lastMessage, escalated, escalationReason }) {
@@ -500,29 +549,20 @@ async function transferProspectToAgent(env, prospectId, agentId) {
   return res;
 }
 
-// TODO: this is a simple "prefer online, else pseudo-random" picker. It has
-// no memory across requests (Workers are stateless per-request), so it can't
-// do a true round robin without a persistent counter (e.g. Workers KV or a
-// Supabase counter). Consider adding one if load ever justifies it — for now
-// "prefer whoever is online" is a reasonable proxy for availability.
-async function pickAgentForEscalation(env) {
-  try {
-    const res = await fetch(
-      `${ZENVIA_API_BASE}/group/${CEC_GROUP_ID}/agents/online?api-key=${env.ZENVIA_API_KEY}`
-    );
-    if (res.ok) {
-      const data = await res.json();
-      const onlineIds = new Set((data.agents || []).map((a) => a.id));
-      const onlineHumans = HUMAN_AGENTS.filter((a) => onlineIds.has(a.id));
-      if (onlineHumans.length > 0) {
-        return onlineHumans[Math.floor(Math.random() * onlineHumans.length)];
-      }
+// Escalation goes to the group, not a specific agent — whoever's available
+// on the team picks it up. scope: prospects:read (live-confirmed against
+// the real swagger.json — see README 1.5).
+async function transferProspectToGroup(env, prospectId, groupId) {
+  const res = await fetch(
+    `${ZENVIA_API_BASE}/prospect/${prospectId}/transfer?api-key=${env.ZENVIA_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ group: groupId }),
     }
-  } catch (err) {
-    console.error("pickAgentForEscalation: online lookup failed", err);
+  );
+  if (!res.ok) {
+    console.error("transferProspectToGroup failed", res.status, await res.text());
   }
-  // Nobody confirmed online (or the lookup failed) — fall back to a
-  // pseudo-random pick among all human agents so the interaction is never
-  // left unassigned.
-  return HUMAN_AGENTS[Math.floor(Math.random() * HUMAN_AGENTS.length)];
+  return res;
 }
