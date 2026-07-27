@@ -60,7 +60,7 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/cleanup/scan-and-warn") {
-      return handleScanAndWarn(request, env);
+      return handleScanAndWarn(request, env, ctx);
     }
 
     return new Response("Not found", { status: 404 });
@@ -884,7 +884,7 @@ async function transferProspectToGroup(env, prospectId, groupId) {
 //   comfortably under that cap instead of pulling the whole group
 //   (archived conversations included) and filtering client-side.
 
-async function handleScanAndWarn(request, env) {
+async function handleScanAndWarn(request, env, ctx) {
   if (!env.CLEANUP_TRIGGER_SECRET || request.headers.get("x-cleanup-secret") !== env.CLEANUP_TRIGGER_SECRET) {
     return new Response(JSON.stringify({ error: "Unauthorized" }), {
       status: 401,
@@ -901,7 +901,7 @@ async function handleScanAndWarn(request, env) {
   }
   const dryRun = body.dryRun !== false; // default true — a real run must opt in explicitly
 
-  const result = await scanAndWarn(env, { dryRun });
+  const result = await scanAndWarn(env, ctx, { dryRun });
   return new Response(JSON.stringify(result), {
     status: 200,
     headers: { "content-type": "application/json" },
@@ -960,7 +960,7 @@ async function getRecentlyActiveProspectIds(env, sinceIso) {
   return new Set(interactions.map((i) => i.prospectId));
 }
 
-async function scanAndWarn(env, { dryRun }) {
+async function scanAndWarn(env, ctx, { dryRun }) {
   const sinceIso = new Date(Date.now() - INACTIVITY_WARNING_HOURS * 60 * 60 * 1000).toISOString();
 
   const [openProspects, recentlyActiveIds] = await Promise.all([
@@ -989,15 +989,14 @@ async function scanAndWarn(env, { dryRun }) {
     toWarn.push(prospect);
   }
 
-  if (!dryRun) {
-    for (const prospect of toWarn) {
-      await sendWhatsappMessage(env, prospect.id, INACTIVITY_WARNING_MESSAGE);
-      await upsertCleanupRow(env, {
-        prospectId: prospect.id,
-        groupId: CEC_GROUP_ID,
-        warnedAt: new Date().toISOString(),
-      });
-    }
+  // Sending 500+ WhatsApp messages one at a time, awaited inline, takes
+  // minutes — far longer than an interactive HTTP request (from the
+  // dashboard button, through the Pages Function, to this Worker) can stay
+  // open. ctx.waitUntil() keeps this running in the background after the
+  // response below is already sent, so the button gets a fast answer
+  // ("queued N") instead of the whole chain timing out mid-send.
+  if (!dryRun && toWarn.length > 0) {
+    ctx.waitUntil(sendWarnings(env, toWarn));
   }
 
   return {
@@ -1005,10 +1004,25 @@ async function scanAndWarn(env, { dryRun }) {
     openConversations: openProspects.length,
     staleConversations: staleProspects.length,
     alreadyPendingClosure: alreadyPendingCount,
-    warned: dryRun ? 0 : toWarn.length,
+    warned: dryRun ? 0 : toWarn.length, // queued in the background, not yet confirmed sent — see sofia_inactivity_cleanup for progress
     wouldWarn: dryRun ? toWarn.length : 0,
     sampleProspectIds: toWarn.slice(0, 10).map((p) => p.id),
   };
+}
+
+async function sendWarnings(env, prospects) {
+  for (const prospect of prospects) {
+    try {
+      await sendWhatsappMessage(env, prospect.id, INACTIVITY_WARNING_MESSAGE);
+      await upsertCleanupRow(env, {
+        prospectId: prospect.id,
+        groupId: CEC_GROUP_ID,
+        warnedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error("sendWarnings failed for", prospect.id, err);
+    }
+  }
 }
 
 // Fase 2: runs on the cron schedule (wrangler.toml [triggers]). Closes
