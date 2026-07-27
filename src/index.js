@@ -652,6 +652,14 @@ async function classifyEscalationWithHaiku(env, history, availableLabels) {
       .map((m) => `${m.role === "user" ? "Paciente" : "Sofía"}: ${m.content}`)
       .join("\n");
 
+    // The patient's very first message is the strongest signal for the real
+    // originating interest — it's often what they actually asked for or
+    // clicked through from (a Meta/Facebook/Instagram ad reply sometimes
+    // carries that context, e.g. "Source: Meta - ID:..."). Called out
+    // separately so it doesn't get diluted by later turns where Sofía may
+    // have listed several unrelated procedures as options.
+    const firstPatientMessage = history.find((m) => m.role === "user")?.content || null;
+
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -669,11 +677,24 @@ async function classifyEscalationWithHaiku(env, history, availableLabels) {
           'describa el interés del paciente, o null si ninguna calza bien — nunca inventes un key que no ' +
           'esté en la lista), "procedure_interest" (resumen muy corto, 2-4 palabras, del procedimiento o ' +
           'tema de interés del paciente, ej. "rinoplastia", "precio botox"), "sentiment" ("positivo", ' +
-          '"neutral" o "negativo", según el tono general del paciente en la conversación).',
+          '"neutral" o "negativo", según el tono general del paciente en la conversación).\n\n' +
+          "REGLA DE PRIORIZACIÓN — muy importante: prioriza siempre el procedimiento que el PACIENTE " +
+          "pidió o por el que preguntó originalmente (mira primero su primer mensaje y cualquier " +
+          "contexto de origen del lead, como un anuncio de Meta/Facebook/Instagram, si aparece ahí). " +
+          "NO uses un procedimiento solo porque Sofía lo haya mencionado como una de varias opciones " +
+          "durante la conversación — Sofía frecuentemente ofrece 2 o 3 alternativas, y elegir una al " +
+          "azar entre esas produce clasificaciones incorrectas. Si Sofía ofreció varias opciones y el " +
+          "paciente no confirmó claramente cuál le interesa, es preferible responder con una etiqueta " +
+          "más general (o \"label\": null) que adivinar cuál de las opciones eligió.",
         messages: [
           {
             role: "user",
-            content: `Etiquetas disponibles (usa el key exacto, columna izquierda):\n${labelsContext}\n\nConversación:\n${transcript}`,
+            content:
+              `Etiquetas disponibles (usa el key exacto, columna izquierda):\n${labelsContext}\n\n` +
+              (firstPatientMessage
+                ? `Primer mensaje del paciente en esta conversación (la señal más confiable de su interés de origen):\n${firstPatientMessage}\n\n`
+                : "") +
+              `Conversación completa:\n${transcript}`,
           },
         ],
       }),

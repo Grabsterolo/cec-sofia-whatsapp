@@ -426,6 +426,25 @@ el JSON en un fence de markdown (` ```json ... ``` `) pese a que el prompt
 le pide no hacerlo — `classifyEscalationWithHaiku()` le quita el fence
 antes de parsear.
 
+**Bug real detectado en producción y corregido (2026-07-27):** un lead que
+llegó por un anuncio de Meta sobre Radiesse escaló con
+`procedure_interest: "Ultherapy"` — Sofía había mencionado Radiesse,
+Morpheus8 y Ultherapy como opciones durante la conversación, y el
+clasificador agarró una sin relación clara con el interés real de origen
+del paciente. Fix: el prompt ahora separa explícitamente el **primer
+mensaje del paciente** en la conversación (la señal más confiable de
+interés de origen, y donde suele aparecer contexto de anuncio si Zenvia lo
+adjunta, ej. "Source: Meta - ID:...") del resto del historial, y el system
+prompt agrega una regla de priorización explícita: usar lo que el paciente
+pidió originalmente, nunca una opción que Sofía solo haya mencionado entre
+varias sin que el paciente la confirmara — y preferir una etiqueta más
+general (o `null`) antes que adivinar. Reproducido y confirmado en una
+prueba con una conversación sembrada (primer mensaje sobre Radiesse desde
+un anuncio, Sofía ofreciendo Radiesse/Morpheus8/Ultherapy sin que el
+paciente confirmara ninguna, escalación por solicitud de agendar):
+`procedure_interest` quedó como `"Radiesse, contorno facial"` — el interés
+real de origen, no una de las opciones mencionadas de pasada.
+
 Probado con `wrangler dev --remote` + `prospectId` falso, forzando ambos
 caminos de escalación (por `[ESCALAR]` y por límite de mensajes): en
 ambos, el flujo llegó completo hasta `transferProspectToGroup` pese a que
