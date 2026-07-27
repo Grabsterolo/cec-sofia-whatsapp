@@ -633,6 +633,48 @@ de forma incorrecta). Re-verificado con el mismo método de tres casos
 (fake ID no-archivado, override local `"archived"`, humano + archived) —
 mismos resultados.
 
+### 1.10 Sofía también responde Facebook Messenger, no solo WhatsApp
+
+`GET /messaging/channels` confirma que esta cuenta tiene conectados
+**whatsapp** y **facebook** (`channelId: "880573125292638"`) — no hay
+Instagram conectado todavía. El topic `interactions` al que ya estábamos
+suscritos (ver 1.3) ya entregaba eventos de ambos canales — el Worker
+simplemente los descartaba: `extractInboundFromInteraction()` filtraba con
+`interaction.via !== "whatsApp"`.
+
+**Cambio:** `SUPPORTED_CHANNELS` (`src/index.js`) mapea cada `via` que
+Zenvia manda a la cadena que `messaging/{channel}` espera para responder
+(`whatsApp` → `whatsapp`; `facebook` → `facebook`, ya coincide). El
+`channel` resuelto viaja junto con el mensaje entrante por todo
+`processInboundMessage()` y se usa para:
+- `sendWhatsappMessage()` → renombrada a `sendChannelMessage(env, prospectId, channel, content)`,
+  llama `messaging/{channel}` en vez de tener `whatsapp` fijo.
+- `sofia_whatsapp_sessions.channel` y `sofia_conversations.channel` — ya
+  no se hardcodea `"whatsapp"` al insertar, se guarda el canal real.
+
+**No cambia:** el resto de la lógica (RAG, Claude, escalación, pool
+round-robin, gates de seguridad) es channel-agnostic y sigue igual —
+solo dependía de `prospectId`/`agentId`/`phone` (que para Facebook en
+realidad es el PSID del usuario, no un número real, pero funciona igual
+como identificador único para el hash de sesión).
+
+**Limitación conocida:** el modo `"warn"` (dormido) de la limpieza por
+inactividad (`sendWarnings()`) sigue asumiendo WhatsApp siempre —
+`getOpenProspects()` no trae el canal de cada prospecto. No es un problema
+activo porque el botón del dashboard usa `mode: "closeDirect"` (no manda
+mensajes), pero habría que resolverlo antes de reactivar el modo `"warn"`
+si para entonces ya hay conversaciones de Facebook stale de verdad.
+
+**Verificación:** `wrangler dev --remote` + dos webhooks fabricados con
+`prospectId` falso — uno con `via: "facebook"` (sender un PSID falso) y
+uno con `via: "whatsApp"` (regresión). Ambos se procesaron completos: RAG
++ Claude respondieron coherentemente, `sendChannelMessage failed facebook
+404` / `sendChannelMessage failed whatsapp 404` confirmaron que cada uno
+llamó al endpoint de `messaging/{channel}` correcto (404 esperado por
+prospectId falso, no error de canal/formato), y Supabase guardó
+`channel: "facebook"` correctamente en `sofia_conversations` y
+`sofia_whatsapp_sessions` para el caso de Facebook.
+
 ---
 
 ## 2. Qué hace el Worker

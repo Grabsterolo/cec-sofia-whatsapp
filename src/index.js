@@ -1,8 +1,19 @@
-// Sofía <-> WhatsApp bridge via Zenvia Conversion (formerly Sirena).
-// See README.md for the full API discovery notes this file relies on.
+// Sofía <-> Zenvia Conversion (formerly Sirena) bridge — WhatsApp and
+// Facebook Messenger, the two channels connected in this account
+// (see SUPPORTED_CHANNELS). See README.md for the full API discovery
+// notes this file relies on.
 
 const ZENVIA_API_BASE = "https://conversion.zenvia.com/v1";
-const WHATSAPP_CHANNEL = "whatsapp";
+
+// Channels connected in this Zenvia account (confirmed live via
+// GET /messaging/channels) that Sofía is allowed to respond on.
+// Interaction.via uses "whatsApp" (capital A) for WhatsApp but plain
+// lowercase for every other channel — SUPPORTED_CHANNELS keys match `via`
+// exactly; `messaging/{channel}` (send) always wants the lowercase form.
+const SUPPORTED_CHANNELS = {
+  whatsApp: "whatsapp",
+  facebook: "facebook",
+};
 
 // CEC group inside Zenvia Conversion ("Centro Europeo de Cirugia").
 // Not secret — confirmed live via GET /groups.
@@ -146,29 +157,36 @@ function extractInboundFromInteraction(interaction) {
   // "integration" = message came in from the prospect via the channel.
   // "agent"/bot performers are our own outbound traffic — never reply to those.
   if (message.performer !== "integration") return null;
-  if (interaction.via && interaction.via !== "whatsApp") return null;
+  if (!interaction.via || !(interaction.via in SUPPORTED_CHANNELS)) return null;
 
   const text = (message.content || message.body || "").trim();
+  // "phone" for WhatsApp; for every other channel this is whatever
+  // identifier that channel uses for the sender (e.g. a Facebook PSID) —
+  // still a unique per-prospect string, just not literally a phone number.
   const phone = message.sender;
   const prospectId = interaction.prospectId;
   if (!text || !phone || !prospectId) return null;
 
   const agentId = interaction.agentId ?? interaction.agent?.id ?? null;
+  const channel = SUPPORTED_CHANNELS[interaction.via];
 
-  return { text, phone, prospectId, interactionId: interaction.id, agentId };
+  return { text, phone, prospectId, interactionId: interaction.id, agentId, channel };
 }
 
 // ---------------------------------------------------------------------------
 // Core processing
 // ---------------------------------------------------------------------------
 
-async function processInboundMessage({ text, phone, prospectId, agentId, interactionId }, env) {
+async function processInboundMessage({ text, phone, prospectId, agentId, interactionId, channel }, env) {
   // Emergency kill switch: sofia_config.whatsapp_enabled, toggled from the
-  // dashboard. Checked before anything else — no reply, no claim, no
+  // dashboard. Despite the name it's a global on/off for Sofía across every
+  // connected channel (WhatsApp + Facebook), not WhatsApp-specific — kept
+  // the original column name to avoid an unrelated dashboard migration.
+  // Checked before anything else — no reply, no claim, no
   // sofia_conversations update — so it's an immediate global pause.
   const sofiaConfig = await loadSofiaConfig(env);
   if (!sofiaConfig.whatsapp_enabled) {
-    console.log(`Skipping inbound message: Sofía WhatsApp is paused (whatsapp_enabled=false), prospect ${prospectId}`);
+    console.log(`Skipping inbound message: Sofía is paused (whatsapp_enabled=false), prospect ${prospectId}`);
     return;
   }
 
@@ -241,7 +259,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     const limitReasonText = "límite de mensajes alcanzado";
     const limitReply = pickMessageLimitReply();
     await claimPromise;
-    await sendWhatsappMessage(env, prospectId, limitReply);
+    await sendChannelMessage(env, prospectId, channel, limitReply);
     const limitAgility = await runEscalationAgility(env, {
       prospectId,
       history,
@@ -252,9 +270,10 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     const updatedHistory = [...history, { role: "assistant", content: limitReply }].slice(
       -MAX_HISTORY_MESSAGES
     );
-    await saveSession(env, phoneHash, updatedHistory);
+    await saveSession(env, phoneHash, updatedHistory, channel);
     await upsertConversation(env, {
       phoneHash,
+      channel,
       lastMessage: limitReply,
       escalated: true,
       escalationReason: limitReasonText,
@@ -287,7 +306,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   const updatedHistory = [...history, { role: "assistant", content: reply }].slice(
     -MAX_HISTORY_MESSAGES
   );
-  await saveSession(env, phoneHash, updatedHistory);
+  await saveSession(env, phoneHash, updatedHistory, channel);
 
   let agility = { procedureInterest: null, sentiment: null };
 
@@ -300,7 +319,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     // before handing off, so the patient isn't left hanging. Skip only if
     // there's truly nothing to send (Sofía wrote nothing before the tag).
     if (reply) {
-      await sendWhatsappMessage(env, prospectId, reply);
+      await sendChannelMessage(env, prospectId, channel, reply);
     }
     agility = await runEscalationAgility(env, {
       prospectId,
@@ -309,11 +328,12 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     });
     await transferToNextAgentInPool(env, prospectId);
   } else {
-    await sendWhatsappMessage(env, prospectId, reply);
+    await sendChannelMessage(env, prospectId, channel, reply);
   }
 
   await upsertConversation(env, {
     phoneHash,
+    channel,
     lastMessage: reply,
     escalated,
     escalationReason: escalation_reason,
@@ -511,7 +531,7 @@ async function getOrCreateSession(env, phoneHash) {
   return { messages: rows[0]?.messages ?? [] };
 }
 
-async function saveSession(env, phoneHash, messages) {
+async function saveSession(env, phoneHash, messages, channel) {
   await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?on_conflict=phone_hash`, {
     method: "POST",
     headers: {
@@ -520,7 +540,7 @@ async function saveSession(env, phoneHash, messages) {
       "Content-Type": "application/json",
       Prefer: "resolution=merge-duplicates,return=minimal",
     },
-    body: JSON.stringify({ phone_hash: phoneHash, messages, channel: "whatsapp" }),
+    body: JSON.stringify({ phone_hash: phoneHash, messages, channel }),
   });
 }
 
@@ -551,6 +571,7 @@ async function getConversationState(env, phoneHash) {
 // fresh from 0, same as a genuinely new conversation.
 async function upsertConversation(env, {
   phoneHash,
+  channel,
   lastMessage,
   escalated,
   escalationReason,
@@ -592,7 +613,7 @@ async function upsertConversation(env, {
       headers: { ...headers, Prefer: "return=minimal" },
       body: JSON.stringify({
         phone_hash: phoneHash,
-        channel: "whatsapp",
+        channel,
         last_message: lastMessage,
         escalated,
         escalation_reason: escalationReason,
@@ -628,9 +649,9 @@ async function getProspectStatus(env, prospectId) {
   }
 }
 
-async function sendWhatsappMessage(env, prospectId, content) {
+async function sendChannelMessage(env, prospectId, channel, content) {
   const res = await fetch(
-    `${ZENVIA_API_BASE}/prospect/${prospectId}/messaging/${WHATSAPP_CHANNEL}?api-key=${env.ZENVIA_API_KEY}`,
+    `${ZENVIA_API_BASE}/prospect/${prospectId}/messaging/${channel}?api-key=${env.ZENVIA_API_KEY}`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -638,7 +659,7 @@ async function sendWhatsappMessage(env, prospectId, content) {
     }
   );
   if (!res.ok) {
-    console.error("sendWhatsappMessage failed", res.status, await res.text());
+    console.error("sendChannelMessage failed", channel, res.status, await res.text());
   }
   return res;
 }
@@ -1059,9 +1080,13 @@ async function closeDirectly(env, prospects) {
 }
 
 async function sendWarnings(env, prospects) {
+  // Dormant mode (the dashboard button always sends mode: "closeDirect" —
+  // see the inactivity cleanup section below). getOpenProspects() doesn't
+  // return each prospect's channel, so this still assumes WhatsApp; would
+  // need that added before "warn" is safe to use for Facebook prospects too.
   for (const prospect of prospects) {
     try {
-      await sendWhatsappMessage(env, prospect.id, INACTIVITY_WARNING_MESSAGE);
+      await sendChannelMessage(env, prospect.id, "whatsapp", INACTIVITY_WARNING_MESSAGE);
       await upsertCleanupRow(env, {
         prospectId: prospect.id,
         groupId: CEC_GROUP_ID,
