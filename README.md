@@ -549,6 +549,44 @@ mensaje del mismo prospecto/teléfono con un `interactionId` **distinto**
 correctamente, cero filas escritas en Supabase; (c) flujo normal sin
 `agentId` asignado → sigue funcionando sin cambios.
 
+### 1.9 Resuelto el trade-off de 1.8 — Sofía vuelve a responder cuando Zenvia marca la conversación como "closed"
+
+El fix de 1.8 dejó un trade-off aceptado a la fuerza: una vez `escalated =
+true` para un `phone_hash`, Sofía nunca volvía a responder, sin importar si
+el asesor humano ya había resuelto y cerrado el caso. En la práctica esto se
+notó como "Sofía dejó de responder" en conversaciones que en realidad ya
+estaban resueltas del lado humano.
+
+**La señal que faltaba:** el objeto `prospect` de Zenvia (`GET
+/prospect/{id}`) trae un campo `status` con 4 valores reales documentados por
+Zenvia — `new`, `processing`, `followUp`, `closed` — que solo cambia cuando
+alguien realmente cierra la conversación. A diferencia de `Interaction.id`
+(que cambia en cada mensaje individual, ver 1.7/1.8), `status` es estable
+mientras la conversación sigue abierta.
+
+**Fix:** cuando `conversationState.escalated` es `true`, en vez de detenerse
+siempre, ahora se consulta `getProspectStatus()` (`GET /prospect/{id}`):
+- Si `status !== "closed"` (o falla la consulta) → se mantiene el
+  comportamiento de 1.8: silencio total, sin tocar nada.
+- Si `status === "closed"` → se trata como una conversación nueva: se
+  resetea `escalated = false` y `message_count = 0` (vía el parámetro
+  `resetCounters` en `upsertConversation`, reintroducido pero ahora atado a
+  una señal confiable en vez del `Interaction.id`) y Sofía responde
+  normalmente.
+
+Importante: esto **no toca** el gate de "humano ya asignado" (1.8) — ese
+sigue siendo incondicional y se evalúa antes que nada, sin importar el
+`status` del prospecto.
+
+**Verificación:** probado con `wrangler dev --remote` + `prospectId` falso y
+tres conversaciones pre-cargadas en Supabase con `escalated = true`: (a)
+`status` no-cerrado (lookup a un ID falso → 404 → `null`) → se mantuvo en
+silencio, cero cambios en la fila; (b) `status === "closed"` (simulado con un
+override local temporal, revertido antes del commit) → Sofía respondió y la
+fila quedó con `escalated = false`, `message_count = 1`; (c) `agentId` de un
+humano real + `status === "closed"` → el gate de humano bloqueó igual, sin
+siquiera llegar a consultar el status.
+
 ---
 
 ## 2. Qué hace el Worker

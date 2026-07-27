@@ -173,17 +173,27 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   const conversationState = await getConversationState(env, phoneHash);
 
   // Hard stop once this conversation has been escalated — by Sofía's own
-  // [ESCALAR] decision or by hitting the message limit below — also
-  // unconditional now, for the same reason. Once true, it stays true until
-  // someone manually clears escalated=false in Supabase. Known trade-off:
-  // a patient who writes back weeks later on a genuinely reopened
-  // conversation won't get Sofía back automatically — there's currently no
-  // reliable Zenvia signal to distinguish that from "same open thread,
-  // new message". Silence-by-default was chosen over risking another
+  // [ESCALAR] decision or by hitting the message limit below — UNLESS
+  // Zenvia's own prospect.status says the conversation was genuinely wrapped
+  // up ("closed"). status is a trustworthy signal (only changes when someone
+  // actually closes the conversation) unlike Interaction.id, which is fresh
+  // on every single message (see README 1.7/1.8). On any other status (new,
+  // processing, followUp) — or if the status lookup itself fails — stay
+  // silent, same as before: silence-by-default over risking another
   // Sofía-overrides-a-human incident.
+  let resetCounters = false;
   if (conversationState.escalated) {
-    console.log(`Skipping inbound message: conversation for prospect ${prospectId} is already escalated`);
-    return;
+    const prospectStatus = await getProspectStatus(env, prospectId);
+    if (prospectStatus !== "closed") {
+      console.log(
+        `Skipping inbound message: conversation for prospect ${prospectId} is already escalated (Zenvia status=${prospectStatus})`
+      );
+      return;
+    }
+    console.log(`Conversation for prospect ${prospectId} was closed in Zenvia — resuming Sofía.`);
+    conversationState.escalated = false;
+    conversationState.messageCount = 0;
+    resetCounters = true;
   }
 
   // Claim the conversation as Sofía right away so it leaves the shared "Sin
@@ -227,6 +237,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       escalated: true,
       escalationReason: limitReasonText,
       interactionId,
+      resetCounters,
       procedureInterest: limitAgility.procedureInterest,
       sentiment: limitAgility.sentiment,
     });
@@ -285,6 +296,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     escalated,
     escalationReason: escalation_reason,
     interactionId,
+    resetCounters,
     procedureInterest: agility.procedureInterest,
     sentiment: agility.sentiment,
   });
@@ -511,17 +523,17 @@ async function getConversationState(env, phoneHash) {
 
 // sofia_conversations has no unique constraint on phone_hash (only on `id`),
 // so this does a manual read-then-write instead of a PostgREST upsert.
-// message_count always accumulates from the stored value — no reset. (A
-// previous "reset on new/reopened conversation" behavior was removed: it
-// was driven by comparing Interaction.id, which Zenvia issues fresh per
-// individual message rather than per conversation thread, so the reset
-// fired on almost every message — see processInboundMessage.)
+// message_count accumulates from the stored value, unless resetCounters is
+// set (Zenvia's prospect.status confirmed "closed" for a previously
+// escalated conversation — see processInboundMessage) — then it starts
+// fresh from 0, same as a genuinely new conversation.
 async function upsertConversation(env, {
   phoneHash,
   lastMessage,
   escalated,
   escalationReason,
   interactionId,
+  resetCounters,
   procedureInterest,
   sentiment,
 }) {
@@ -536,6 +548,7 @@ async function upsertConversation(env, {
     { headers }
   );
   const existing = existingRes.ok ? await existingRes.json() : [];
+  const baselineMessageCount = resetCounters ? 0 : existing[0]?.message_count ?? 0;
 
   if (existing[0]) {
     await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_conversations?id=eq.${existing[0].id}`, {
@@ -545,7 +558,7 @@ async function upsertConversation(env, {
         last_message: lastMessage,
         escalated,
         escalation_reason: escalationReason,
-        message_count: (existing[0].message_count ?? 0) + 1,
+        message_count: baselineMessageCount + 1,
         last_interaction_id: interactionId,
         procedure_interest: procedureInterest ?? null,
         sentiment: sentiment ?? null,
@@ -573,6 +586,23 @@ async function upsertConversation(env, {
 // ---------------------------------------------------------------------------
 // Zenvia Conversion API calls
 // ---------------------------------------------------------------------------
+
+// Zenvia's prospect.status has 4 real values (new, processing, followUp,
+// closed) — unlike Interaction.id (fresh per message, not per thread, see
+// README 1.7/1.8), status only changes when the conversation is genuinely
+// wrapped up. Used to decide whether a previously-escalated conversation
+// can safely resume with Sofía. Returns null on any failure — callers must
+// treat that as "not closed" (stay silent), never as "closed".
+async function getProspectStatus(env, prospectId) {
+  try {
+    const res = await fetch(`${ZENVIA_API_BASE}/prospect/${prospectId}?api-key=${env.ZENVIA_API_KEY}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.status ?? null;
+  } catch {
+    return null;
+  }
+}
 
 async function sendWhatsappMessage(env, prospectId, content) {
   const res = await fetch(
