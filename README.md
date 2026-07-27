@@ -725,6 +725,83 @@ mismos resultados.
 
 Health check trivial (`200 ok`) para verificar que el Worker está arriba.
 
+### `POST /cleanup/scan-and-warn` — limpieza de buzón por inactividad
+
+Protegido por header `x-cleanup-secret` (debe coincidir con el secret
+`CLEANUP_TRIGGER_SECRET`). Body: `{ "dryRun": true|false }` (default `true`
+si se omite — un run real requiere pasar `dryRun: false` explícitamente).
+
+**Investigación previa (corrige varios supuestos del spec original):**
+- `prospect.status` real (confirmado vía `GET /prospects?group=...&limit=5000`
+  sobre el grupo real): `new`, `unclaimed`, `followUp`, `archived` — no
+  `new`/`processing`/`followUp`/`closed` como sugiere el artículo de ayuda de
+  Zenvia (ver también la corrección en 1.9 más arriba).
+- `archivingReason "inactive"` ("Inactivo") ya existe en
+  `GET /as-user/archiving-reasons` — no hubo que crear ninguno.
+- No existe `agent.nextReminder` ni `interaction.dueAt` en los datos reales
+  de esta cuenta (revisados 100 prospects) — el resguardo de "saltar si
+  tiene recordatorio pendiente" del spec original se omitió, por indicación
+  explícita, en vez de construirse contra un campo que no existe.
+- `GET /prospects` tiene un tope duro de `limit=5000` y **no** soporta
+  `offset`/`page`/`cursor`. Filtrar server-side por `status=followUp` y
+  `status=unclaimed` (las únicas conversaciones abiertas) mantiene el
+  conteo muy por debajo de ese tope (~925 al momento de escribir esto)
+  sin necesitar paginación.
+- `GET /prospects/interactions` no soporta `group` ni `prospectId` como
+  filtros, pero `createdAfter` sí funciona sin requerir `agent` — permite
+  traer toda la actividad reciente de la cuenta en una sola llamada
+  (~4800/5000 en una ventana de 24h al momento de escribir esto — cerca del
+  tope, revisar si el tráfico crece) y cruzarla contra la lista de
+  conversaciones abiertas para encontrar cuáles llevan ≥24h sin actividad.
+
+**Lógica:**
+1. `getOpenProspects()` — conversaciones con `status=followUp` o
+   `status=unclaimed` en el grupo del CEC.
+2. `getRecentlyActiveProspectIds()` — ids con al menos una interacción en
+   las últimas 24h, cuenta completa. Si falla, aborta sin avisar ni cerrar
+   nada (fail closed).
+3. `stale = open - recentlyActive`. Se excluyen los que ya están en
+   `sofia_inactivity_cleanup` con `closed_at IS NULL` (ya avisados,
+   pendientes del cierre automático — no se re-avisan).
+4. Si `dryRun`: solo devuelve el resumen, cero mensajes, cero escrituras.
+5. Si no: manda `INACTIVITY_WARNING_MESSAGE` por WhatsApp a cada uno y
+   guarda `warned_at = now()` en `sofia_inactivity_cleanup`.
+
+El mensaje de aviso (`INACTIVITY_WARNING_MESSAGE` en `src/index.js`) es un
+copy propio, cálido y formal ("usted"), sin emojis — mismo tono que
+`sofia_config.system_prompt`, aunque este flujo no pasa por Claude.
+
+### `scheduled()` — cron de cierre (cada 30 min, ver `wrangler.toml`)
+
+1. Lee `sofia_inactivity_cleanup` con `closed_at IS NULL` y
+   `warned_at <= now() - 2h`.
+2. Revisa actividad desde el `warned_at` más antiguo del lote (una sola
+   llamada a `getRecentlyActiveProspectIds`, reusada para todo el lote).
+3. Si el prospecto tuvo actividad desde que se le avisó: `skipped_reason =
+   "respondió"` y se marca `closed_at = now()` igual (para sacarlo de la
+   cola — si vuelve a quedar inactivo, un futuro `scan-and-warn` lo detecta
+   de nuevo con un `warned_at` fresco; dejarlo con `closed_at = null`
+   indefinidamente lo haría revisarse en cada cron para siempre).
+4. Si no: `POST /prospect/{id}/as-user/archive` con
+   `archivingReason: "inactive"` y `closed_at = now()`.
+
+**Verificación:** `dryRun: true` corrido contra el grupo real (925
+conversaciones abiertas, 512 inactivas ≥24h detectadas, cero mensajes/
+escrituras). El cierre (`scheduled()`) se probó con dos filas falsas
+insertadas directo en Supabase (sin pasar por Zenvia, mismo prospectId
+inválido de siempre): una con `warned_at` de hace 3h → correctamente
+archivada (`404` esperado contra el prospectId falso) y marcada
+`closed_at`; otra con `warned_at` de hace 30 min → correctamente ignorada
+(no vencía todavía). La rama "respondió" no se probó en vivo contra un
+prospecto real (para no arriesgar archivar una conversación real por
+error durante la prueba) — la lógica es simétrica a la ya validada en
+1.9/1.8 (`Set.has()` sobre ids reales), pero queda pendiente de una
+verificación en vivo si se quiere esa confianza extra antes de confiar en
+ella a ciegas. **El modo real (`dryRun: false`) del scan-and-warn nunca se
+corrió** — mandaría mensajes reales a 512 pacientes/prospectos, así que
+queda pendiente de que JP lo dispare desde el botón del dashboard después
+de revisar el resumen del dry-run.
+
 ---
 
 ## 3. Variables de entorno necesarias
@@ -747,6 +824,15 @@ wrangler secret put WEBHOOK_SHARED_SECRET
 
 Si la seteas, la `callback_url` que registres en el paso 5 debe incluir
 `?secret=<el mismo valor>`.
+
+Necesaria para el botón de limpieza de inactividad del dashboard
+(`POST /cleanup/scan-and-warn`) — debe tener el mismo valor que el secret
+`CLEANUP_TRIGGER_SECRET` del proyecto de Cloudflare Pages `sofiacec`
+(`functions/api/cleanup-scan.js` en `cecmarketing`):
+
+```bash
+wrangler secret put CLEANUP_TRIGGER_SECRET
+```
 
 ---
 

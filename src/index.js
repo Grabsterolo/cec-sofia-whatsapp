@@ -36,6 +36,17 @@ function pickMessageLimitReply() {
   return MESSAGE_LIMIT_REPLIES[Math.floor(Math.random() * MESSAGE_LIMIT_REPLIES.length)];
 }
 
+// Sent to a prospect that's had no activity in INACTIVITY_WARNING_HOURS —
+// warm, formal "usted", zero emojis, matching Sofía's own tone (see
+// sofia_config.system_prompt) even though this path doesn't call Claude.
+const INACTIVITY_WARNING_MESSAGE =
+  "Como no hemos tenido noticias suyas, vamos a pausar esta conversación por el momento. " +
+  "Si más adelante necesita algo más o quiere retomar el tema, con gusto lo atendemos — solo escríbanos por aquí.";
+
+const INACTIVITY_WARNING_HOURS = 24;
+const INACTIVITY_CLOSE_AFTER_WARNING_HOURS = 2;
+const INACTIVITY_ARCHIVE_REASON = "inactive";
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -48,7 +59,15 @@ export default {
       return handleWebhook(request, env);
     }
 
+    if (request.method === "POST" && url.pathname === "/cleanup/scan-and-warn") {
+      return handleScanAndWarn(request, env);
+    }
+
     return new Response("Not found", { status: 404 });
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(closeInactiveConversations(env));
   },
 };
 
@@ -843,4 +862,270 @@ async function transferProspectToGroup(env, prospectId, groupId) {
     console.error("transferProspectToGroup failed", res.status, await res.text());
   }
   return res;
+}
+
+// ---------------------------------------------------------------------------
+// Inactivity cleanup (Fase 1: scan-and-warn, Fase 2: cron close)
+// ---------------------------------------------------------------------------
+//
+// See README section on inactivity cleanup for full design notes and the
+// live-research corrections to the original spec:
+// - prospect.status real values: new, unclaimed, followUp, archived (not
+//   the help-center's new/processing/followUp/closed).
+// - archivingReason "inactive" already exists in this Zenvia account — no
+//   need to create one.
+// - No agent.nextReminder / interaction.dueAt field found anywhere in this
+//   account's live data — the "skip if has a pending reminder" guard from
+//   the original spec was dropped, by explicit instruction, rather than
+//   built against a field that doesn't exist.
+// - GET /prospects has a hard cap of limit=5000 and no offset/page/cursor
+//   pagination. Filtering server-side by status=followUp / status=unclaimed
+//   keeps the open-conversation set (~925 prospects at time of writing)
+//   comfortably under that cap instead of pulling the whole group
+//   (archived conversations included) and filtering client-side.
+
+async function handleScanAndWarn(request, env) {
+  if (!env.CLEANUP_TRIGGER_SECRET || request.headers.get("x-cleanup-secret") !== env.CLEANUP_TRIGGER_SECRET) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {
+    // no body / invalid JSON -> treat as a real run with no options, same
+    // as an empty {}
+  }
+  const dryRun = body.dryRun !== false; // default true — a real run must opt in explicitly
+
+  const result = await scanAndWarn(env, { dryRun });
+  return new Response(JSON.stringify(result), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+// Fetches every open prospect in the group (status=followUp or
+// status=unclaimed — "archived" ones are already closed, no need to touch
+// them). Two calls instead of one unfiltered pull: keeps each request well
+// under the API's 5000-result cap even as the group grows, without needing
+// pagination the API doesn't support.
+async function getOpenProspects(env, groupId) {
+  const [followUp, unclaimed] = await Promise.all([
+    fetchProspectsByStatus(env, groupId, "followUp"),
+    fetchProspectsByStatus(env, groupId, "unclaimed"),
+  ]);
+  return [...followUp, ...unclaimed];
+}
+
+async function fetchProspectsByStatus(env, groupId, status) {
+  const res = await fetch(
+    `${ZENVIA_API_BASE}/prospects?group=${groupId}&status=${status}&limit=5000&api-key=${env.ZENVIA_API_KEY}`
+  );
+  if (!res.ok) {
+    console.error(`fetchProspectsByStatus(${status}) failed`, res.status, await res.text());
+    return [];
+  }
+  const prospects = await res.json();
+  if (prospects.length === 5000) {
+    console.error(
+      `fetchProspectsByStatus(${status}) hit the 5000 result cap — some open prospects may be missing from this scan`
+    );
+  }
+  return prospects;
+}
+
+// Prospect ids with at least one interaction since `sinceIso`, across the
+// whole account (the interactions endpoint has no group filter — group
+// membership is enforced by intersecting with getOpenProspects() instead).
+async function getRecentlyActiveProspectIds(env, sinceIso) {
+  const res = await fetch(
+    `${ZENVIA_API_BASE}/prospects/interactions?createdAfter=${encodeURIComponent(sinceIso)}&limit=5000&api-key=${env.ZENVIA_API_KEY}`
+  );
+  if (!res.ok) {
+    console.error("getRecentlyActiveProspectIds failed", res.status, await res.text());
+    // Fail closed: treat every prospect as "recently active" so a broken
+    // lookup skips the whole scan instead of warning/closing everything.
+    return null;
+  }
+  const interactions = await res.json();
+  if (interactions.length === 5000) {
+    console.error(
+      "getRecentlyActiveProspectIds hit the 5000 result cap — recent-activity data may be incomplete for this window"
+    );
+  }
+  return new Set(interactions.map((i) => i.prospectId));
+}
+
+async function scanAndWarn(env, { dryRun }) {
+  const sinceIso = new Date(Date.now() - INACTIVITY_WARNING_HOURS * 60 * 60 * 1000).toISOString();
+
+  const [openProspects, recentlyActiveIds] = await Promise.all([
+    getOpenProspects(env, CEC_GROUP_ID),
+    getRecentlyActiveProspectIds(env, sinceIso),
+  ]);
+
+  if (recentlyActiveIds === null) {
+    return {
+      dryRun,
+      error: "Could not determine recent activity — aborted without warning or closing anything.",
+    };
+  }
+
+  const staleProspects = openProspects.filter((p) => !recentlyActiveIds.has(p.id));
+  const alreadyPending = await getPendingCleanupProspectIds(env);
+
+  const toWarn = [];
+  let alreadyPendingCount = 0;
+
+  for (const prospect of staleProspects) {
+    if (alreadyPending.has(prospect.id)) {
+      alreadyPendingCount++;
+      continue;
+    }
+    toWarn.push(prospect);
+  }
+
+  if (!dryRun) {
+    for (const prospect of toWarn) {
+      await sendWhatsappMessage(env, prospect.id, INACTIVITY_WARNING_MESSAGE);
+      await upsertCleanupRow(env, {
+        prospectId: prospect.id,
+        groupId: CEC_GROUP_ID,
+        warnedAt: new Date().toISOString(),
+      });
+    }
+  }
+
+  return {
+    dryRun,
+    openConversations: openProspects.length,
+    staleConversations: staleProspects.length,
+    alreadyPendingClosure: alreadyPendingCount,
+    warned: dryRun ? 0 : toWarn.length,
+    wouldWarn: dryRun ? toWarn.length : 0,
+    sampleProspectIds: toWarn.slice(0, 10).map((p) => p.id),
+  };
+}
+
+// Fase 2: runs on the cron schedule (wrangler.toml [triggers]). Closes
+// conversations that were warned INACTIVITY_CLOSE_AFTER_WARNING_HOURS ago
+// and still have no new activity since the warning was sent.
+async function closeInactiveConversations(env) {
+  const dueRows = await getDueForClosure(env, INACTIVITY_CLOSE_AFTER_WARNING_HOURS);
+  if (dueRows.length === 0) return;
+
+  const oldestWarnedAt = dueRows.reduce(
+    (min, r) => (r.warned_at < min ? r.warned_at : min),
+    dueRows[0].warned_at
+  );
+  const activeSinceWarning = await getRecentlyActiveProspectIds(env, oldestWarnedAt);
+
+  if (activeSinceWarning === null) {
+    console.error("closeInactiveConversations aborted — could not determine recent activity");
+    return;
+  }
+
+  for (const row of dueRows) {
+    if (activeSinceWarning.has(row.prospect_id)) {
+      await markCleanupRowSkipped(env, row.prospect_id, "respondió");
+      continue;
+    }
+    await archiveProspect(env, row.prospect_id, INACTIVITY_ARCHIVE_REASON);
+    await markCleanupRowClosed(env, row.prospect_id);
+  }
+}
+
+async function archiveProspect(env, prospectId, archivingReason) {
+  const res = await fetch(
+    `${ZENVIA_API_BASE}/prospect/${prospectId}/as-user/archive?api-key=${env.ZENVIA_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ archivingReason }),
+    }
+  );
+  if (!res.ok) {
+    console.error("archiveProspect failed", prospectId, res.status, await res.text());
+  }
+  return res;
+}
+
+// ---------------------------------------------------------------------------
+// sofia_inactivity_cleanup persistence
+// ---------------------------------------------------------------------------
+
+async function getPendingCleanupProspectIds(env) {
+  const res = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/sofia_inactivity_cleanup?closed_at=is.null&select=prospect_id`,
+    {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+  if (!res.ok) return new Set();
+  const rows = await res.json();
+  return new Set(rows.map((r) => r.prospect_id));
+}
+
+async function getDueForClosure(env, hoursSinceWarning) {
+  const cutoff = new Date(Date.now() - hoursSinceWarning * 60 * 60 * 1000).toISOString();
+  const res = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/sofia_inactivity_cleanup?closed_at=is.null&warned_at=lte.${cutoff}&select=prospect_id,warned_at`,
+    {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+  if (!res.ok) {
+    console.error("getDueForClosure failed", res.status, await res.text());
+    return [];
+  }
+  return res.json();
+}
+
+async function upsertCleanupRow(env, { prospectId, groupId, warnedAt }) {
+  await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_inactivity_cleanup?on_conflict=prospect_id`, {
+    method: "POST",
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates,return=minimal",
+    },
+    body: JSON.stringify({ prospect_id: prospectId, group_id: groupId, warned_at: warnedAt }),
+  });
+}
+
+async function markCleanupRowClosed(env, prospectId) {
+  await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_inactivity_cleanup?prospect_id=eq.${prospectId}`, {
+    method: "PATCH",
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify({ closed_at: new Date().toISOString() }),
+  });
+}
+
+async function markCleanupRowSkipped(env, prospectId, skippedReason) {
+  await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_inactivity_cleanup?prospect_id=eq.${prospectId}`, {
+    method: "PATCH",
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify({ closed_at: new Date().toISOString(), skipped_reason: skippedReason }),
+  });
 }

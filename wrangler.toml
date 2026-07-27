@@ -2,6 +2,13 @@ name = "cec-sofia-whatsapp"
 main = "src/index.js"
 compatibility_date = "2026-07-01"
 
+# Fase 2 of the inactivity cleanup — closes conversations that were warned
+# INACTIVITY_CLOSE_AFTER_WARNING_HOURS ago and are still inactive. Every
+# 30 minutes is frequent enough that the 2h window is enforced with well
+# under 30min of slop.
+[triggers]
+crons = ["*/30 * * * *"]
+
 # Secrets (set manually, never in this file or in git):
 #   wrangler secret put ZENVIA_API_KEY
 #   wrangler secret put SUPABASE_URL
@@ -9,3 +16,4 @@ compatibility_date = "2026-07-01"
 #   wrangler secret put OPENAI_API_KEY
 #   wrangler secret put ANTHROPIC_API_KEY
 #   wrangler secret put WEBHOOK_SHARED_SECRET   # optional, see README
+#   wrangler secret put CLEANUP_TRIGGER_SECRET  # protects POST /cleanup/scan-and-warn
