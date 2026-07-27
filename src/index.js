@@ -900,8 +900,13 @@ async function handleScanAndWarn(request, env, ctx) {
     // as an empty {}
   }
   const dryRun = body.dryRun !== false; // default true — a real run must opt in explicitly
+  // "warn" = original flow (WhatsApp warning, closes 2h later if no reply).
+  // "closeDirect" = archive stale conversations immediately, no WhatsApp
+  // message sent at all — added because warning each one costs a real
+  // WhatsApp message and JP asked to skip that cost entirely.
+  const mode = body.mode === "closeDirect" ? "closeDirect" : "warn";
 
-  const result = await scanAndWarn(env, ctx, { dryRun });
+  const result = await scanAndWarn(env, ctx, { dryRun, mode });
   return new Response(JSON.stringify(result), {
     status: 200,
     headers: { "content-type": "application/json" },
@@ -960,7 +965,7 @@ async function getRecentlyActiveProspectIds(env, sinceIso) {
   return new Set(interactions.map((i) => i.prospectId));
 }
 
-async function scanAndWarn(env, ctx, { dryRun }) {
+async function scanAndWarn(env, ctx, { dryRun, mode }) {
   const sinceIso = new Date(Date.now() - INACTIVITY_WARNING_HOURS * 60 * 60 * 1000).toISOString();
 
   const [openProspects, recentlyActiveIds] = await Promise.all([
@@ -971,6 +976,7 @@ async function scanAndWarn(env, ctx, { dryRun }) {
   if (recentlyActiveIds === null) {
     return {
       dryRun,
+      mode,
       error: "Could not determine recent activity — aborted without warning or closing anything.",
     };
   }
@@ -978,7 +984,7 @@ async function scanAndWarn(env, ctx, { dryRun }) {
   const staleProspects = openProspects.filter((p) => !recentlyActiveIds.has(p.id));
   const alreadyPending = await getPendingCleanupProspectIds(env);
 
-  const toWarn = [];
+  const toProcess = [];
   let alreadyPendingCount = 0;
 
   for (const prospect of staleProspects) {
@@ -986,28 +992,49 @@ async function scanAndWarn(env, ctx, { dryRun }) {
       alreadyPendingCount++;
       continue;
     }
-    toWarn.push(prospect);
+    toProcess.push(prospect);
   }
 
-  // Sending 500+ WhatsApp messages one at a time, awaited inline, takes
-  // minutes — far longer than an interactive HTTP request (from the
-  // dashboard button, through the Pages Function, to this Worker) can stay
-  // open. ctx.waitUntil() keeps this running in the background after the
-  // response below is already sent, so the button gets a fast answer
-  // ("queued N") instead of the whole chain timing out mid-send.
-  if (!dryRun && toWarn.length > 0) {
-    ctx.waitUntil(sendWarnings(env, toWarn));
+  // Both paths touch hundreds of prospects one at a time — far longer than
+  // an interactive HTTP request (dashboard -> Pages Function -> this
+  // Worker) can stay open. ctx.waitUntil() keeps this running in the
+  // background after the response below is already sent, so the button
+  // gets a fast answer ("queued N") instead of the whole chain timing out
+  // mid-run.
+  if (!dryRun && toProcess.length > 0) {
+    ctx.waitUntil(mode === "closeDirect" ? closeDirectly(env, toProcess) : sendWarnings(env, toProcess));
   }
 
   return {
     dryRun,
+    mode,
     openConversations: openProspects.length,
     staleConversations: staleProspects.length,
     alreadyPendingClosure: alreadyPendingCount,
-    warned: dryRun ? 0 : toWarn.length, // queued in the background, not yet confirmed sent — see sofia_inactivity_cleanup for progress
-    wouldWarn: dryRun ? toWarn.length : 0,
-    sampleProspectIds: toWarn.slice(0, 10).map((p) => p.id),
+    warned: dryRun ? 0 : toProcess.length, // queued in the background, not yet confirmed done — see sofia_inactivity_cleanup for progress
+    wouldWarn: dryRun ? toProcess.length : 0,
+    sampleProspectIds: toProcess.slice(0, 10).map((p) => p.id),
   };
+}
+
+// mode: "closeDirect" — archives stale conversations right away with no
+// WhatsApp message at all (each warning message has a real cost; JP asked
+// to skip it and just close everything already ≥24h inactive).
+async function closeDirectly(env, prospects) {
+  for (const prospect of prospects) {
+    try {
+      const archiveRes = await archiveProspect(env, prospect.id, INACTIVITY_ARCHIVE_REASON);
+      if (!archiveRes.ok) continue; // don't record as closed if it wasn't — leave it for the next scan to retry
+      await upsertCleanupRow(env, {
+        prospectId: prospect.id,
+        groupId: CEC_GROUP_ID,
+        warnedAt: null,
+      });
+      await markCleanupRowClosed(env, prospect.id);
+    } catch (err) {
+      console.error("closeDirectly failed for", prospect.id, err);
+    }
+  }
 }
 
 async function sendWarnings(env, prospects) {

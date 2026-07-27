@@ -797,10 +797,62 @@ prospecto real (para no arriesgar archivar una conversación real por
 error durante la prueba) — la lógica es simétrica a la ya validada en
 1.9/1.8 (`Set.has()` sobre ids reales), pero queda pendiente de una
 verificación en vivo si se quiere esa confianza extra antes de confiar en
-ella a ciegas. **El modo real (`dryRun: false`) del scan-and-warn nunca se
-corrió** — mandaría mensajes reales a 512 pacientes/prospectos, así que
-queda pendiente de que JP lo dispare desde el botón del dashboard después
-de revisar el resumen del dry-run.
+ella a ciegas.
+
+### Incidente en producción — timeout en el envío real + cambio a cierre directo sin WhatsApp
+
+El primer intento real (`dryRun: false`) desde el botón del dashboard
+falló: mandaba los 535 avisos uno por uno, esperado cada uno de forma
+síncrona dentro del mismo request HTTP interactivo (dashboard → Pages
+Function → este Worker). Eso tarda minutos — mucho más de lo que esa
+cadena de peticiones aguanta abierta — así que la conexión se cortó a
+mitad de camino. El navegador recibió la página de error HTML de la
+plataforma en vez de JSON (`Unexpected token '<'... is not valid JSON`).
+
+**Efecto real:** antes de cortarse, alcanzó a mandar el mensaje de aviso a
+**23 conversaciones reales** (confirmado por sus filas en
+`sofia_inactivity_cleanup` con `warned_at` entre 20:00:45 y 20:00:54 UTC
+del 2026-07-27). Esas 23 quedaron correctamente registradas y las cierra
+el cron normal 2h después si nadie responde — no hubo que hacer nada
+especial con ellas.
+
+**Fix — envío en segundo plano:** `sendWarnings()` (el loop que manda los
+avisos) ahora se dispara con `ctx.waitUntil()` en vez de esperarse en
+línea. El endpoint responde de inmediato con un resumen ("N en cola") y
+el envío real sigue corriendo en segundo plano después de que la
+respuesta ya salió — sin este cambio, cualquier tanda de más de ~30-50
+mensajes reventaría el mismo timeout. Verificado con `wrangler dev
+--remote` + una ruta de debug temporal: 20 IDs falsos encolados, la
+respuesta volvió en ~490ms, y los 20 envíos de fondo se completaron poco
+después (cada uno con el error esperado por ser un ObjectId inválido, sin
+detener el lote).
+
+**Cambio de alcance — `mode: "closeDirect"`:** después de ver que ese
+primer intento real ya había costado 23 mensajes de WhatsApp reales, JP
+pidió no seguir pagando por avisar una por una a las ~500 restantes, sino
+cerrar directamente las conversaciones inactivas ≥24h sin mandarles nada.
+`POST /cleanup/scan-and-warn` ahora acepta `{ dryRun, mode }`:
+- `mode: "warn"` (default) — el flujo original: manda el aviso por
+  WhatsApp, cierra 2h después si no hay respuesta (`sendWarnings()`).
+- `mode: "closeDirect"` — nuevo: llama `POST /prospect/{id}/as-user/archive`
+  directamente para cada conversación stale, sin enviar ningún mensaje
+  (`closeDirectly()`). Solo marca la fila como `closed_at` si el archive en
+  Zenvia realmente respondió `ok` — si falla, se deja sin cerrar para que
+  un `scan-and-warn` futuro la vuelva a intentar.
+
+El botón del dashboard (`SofiaConversationsSection.jsx`) ahora manda
+siempre `mode: "closeDirect"` — ya no ofrece la opción de avisar por
+WhatsApp desde la UI (el código de `mode: "warn"` se deja en el Worker por
+si se necesita reactivarlo más adelante, pero nada en el dashboard lo
+dispara).
+
+Verificado con `wrangler dev --remote`: `dryRun` con `mode: "closeDirect"`
+contra el grupo real (941 abiertas, 527 stale) — mismos números que antes,
+cero escrituras. El envío real de `closeDirectly()` se probó igual que
+`sendWarnings()`, con 5 prospectIds falsos vía una ruta de debug temporal:
+respuesta en ~550ms, los 5 archivados en segundo plano fallaron de forma
+segura (`400 Invalid prospectId`, ObjectId inválido esperado) sin
+detenerse entre sí.
 
 ---
 
