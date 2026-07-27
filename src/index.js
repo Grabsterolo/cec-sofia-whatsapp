@@ -153,37 +153,37 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     return;
   }
 
+  // A human already has this conversation (Adrian, Angie, Ingrid, or
+  // Jordan) — don't touch it at all, on ANY message, unconditionally. This
+  // used to be gated behind an "is this a new conversation" check based on
+  // Interaction.id, which turned out to be wrong: Zenvia issues a new
+  // Interaction.id per individual message, not per conversation thread
+  // (confirmed live — see README 1.7), so that gate skipped this check on
+  // almost every message and let Sofía reclaim conversations a human
+  // already owned. agentId on the inbound payload reflects who currently
+  // owns the prospect right now — that's the only signal we trust.
+  if (agentId && HUMAN_AGENT_IDS.has(agentId)) {
+    console.log(
+      `Skipping inbound message: prospect ${prospectId} is already assigned to a human agent (${agentId})`
+    );
+    return;
+  }
+
   const phoneHash = await sha256Hex(phone);
   const conversationState = await getConversationState(env, phoneHash);
 
-  // Zenvia hands out a new interactionId whenever a closed conversation is
-  // reopened (or on a genuinely new contact, where there's no stored id at
-  // all — lastInteractionId is null). That's the real signal for "this is
-  // fresh territory for Sofía", not message_count or escalated on their
-  // own: a conversation can look "escalated" or "over the limit" from a
-  // previous, already-closed round and still deserve a clean slate now.
-  const isNewConversation = interactionId !== conversationState.lastInteractionId;
-
-  if (!isNewConversation) {
-    // Same open conversation as before — the existing gates apply.
-    // A human already has it (Adrian, Angie, Ingrid, or Jordan) — don't
-    // touch it at all: no reply, no claim, no sofia_conversations update.
-    if (agentId && HUMAN_AGENT_IDS.has(agentId)) {
-      console.log(
-        `Skipping inbound message: prospect ${prospectId} is already assigned to a human agent (${agentId})`
-      );
-      return;
-    }
-
-    // Hard stop once this (still-open) conversation has been escalated —
-    // by Sofía's own [ESCALAR] decision or by hitting the message limit
-    // below — regardless of whether Zenvia has actually reassigned agentId
-    // to a human yet (the group transfer doesn't necessarily do that
-    // immediately). No RAG, no Claude, no claim, no reply.
-    if (conversationState.escalated) {
-      console.log(`Skipping inbound message: conversation for prospect ${prospectId} is already escalated`);
-      return;
-    }
+  // Hard stop once this conversation has been escalated — by Sofía's own
+  // [ESCALAR] decision or by hitting the message limit below — also
+  // unconditional now, for the same reason. Once true, it stays true until
+  // someone manually clears escalated=false in Supabase. Known trade-off:
+  // a patient who writes back weeks later on a genuinely reopened
+  // conversation won't get Sofía back automatically — there's currently no
+  // reliable Zenvia signal to distinguish that from "same open thread,
+  // new message". Silence-by-default was chosen over risking another
+  // Sofía-overrides-a-human incident.
+  if (conversationState.escalated) {
+    console.log(`Skipping inbound message: conversation for prospect ${prospectId} is already escalated`);
+    return;
   }
 
   // Claim the conversation as Sofía right away so it leaves the shared "Sin
@@ -205,12 +205,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     -MAX_HISTORY_MESSAGES
   );
 
-  // A new/reopened conversation starts its turn count from zero, even if
-  // the stored row still has a high count or escalated=true from the
-  // previous (closed) round — that state belongs to the old interaction.
-  const effectiveMessageCount = isNewConversation ? 0 : conversationState.messageCount;
-
-  if (effectiveMessageCount >= MAX_CONVERSATION_TURNS) {
+  if (conversationState.messageCount >= MAX_CONVERSATION_TURNS) {
     const limitReasonText = "límite de mensajes alcanzado";
     const limitReply = pickMessageLimitReply();
     await claimPromise;
@@ -232,7 +227,6 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       escalated: true,
       escalationReason: limitReasonText,
       interactionId,
-      resetCounters: isNewConversation,
       procedureInterest: limitAgility.procedureInterest,
       sentiment: limitAgility.sentiment,
     });
@@ -291,7 +285,6 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     escalated,
     escalationReason: escalation_reason,
     interactionId,
-    resetCounters: isNewConversation,
     procedureInterest: agility.procedureInterest,
     sentiment: agility.sentiment,
   });
@@ -518,16 +511,17 @@ async function getConversationState(env, phoneHash) {
 
 // sofia_conversations has no unique constraint on phone_hash (only on `id`),
 // so this does a manual read-then-write instead of a PostgREST upsert.
-// resetCounters is set for a brand-new/reopened interaction (see
-// processInboundMessage): message_count starts fresh from 0 instead of
-// continuing the old (closed) conversation's count.
+// message_count always accumulates from the stored value — no reset. (A
+// previous "reset on new/reopened conversation" behavior was removed: it
+// was driven by comparing Interaction.id, which Zenvia issues fresh per
+// individual message rather than per conversation thread, so the reset
+// fired on almost every message — see processInboundMessage.)
 async function upsertConversation(env, {
   phoneHash,
   lastMessage,
   escalated,
   escalationReason,
   interactionId,
-  resetCounters,
   procedureInterest,
   sentiment,
 }) {
@@ -543,8 +537,6 @@ async function upsertConversation(env, {
   );
   const existing = existingRes.ok ? await existingRes.json() : [];
 
-  const baselineMessageCount = resetCounters ? 0 : existing[0]?.message_count ?? 0;
-
   if (existing[0]) {
     await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_conversations?id=eq.${existing[0].id}`, {
       method: "PATCH",
@@ -553,7 +545,7 @@ async function upsertConversation(env, {
         last_message: lastMessage,
         escalated,
         escalation_reason: escalationReason,
-        message_count: baselineMessageCount + 1,
+        message_count: (existing[0].message_count ?? 0) + 1,
         last_interaction_id: interactionId,
         procedure_interest: procedureInterest ?? null,
         sentiment: sentiment ?? null,

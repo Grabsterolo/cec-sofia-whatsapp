@@ -504,6 +504,51 @@ suscripción (paso 3 más abajo) y llegue el primer mensaje real, revisa
 `console.error`/log de la request cruda te va a decir exactamente qué forma
 tiene el sobre real, y hay que ajustar esa función (no el resto del Worker).
 
+### 1.8 Bug crítico en producción — Sofía se reasignaba conversaciones ya tomadas por un humano (corregido)
+
+**Síntoma real:** un prospecto ("Anita 🌸", `prospectId`
+`6a65117e44a7bb9e01ac3e40`) ya había sido tomado por Jordan Murillo, y Sofía
+se lo reasignó a sí misma y le siguió respondiendo al paciente.
+
+**Causa raíz:** la lógica de "conversación nueva/reabierta" (agregada en 1.6,
+sección "reset on new interaction") comparaba `interactionId !==
+conversationState.lastInteractionId` para decidir si aplicar los dos gates de
+seguridad (humano ya asignado, conversación ya escalada) o saltárselos por
+tratarse de terreno "fresco". La premisa era que Zenvia reutiliza un mismo
+`Interaction.id` por hilo de conversación y solo emite uno nuevo al reabrir un
+hilo cerrado. Esa premisa era falsa: confirmado en vivo (ver 1.7,
+`GET /prospect/{id}/interactions`), Zenvia emite un `Interaction.id` distinto
+**por cada mensaje individual**, no por hilo. Eso hacía que
+`isNewConversation` fuera casi siempre `true`, lo cual:
+
+- Saltaba el gate de "ya lo tiene un humano" en casi todos los mensajes.
+- Saltaba el gate de "ya está escalada" en casi todos los mensajes.
+- Rompía el límite de 10 mensajes: `resetCounters: isNewConversation` casi
+  siempre `true` significaba que `message_count` nunca acumulaba más de 1.
+
+**Fix aplicado:** se eliminó por completo `isNewConversation` /
+`resetCounters` / `effectiveMessageCount`. Los dos gates de seguridad y la
+acumulación de `message_count` ahora son incondicionales en cada mensaje —
+ya no dependen de comparar `Interaction.id` para nada.
+
+**Trade-off aceptado explícitamente:** una vez que `escalated = true` para un
+`phone_hash`, Sofía ya no vuelve a responderle automáticamente a ese
+paciente, incluso si genuinamente reabre la conversación semanas después —
+no existe hoy una señal confiable de Zenvia para distinguir "mismo hilo
+abierto, mensaje nuevo" de "hilo genuinamente reabierto". Se prefirió este
+silencio-por-defecto sobre el riesgo de repetir el incidente de
+Sofía-reemplazando-a-un-humano. Para reactivar a Sofía en una conversación
+puntual hay que limpiar manualmente `escalated = false` en
+`sofia_conversations` (Supabase).
+
+**Verificación:** probado con `wrangler dev --remote` + `prospectId` falso,
+simulando (a) primer mensaje entrante con `agentId` de un humano real ya
+asignado → confirmado que el Worker no responde ni reclama; (b) un segundo
+mensaje del mismo prospecto/teléfono con un `interactionId` **distinto**
+(reproduciendo exactamente el disparador del bug real) → también bloqueado
+correctamente, cero filas escritas en Supabase; (c) flujo normal sin
+`agentId` asignado → sigue funcionando sin cambios.
+
 ---
 
 ## 2. Qué hace el Worker
