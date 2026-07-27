@@ -206,6 +206,36 @@ confirmado contra el `swagger.json` real). Cualquiera del equipo que esté
 disponible lo puede tomar desde el pool del grupo — ya no hace falta la
 lógica de "elegir quién está online" que existía antes.
 
+### 1.5f Vuelta a asignación puntual — round-robin entre los 4 asesores (reemplaza 1.5c)
+
+El escalar al grupo completo (1.5c) hacía que las conversaciones se
+amontonaran de forma pareja en el pool compartido, sin repartirse. JP pidió
+que Zenvia distribuya el trabajo asignando cada escalación a un asesor
+específico, rotando entre los 4 en orden fijo.
+
+`transferProspectToGroup()` se eliminó; ahora `transferToNextAgentInPool()`
+llama a `transferProspectToAgent()` (`as-user/transfer`, la misma que ya se
+usaba para que Sofía se auto-asignara) con el siguiente `agentId` de
+`HUMAN_AGENTS` en orden: Adrian → Angie → Ingrid → Jordan → Adrian → ...
+
+El turno se guarda en `sofia_config.escalation_round_robin_index` (columna
+nueva, entero que solo crece — el agente es `index % 4`, así que no hay que
+manejar el "dar la vuelta" como caso especial). Es un read-then-write
+simple contra Supabase, no atómico: si dos escalaciones llegaran en el
+mismo instante exacto podrían leer el mismo índice y caer en el mismo
+asesor. Aceptado a propósito — las escalaciones son poco frecuentes, así
+que el riesgo real de que eso pase es bajísimo, y el costo de un turno
+salteado ocasional es bajo.
+
+**Verificación:** con `wrangler dev --remote` + una ruta de debug temporal,
+6 llamadas seguidas a `pickNextPoolAgent()` devolvieron exactamente
+`Adrian, Angie, Ingrid, Jordan, Adrian, Angie` (confirmado el orden
+correcto y el wraparound), y `escalation_round_robin_index` en Supabase
+subió de 0 a 6. Después, una llamada a `transferToNextAgentInPool()` con
+un `prospectId` falso disparó `transferProspectToAgent()` de verdad contra
+Zenvia (confirmado en el log: `transferProspectToAgent failed 404` — el
+404 esperado para un prospecto falso, no un error de scope/auth).
+
 ### 1.5d Investigación — ¿marcar "no leído" y/o etiquetas? (solo lectura del spec, nada implementado)
 
 Investigación puntual pedida para evaluar dos ideas antes de decidir si se
@@ -396,7 +426,8 @@ existentes). `CategoriesByIndustry` ya no aparece en el spec actual.
 ### 1.5e Agilidad para asesores al escalar — implementado
 
 Cuando `escalated` es `true` (por `[ESCALAR]` de Sofía o por el límite de
-10 mensajes), **antes de transferir al grupo**, `runEscalationAgility()` en
+10 mensajes), **antes de transferir al siguiente asesor del pool** (ver
+1.5f), `runEscalationAgility()` en
 `src/index.js` corre tres pasos, todos **best-effort** — ninguno puede
 bloquear ni retrasar lo importante (responder al paciente, transferir):
 
@@ -651,8 +682,8 @@ mismos resultados.
        conversación abierta), se ignora el mensaje por completo — sin RAG,
        sin Claude, sin reclamo, sin respuesta, solo un `console.log`. No
        depende de que Zenvia ya haya reasignado `agentId` a un humano de
-       verdad — el transfer al grupo (ver 1.5c) no necesariamente lo hace
-       de inmediato, así que este chequeo cubre ese hueco mientras la
+       verdad — el transfer al asesor del pool (ver 1.5f) no necesariamente
+       lo hace de inmediato, así que este chequeo cubre ese hueco mientras la
        conversación siga con el mismo `interactionId`.
    - Reclama la conversación como Sofia CEC (`POST
      /prospect/{id}/as-user/transfer` con `user` = `SOFIA_AGENT_ID`) apenas
@@ -672,7 +703,8 @@ mismos resultados.
      den la mejor ayuda posible con esto...", etc. — ver
      `MESSAGE_LIMIT_REPLIES` en `src/index.js`), corre la agilidad para
      asesores (`runEscalationAgility()`, ver 1.5e — best-effort, nunca
-     bloquea), transfiere al grupo (ver 1.5c) y guarda `escalated: true`,
+     bloquea), transfiere al siguiente asesor del pool (ver 1.5f) y guarda
+     `escalated: true`,
      `escalation_reason: "límite de mensajes alcanzado"` +
      `procedure_interest`/`sentiment` de lo que devolvió Haiku. Corta el
      flujo ahí — y de paso activa el freno del punto anterior para el
@@ -705,7 +737,7 @@ mismos resultados.
      `[ESCALAR]`) al paciente vía `messaging/whatsapp` — salvo que quede
      vacía, en cuyo caso se salta ese envío —, corre la agilidad para
      asesores (`runEscalationAgility()`, ver 1.5e) y por último transfiere
-     al **grupo** (ver 1.5c), no a un agente específico.
+     al **siguiente asesor del pool** (round-robin, ver 1.5f).
    - Actualiza `sofia_conversations` (insert si no existe fila para ese
      `phone_hash`, update si ya existe — la tabla no tiene constraint único
      en `phone_hash`, así que es lectura+escritura manual, no un upsert de

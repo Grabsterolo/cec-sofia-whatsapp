@@ -247,7 +247,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       history,
       escalationReason: limitReasonText,
     });
-    await transferProspectToGroup(env, prospectId, CEC_GROUP_ID);
+    await transferToNextAgentInPool(env, prospectId);
 
     const updatedHistory = [...history, { role: "assistant", content: limitReply }].slice(
       -MAX_HISTORY_MESSAGES
@@ -307,7 +307,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       history: updatedHistory,
       escalationReason: escalation_reason,
     });
-    await transferProspectToGroup(env, prospectId, CEC_GROUP_ID);
+    await transferToNextAgentInPool(env, prospectId);
   } else {
     await sendWhatsappMessage(env, prospectId, reply);
   }
@@ -846,22 +846,43 @@ async function transferProspectToAgent(env, prospectId, agentId) {
   return res;
 }
 
-// Escalation goes to the group, not a specific agent — whoever's available
-// on the team picks it up. scope: prospects:read (live-confirmed against
-// the real swagger.json — see README 1.5).
-async function transferProspectToGroup(env, prospectId, groupId) {
+// Escalation used to go to the whole group ("whoever's available picks it
+// up"), but that let conversations pile up unevenly. Now it's a simple
+// round-robin over HUMAN_AGENTS, in fixed order (Adrian, Angie, Ingrid,
+// Jordan, Adrian, ...), tracked via sofia_config.escalation_round_robin_index
+// (a single ever-incrementing counter — the agent is index % length, so
+// no special-casing is needed on wraparound). Reads-then-writes the
+// counter in Supabase, so two escalations arriving in the same instant
+// could in theory read the same value and both go to the same agent —
+// acceptable: escalations are infrequent enough that this is a non-issue
+// in practice, and the cost of a rare skipped/doubled turn is low.
+async function transferToNextAgentInPool(env, prospectId) {
+  const agentId = await pickNextPoolAgent(env);
+  return transferProspectToAgent(env, prospectId, agentId);
+}
+
+async function pickNextPoolAgent(env) {
+  const headers = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+  };
+
   const res = await fetch(
-    `${ZENVIA_API_BASE}/prospect/${prospectId}/transfer?api-key=${env.ZENVIA_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ group: groupId }),
-    }
+    `${env.SUPABASE_URL}/rest/v1/sofia_config?id=eq.1&select=escalation_round_robin_index`,
+    { headers }
   );
-  if (!res.ok) {
-    console.error("transferProspectToGroup failed", res.status, await res.text());
-  }
-  return res;
+  const currentIndex = res.ok ? (await res.json())[0]?.escalation_round_robin_index ?? 0 : 0;
+
+  const agent = HUMAN_AGENTS[currentIndex % HUMAN_AGENTS.length];
+
+  await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_config?id=eq.1`, {
+    method: "PATCH",
+    headers: { ...headers, Prefer: "return=minimal" },
+    body: JSON.stringify({ escalation_round_robin_index: currentIndex + 1 }),
+  });
+
+  return agent.id;
 }
 
 // ---------------------------------------------------------------------------
