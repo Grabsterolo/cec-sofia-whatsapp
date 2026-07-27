@@ -587,6 +587,21 @@ fila quedó con `escalated = false`, `message_count = 1`; (c) `agentId` de un
 humano real + `status === "closed"` → el gate de humano bloqueó igual, sin
 siquiera llegar a consultar el status.
 
+**Corrección post-deploy — el valor real es `"archived"`, no `"closed"`:**
+el artículo de ayuda de Zenvia usa nombres genéricos ("Closed") que no
+coinciden con el valor literal que la API devuelve. Confirmado en vivo con
+`GET /prospects?group={groupId}&limit=5000` sobre el grupo real (`620bdb7d...`,
+5000 resultados, tope de la API): los únicos valores de `status` observados
+son `"new"`, `"unclaimed"`, `"followUp"` y `"archived"` — nunca `"closed"`.
+Un prospecto real archivado (`status: "archived"`, con `archivingReason`
+poblado) lo confirmó. El código se corrigió para comparar contra
+`"archived"` en vez de `"closed"` (mismo día del deploy original, antes de
+que causara ningún problema real — el bug era "silencioso": con `"closed"`
+el resume simplemente nunca se disparaba, pero tampoco reactivaba a Sofía
+de forma incorrecta). Re-verificado con el mismo método de tres casos
+(fake ID no-archivado, override local `"archived"`, humano + archived) —
+mismos resultados.
+
 ---
 
 ## 2. Qué hace el Worker

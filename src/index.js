@@ -175,22 +175,25 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // Hard stop once this conversation has been escalated — by Sofía's own
   // [ESCALAR] decision or by hitting the message limit below — UNLESS
   // Zenvia's own prospect.status says the conversation was genuinely wrapped
-  // up ("closed"). status is a trustworthy signal (only changes when someone
-  // actually closes the conversation) unlike Interaction.id, which is fresh
-  // on every single message (see README 1.7/1.8). On any other status (new,
-  // processing, followUp) — or if the status lookup itself fails — stay
-  // silent, same as before: silence-by-default over risking another
-  // Sofía-overrides-a-human incident.
+  // up ("archived" — Zenvia's real API value; live-confirmed via GET
+  // /prospects, see README 1.9 correction. The help-center concept "Closed"
+  // does NOT literally appear as "closed" in the API). status is a
+  // trustworthy signal (only changes when someone actually closes the
+  // conversation) unlike Interaction.id, which is fresh on every single
+  // message (see README 1.7/1.8). On any other status (new, unclaimed,
+  // followUp) — or if the status lookup itself fails — stay silent, same as
+  // before: silence-by-default over risking another Sofía-overrides-a-human
+  // incident.
   let resetCounters = false;
   if (conversationState.escalated) {
     const prospectStatus = await getProspectStatus(env, prospectId);
-    if (prospectStatus !== "closed") {
+    if (prospectStatus !== "archived") {
       console.log(
         `Skipping inbound message: conversation for prospect ${prospectId} is already escalated (Zenvia status=${prospectStatus})`
       );
       return;
     }
-    console.log(`Conversation for prospect ${prospectId} was closed in Zenvia — resuming Sofía.`);
+    console.log(`Conversation for prospect ${prospectId} was archived in Zenvia — resuming Sofía.`);
     conversationState.escalated = false;
     conversationState.messageCount = 0;
     resetCounters = true;
@@ -524,7 +527,7 @@ async function getConversationState(env, phoneHash) {
 // sofia_conversations has no unique constraint on phone_hash (only on `id`),
 // so this does a manual read-then-write instead of a PostgREST upsert.
 // message_count accumulates from the stored value, unless resetCounters is
-// set (Zenvia's prospect.status confirmed "closed" for a previously
+// set (Zenvia's prospect.status confirmed "archived" for a previously
 // escalated conversation — see processInboundMessage) — then it starts
 // fresh from 0, same as a genuinely new conversation.
 async function upsertConversation(env, {
@@ -587,12 +590,14 @@ async function upsertConversation(env, {
 // Zenvia Conversion API calls
 // ---------------------------------------------------------------------------
 
-// Zenvia's prospect.status has 4 real values (new, processing, followUp,
-// closed) — unlike Interaction.id (fresh per message, not per thread, see
+// Zenvia's prospect.status has 4 real values live-confirmed via GET
+// /prospects (README 1.9 correction): "new", "unclaimed", "followUp",
+// "archived" — unlike Interaction.id (fresh per message, not per thread, see
 // README 1.7/1.8), status only changes when the conversation is genuinely
-// wrapped up. Used to decide whether a previously-escalated conversation
-// can safely resume with Sofía. Returns null on any failure — callers must
-// treat that as "not closed" (stay silent), never as "closed".
+// wrapped up ("archived"). Used to decide whether a previously-escalated
+// conversation can safely resume with Sofía. Returns null on any failure —
+// callers must treat that as "not archived" (stay silent), never as
+// "archived".
 async function getProspectStatus(env, prospectId) {
   try {
     const res = await fetch(`${ZENVIA_API_BASE}/prospect/${prospectId}?api-key=${env.ZENVIA_API_KEY}`);
