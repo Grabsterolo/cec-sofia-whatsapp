@@ -357,6 +357,13 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     await transferToNextAgentInPool(env, prospectId);
   } else {
     await sendChannelMessage(env, prospectId, channel, reply);
+    // Classify every non-escalated turn too (not just escalations) so the
+    // dashboard's conversation list shows a real topic/sentiment instead of
+    // "sin clasificar" for the conversations Sofía resolves on her own — the
+    // large majority of them. No Zenvia labels needed here (that's only
+    // relevant when handing off to a human), so pass an empty label list to
+    // skip the extra Zenvia call runEscalationAgility would otherwise make.
+    agility = await classifyEscalationWithHaiku(env, updatedHistory, []);
   }
 
   await upsertConversation(env, {
@@ -912,10 +919,12 @@ async function getAvailableLabels(env) {
 }
 
 // Cheap classification pass with Haiku (not Sonnet — this is a simple
-// tagging task, not a conversational one) so a human agent gets a running
-// start: which label fits, what the patient actually wants, and how they
-// seem to be feeling. Never throws — always returns a usable (possibly
-// all-null) result.
+// tagging task, not a conversational one): which label fits (only used on
+// escalation), what the patient actually wants, and how they seem to be
+// feeling. Called on every turn (see processInboundMessage) so
+// sofia_conversations always has an up-to-date topic/sentiment, not just on
+// escalation. Never throws — always returns a usable (possibly all-null)
+// result.
 async function classifyEscalationWithHaiku(env, history, availableLabels) {
   try {
     const labelsContext = availableLabels.map((l) => `${l.key}: ${l.name}`).join("\n");
