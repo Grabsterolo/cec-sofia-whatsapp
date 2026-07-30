@@ -355,7 +355,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // block explicitly instead of assuming it's first.
   const textBlock = (claudeData?.content || []).find((b) => b.type === "text");
   const rawText = textBlock?.text ?? "";
-  const { reply, escalated, escalation_reason } = parseEscalation(rawText);
+  const { reply, escalated, escalation_reason, shouldClose } = parseEscalation(rawText);
 
   const updatedHistory = [...history, { role: "assistant", content: reply }].slice(
     -MAX_HISTORY_MESSAGES
@@ -390,6 +390,14 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     // relevant when handing off to a human), so pass an empty label list to
     // skip the extra Zenvia call runEscalationAgility would otherwise make.
     agility = await classifyEscalationWithHaiku(env, updatedHistory, []);
+
+    // [CERRAR] — casos que no necesitan seguimiento humano ni quedar
+    // abiertos en la bandeja (ej. consultas de vacantes, ver system_prompt).
+    // "infoGeneral" es el motivo de archivado de Zenvia más cercano — no es
+    // venta, no es "no interesado", no es inactividad.
+    if (shouldClose) {
+      await archiveProspect(env, prospectId, "infoGeneral");
+    }
   }
 
   await upsertConversation(env, {
@@ -409,8 +417,17 @@ function parseEscalation(rawText) {
   const escalationMatch = rawText.match(/\[ESCALAR:?\s*([^\]]*)\]/i);
   const escalated = !!escalationMatch;
   const escalation_reason = escalated ? escalationMatch[1].trim() || null : null;
-  const reply = rawText.replace(/\s*\[ESCALAR:?\s*([^\]]*)\]\s*/i, " ").trim();
-  return { reply, escalated, escalation_reason };
+  // [CERRAR] — casos que no necesitan seguimiento humano (ej. consultas de
+  // vacantes) pero tampoco deben quedar abiertos en la bandeja. Mutuamente
+  // excluyente con escalar: si Sofía escaló, ignoramos [CERRAR] aunque
+  // aparezca (no debería, pero escalar siempre gana).
+  const closeMatch = rawText.match(/\[CERRAR\]/i);
+  const shouldClose = !escalated && !!closeMatch;
+  const reply = rawText
+    .replace(/\s*\[ESCALAR:?\s*([^\]]*)\]\s*/i, " ")
+    .replace(/\s*\[CERRAR\]\s*/i, " ")
+    .trim();
+  return { reply, escalated, escalation_reason, shouldClose };
 }
 
 // ---------------------------------------------------------------------------
