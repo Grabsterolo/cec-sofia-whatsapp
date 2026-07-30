@@ -1324,14 +1324,29 @@ async function scanAndWarn(env, ctx, { dryRun, mode }) {
     toProcess.push(prospect);
   }
 
-  // Both paths touch hundreds of prospects one at a time — far longer than
-  // an interactive HTTP request (dashboard -> Pages Function -> this
-  // Worker) can stay open. ctx.waitUntil() keeps this running in the
-  // background after the response below is already sent, so the button
-  // gets a fast answer ("queued N") instead of the whole chain timing out
-  // mid-run.
-  if (!dryRun && toProcess.length > 0) {
-    ctx.waitUntil(mode === "closeDirect" ? closeDirectly(env, toProcess) : sendWarnings(env, toProcess));
+  // Cada prospecto en closeDirect gasta 2 subrequests (archivar + 1
+  // escritura a Supabase); "warn" gasta 2 también (enviar WhatsApp + 1
+  // escritura). Sumado a los ~4 subrequests de arranque de este mismo
+  // scanAndWarn (getOpenProspects x2, getRecentlyActiveProspectIds,
+  // getPendingCleanupProspectIds), procesar todo en una sola invocación
+  // choca contra el límite de subrequests por invocación de Cloudflare
+  // ("Too many subrequests") apenas pasan ~20 prospectos — el lote se
+  // cortaba en silencio a mitad de camino, sin avisar. Se procesa en lotes
+  // seguros; lo que sobra queda tal cual (ni "pending" ni "closed"), así
+  // que el siguiente click/scan lo vuelve a recoger solo — batchRemaining
+  // le dice al dashboard si hace falta correrlo de nuevo.
+  const CLEANUP_BATCH_LIMIT = 20;
+  const batch = toProcess.slice(0, CLEANUP_BATCH_LIMIT);
+  const batchRemaining = toProcess.length - batch.length;
+
+  // Ambos modos tocan hasta CLEANUP_BATCH_LIMIT prospectos uno a la vez —
+  // más de lo que un request HTTP interactivo (dashboard -> Pages Function
+  // -> este Worker) puede esperar. ctx.waitUntil() lo sigue corriendo en
+  // segundo plano después de que la respuesta de abajo ya se envió, así el
+  // botón responde rápido ("queued N") en vez de que toda la cadena haga
+  // timeout a mitad de camino.
+  if (!dryRun && batch.length > 0) {
+    ctx.waitUntil(mode === "closeDirect" ? closeDirectly(env, batch) : sendWarnings(env, batch));
   }
 
   return {
@@ -1340,9 +1355,10 @@ async function scanAndWarn(env, ctx, { dryRun, mode }) {
     openConversations: openProspects.length,
     staleConversations: staleProspects.length,
     alreadyPendingClosure: alreadyPendingCount,
-    warned: dryRun ? 0 : toProcess.length, // queued in the background, not yet confirmed done — see sofia_inactivity_cleanup for progress
+    warned: dryRun ? 0 : batch.length, // queued in the background, not yet confirmed done — see sofia_inactivity_cleanup for progress
     wouldWarn: dryRun ? toProcess.length : 0,
-    sampleProspectIds: toProcess.slice(0, 10).map((p) => p.id),
+    batchRemaining, // > 0 significa que hay que volver a correr el scan para terminar
+    sampleProspectIds: batch.slice(0, 10).map((p) => p.id),
   };
 }
 
@@ -1354,12 +1370,7 @@ async function closeDirectly(env, prospects) {
     try {
       const archiveRes = await archiveProspect(env, prospect.id, INACTIVITY_ARCHIVE_REASON);
       if (!archiveRes.ok) continue; // don't record as closed if it wasn't — leave it for the next scan to retry
-      await upsertCleanupRow(env, {
-        prospectId: prospect.id,
-        groupId: CEC_GROUP_ID,
-        warnedAt: null,
-      });
-      await markCleanupRowClosed(env, prospect.id);
+      await upsertCleanupRowClosed(env, { prospectId: prospect.id, groupId: CEC_GROUP_ID });
     } catch (err) {
       console.error("closeDirectly failed for", prospect.id, err);
     }
@@ -1475,6 +1486,31 @@ async function upsertCleanupRow(env, { prospectId, groupId, warnedAt }) {
       Prefer: "resolution=merge-duplicates,return=minimal",
     },
     body: JSON.stringify({ prospect_id: prospectId, group_id: groupId, warned_at: warnedAt }),
+  });
+}
+
+// Upsert + "closed" en una sola llamada (antes eran dos: upsertCleanupRow
+// seguido de markCleanupRowClosed) — closeDirectly() procesa cientos de
+// prospectos secuencialmente dentro de un único ctx.waitUntil(), y cada
+// subrequest cuenta contra el límite por invocación de Cloudflare. Con 3
+// llamadas por prospecto (archivar + 2 escrituras) el lote se cortaba en
+// silencio tras ~15 prospectos; con esta fusión a 1 escritura quedan 2
+// llamadas por prospecto en el camino feliz.
+async function upsertCleanupRowClosed(env, { prospectId, groupId }) {
+  await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_inactivity_cleanup?on_conflict=prospect_id`, {
+    method: "POST",
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates,return=minimal",
+    },
+    body: JSON.stringify({
+      prospect_id: prospectId,
+      group_id: groupId,
+      warned_at: null,
+      closed_at: new Date().toISOString(),
+    }),
   });
 }
 
