@@ -645,7 +645,13 @@ async function ragSearch(env, history) {
       body: JSON.stringify({
         query_embedding: queryEmbedding,
         match_count: 6,
-        match_threshold: 0.5,
+        // 0.5 estaba por debajo del "piso de ruido" real de este corpus:
+        // pares de chunks NO relacionados ya promedian ~0.507 de similitud
+        // coseno entre sí (medido sobre los 79 chunks reales), así que el
+        // umbral casi nunca filtraba nada — match_sofia_chunks devolvía
+        // resultados aunque no hubiera nada realmente relevante, lo cual
+        // apagaba el fallback de mandar el knowledge_base completo.
+        match_threshold: 0.3,
       }),
     });
     if (!ragRes.ok) return [];
