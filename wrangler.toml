@@ -9,6 +9,12 @@ compatibility_date = "2026-07-01"
 [triggers]
 crons = ["*/30 * * * *"]
 
+# Deduplicación de entregas repetidas de webhook (mismo interactionId) — ver
+# processInboundMessage(). TTL corto, no es un dato que necesite persistir.
+[[kv_namespaces]]
+binding = "SOFIA_DEDUP"
+id = "94958807d92548389718c4036ea1b178"
+
 # Secrets (set manually, never in this file or in git):
 #   wrangler secret put ZENVIA_API_KEY
 #   wrangler secret put SUPABASE_URL

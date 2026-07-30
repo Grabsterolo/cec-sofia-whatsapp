@@ -193,11 +193,31 @@ function extractInboundFromInteraction(interaction) {
 // ---------------------------------------------------------------------------
 
 async function processInboundMessage({ text, phone, prospectId, agentId, interactionId, channel, attachment }, env) {
+  // Deduplicate redelivered webhook events. Zenvia (or an upstream retry)
+  // can redeliver the same interaction more than once — without this, each
+  // redelivery re-runs the whole pipeline as if it were a brand new
+  // message: a fresh Claude reply, a fresh outbound WhatsApp send, and a
+  // fresh attempt to claim/reply on a conversation that may have since been
+  // escalated to a human (see README "Sofía repite despedidas / responde
+  // tras reasignación a Angie"). Checked before anything else, including
+  // the kill switch, so a duplicate never does any work at all. TTL is
+  // generous (24h) since a retry storm could plausibly span hours, and the
+  // KV entry itself is tiny and not sensitive.
+  if (interactionId) {
+    const dedupKey = `interaction:${interactionId}`;
+    const alreadyProcessed = await env.SOFIA_DEDUP.get(dedupKey);
+    if (alreadyProcessed) {
+      console.log(`Skipping duplicate delivery of interaction ${interactionId} for prospect ${prospectId}`);
+      return;
+    }
+    await env.SOFIA_DEDUP.put(dedupKey, "1", { expirationTtl: 86400 });
+  }
+
   // Emergency kill switch: sofia_config.whatsapp_enabled, toggled from the
   // dashboard. Despite the name it's a global on/off for Sofía across every
   // connected channel (WhatsApp + Facebook), not WhatsApp-specific — kept
   // the original column name to avoid an unrelated dashboard migration.
-  // Checked before anything else — no reply, no claim, no
+  // Checked before anything else except dedup — no reply, no claim, no
   // sofia_conversations update — so it's an immediate global pause.
   const sofiaConfig = await loadSofiaConfig(env);
   if (!sofiaConfig.whatsapp_enabled) {
@@ -207,16 +227,20 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
 
   // A human already has this conversation (Adrian, Angie, Ingrid, or
   // Jordan) — don't touch it at all, on ANY message, unconditionally. This
-  // used to be gated behind an "is this a new conversation" check based on
-  // Interaction.id, which turned out to be wrong: Zenvia issues a new
-  // Interaction.id per individual message, not per conversation thread
-  // (confirmed live — see README 1.7), so that gate skipped this check on
-  // almost every message and let Sofía reclaim conversations a human
-  // already owned. agentId on the inbound payload reflects who currently
-  // owns the prospect right now — that's the only signal we trust.
-  if (agentId && HUMAN_AGENT_IDS.has(agentId)) {
+  // used to trust the `agentId` field on the inbound webhook payload, which
+  // turned out to be unsafe: on a redelivered/retried event that payload
+  // can reflect who owned the conversation *before* a human claimed it,
+  // not the current owner — a stale-payload window that let Sofía keep
+  // replying after Angie had already taken over (see README "Sofía sigue
+  // respondiendo tras reasignación a un humano"). Fetching the prospect's
+  // current agent directly from Zenvia closes that gap. Fails closed: any
+  // lookup error is treated as "a human might own this" and skipped, never
+  // as "safe to proceed" — same fail-safe direction as the payload-agentId
+  // fix this replaces.
+  const { agentId: liveAgentId, failed: agentLookupFailed } = await getCurrentProspectAgentId(env, prospectId);
+  if (agentLookupFailed || (liveAgentId && HUMAN_AGENT_IDS.has(liveAgentId))) {
     console.log(
-      `Skipping inbound message: prospect ${prospectId} is already assigned to a human agent (${agentId})`
+      `Skipping inbound message: prospect ${prospectId} is owned by a human agent (live check: agentId=${liveAgentId}, lookupFailed=${agentLookupFailed})`
     );
     return;
   }
@@ -256,12 +280,14 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // in with conversations that actually need a human. Skip the call
   // entirely when the interaction is already assigned to Sofía (the common
   // case after the first message in a conversation) to avoid an
-  // unnecessary transfer on every turn. Kicked off here and awaited later
-  // so it runs alongside the RAG + Claude calls instead of blocking them.
-  // Only reached when we're actually going to process the message — both
-  // gates above return before this point when they trigger.
+  // unnecessary transfer on every turn. Uses liveAgentId (not the webhook
+  // payload's agentId) for the same staleness reason as the human-owned
+  // check above. Kicked off here and awaited later so it runs alongside the
+  // RAG + Claude calls instead of blocking them. Only reached when we're
+  // actually going to process the message — both gates above return before
+  // this point when they trigger.
   const claimPromise =
-    agentId !== SOFIA_AGENT_ID
+    liveAgentId !== SOFIA_AGENT_ID
       ? transferProspectToAgent(env, prospectId, SOFIA_AGENT_ID)
       : Promise.resolve();
 
@@ -857,6 +883,24 @@ async function getProspectStatus(env, prospectId) {
     return data.status ?? null;
   } catch {
     return null;
+  }
+}
+
+// The prospect object carries a full `agent: {id, firstName, ...}` object
+// reflecting who currently owns it in Zenvia right now (live-confirmed via
+// GET /prospects) — distinct from, and more trustworthy than, the agentId
+// field on an inbound webhook payload, which can be stale on a redelivered
+// event. `failed: true` on any error — callers must treat that the same as
+// "a human owns this" (fail closed), never as "safe to proceed", since this
+// guards against Sofía overriding a human agent.
+async function getCurrentProspectAgentId(env, prospectId) {
+  try {
+    const res = await fetch(`${ZENVIA_API_BASE}/prospect/${prospectId}?api-key=${env.ZENVIA_API_KEY}`);
+    if (!res.ok) return { agentId: null, failed: true };
+    const data = await res.json();
+    return { agentId: data.agent?.id ?? null, failed: false };
+  } catch {
+    return { agentId: null, failed: true };
   }
 }
 
