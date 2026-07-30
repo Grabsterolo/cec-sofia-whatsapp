@@ -661,7 +661,14 @@ function buildSystemBlocks(system, knowledge_base, chunks) {
     {
       type: "text",
       text: system,
-      cache_control: { type: "ephemeral" },
+      // 1h TTL instead of the 5min default: the median gap between
+      // conversation starts (~169s) is well under 5min, but real gaps range
+      // up to ~2.3h — with the default TTL, roughly a fifth of turns pay a
+      // full 1.25x cache-write instead of a 0.1x read. 1h covers the
+      // observed gap distribution almost entirely, cutting unnecessary
+      // rewrites (~$40/mo estimated) at the cost of a slightly pricier
+      // write (2x instead of 1.25x) on the writes that do still happen.
+      cache_control: { type: "ephemeral", ttl: "1h" },
     },
   ];
 
@@ -678,7 +685,7 @@ function buildSystemBlocks(system, knowledge_base, chunks) {
       text:
         "INFORMACIÓN COMPLETA DEL CEC (usa solo lo relevante para la pregunta del paciente):\n\n" +
         knowledge_base,
-      cache_control: { type: "ephemeral" },
+      cache_control: { type: "ephemeral", ttl: "1h" },
     });
   }
 
