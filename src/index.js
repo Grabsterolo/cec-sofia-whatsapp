@@ -81,6 +81,10 @@ export default {
       return handleScanAndWarn(request, env, ctx);
     }
 
+    if (request.method === "POST" && url.pathname === "/send/birthday") {
+      return handleSendBirthday(request, env);
+    }
+
     return new Response("Not found", { status: 404 });
   },
 
@@ -1167,6 +1171,117 @@ async function transferProspectToAgent(env, prospectId, agentId) {
 async function transferToNextAgentInPool(env, prospectId) {
   const agentId = await pickNextPoolAgent(env);
   return transferProspectToAgent(env, prospectId, agentId);
+}
+
+// ---------------------------------------------------------------------------
+// Manual outbound send — birthday messages triggered from the cecmarketing
+// dashboard (a person clicks a button; this is never automatic). Sofía is
+// otherwise purely reactive (replies to inbound webhooks), so this is the
+// one path that originates a WhatsApp conversation from our side.
+//
+// A regular `messaging/{channel}` send (see sendChannelMessage()) only
+// works inside the 24h WhatsApp session window, which a birthday message
+// will usually fall outside of. `messaging/{channel}/notification` sends a
+// pre-approved WhatsApp template instead, which isn't bound by that window
+// (scope `messages:transactional`, confirmed live-accessible via
+// GET /swagger.json — NewTemplateMessage: { templateId, variables }).
+//
+// NOT YET LIVE-TESTED: the birthday template is created in Zenvia but still
+// pending Meta's review, so BIRTHDAY_TEMPLATE_ID isn't set yet and this path
+// has never actually sent a message.
+//
+// The template has no placeholder (JP's call — fixed text, same message for
+// everyone) — `sendTemplateMessage()` is called with `variables: {}`. If a
+// future template version adds a {{1}} for the name, pass
+// `{ "1": name }` instead (the common WhatsApp convention for template
+// variables, unconfirmed against this account's swagger since no template
+// here has ever used one) and reintroduce a `name` field on the request
+// body / dashboard form.
+async function handleSendBirthday(request, env) {
+  if (!env.SEND_TRIGGER_SECRET || request.headers.get("x-send-secret") !== env.SEND_TRIGGER_SECRET) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  if (!env.BIRTHDAY_TEMPLATE_ID) {
+    return new Response(JSON.stringify({ error: "BIRTHDAY_TEMPLATE_ID no está configurado todavía (falta aprobar la plantilla en Zenvia)." }), {
+      status: 503,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Body inválido, se esperaba JSON." }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const phoneNumber = (body.phoneNumber || "").trim();
+  if (!phoneNumber) {
+    return new Response(JSON.stringify({ error: "Se requiere phoneNumber." }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const prospectId = await findProspectIdByPhone(env, phoneNumber);
+  if (!prospectId) {
+    return new Response(JSON.stringify({ error: `No se encontró ningún prospecto en Zenvia con el teléfono ${phoneNumber}.` }), {
+      status: 404,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const result = await sendTemplateMessage(env, prospectId, "whatsapp", env.BIRTHDAY_TEMPLATE_ID, {});
+  if (!result.ok) {
+    return new Response(JSON.stringify({ error: `Zenvia respondió ${result.status} al enviar la plantilla.`, detail: result.detail }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  return new Response(JSON.stringify({ ok: true, prospectId }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+// GET /prospect-by?phoneNumber=... — live-confirmed present in swagger.json,
+// not yet exercised against a real phone number. Returns null on no match
+// or any failure (caller responds 404, never guesses a prospect).
+async function findProspectIdByPhone(env, phoneNumber) {
+  try {
+    const res = await fetch(
+      `${ZENVIA_API_BASE}/prospect-by?phoneNumber=${encodeURIComponent(phoneNumber)}&api-key=${env.ZENVIA_API_KEY}`
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const prospect = Array.isArray(data) ? data[0] : data;
+    return prospect?.id ?? prospect?.prospectId ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function sendTemplateMessage(env, prospectId, channel, templateId, variables) {
+  const res = await fetch(
+    `${ZENVIA_API_BASE}/prospect/${prospectId}/messaging/${channel}/notification?api-key=${env.ZENVIA_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ templateId, variables }),
+    }
+  );
+  if (res.ok) return { ok: true, status: res.status };
+  const detail = await res.text();
+  console.error("sendTemplateMessage failed", channel, res.status, detail);
+  return { ok: false, status: res.status, detail };
 }
 
 async function pickNextPoolAgent(env) {

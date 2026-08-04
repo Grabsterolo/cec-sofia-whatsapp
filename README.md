@@ -1065,6 +1065,74 @@ adjunto, revisar `wrangler tail` para confirmar que el campo coincide.
 
 ---
 
+## 5c. Envío manual de mensaje de cumpleaños — `POST /send/birthday`
+
+JP pidió poder mandarle a alguien un mensaje de cumpleaños por WhatsApp
+apretando un botón en el dashboard de `cecmarketing` — no automático, no
+disparado por cron, una persona decide cuándo.
+
+**Por qué no reutiliza `sendChannelMessage()` (la que usa Sofía para
+responder):** ese endpoint (`messaging/{channel}`, sin `/notification`)
+solo funciona si el prospecto tiene conversación abierta o escribió por
+WhatsApp en las últimas 24h (ventana estándar de WhatsApp Business, ver
+1.4). Un mensaje de cumpleaños lo iniciamos nosotros, así que va a caer
+fuera de esa ventana casi siempre. El endpoint correcto para eso es el
+hermano mencionado en 1.4 y nunca antes usado:
+
+```
+POST /prospect/{prospectId}/messaging/{channel}/notification?api-key=...
+Content-Type: application/json
+
+{ "templateId": "...", "variables": {} }
+```
+
+(`variables` viaja vacío a propósito — la plantilla que JP creó no tiene
+placeholder `{{1}}`, texto fijo igual para todos. Decisión explícita suya:
+no vale la pena volver a someter la plantilla a revisión de Meta solo por
+personalizar el nombre.)
+
+(`operationId` no confirmado en vivo; schema `NewTemplateMessage` leído del
+`swagger.json` real vía fetch — `{ templateId: string, variables: object }`
+— scope `messages:transactional`. No requiere ventana de 24h porque manda
+una plantilla de WhatsApp Business pre-aprobada por Meta, que es justamente
+para esto.)
+
+**Cómo se identifica al prospecto:** `sofia_conversations` en Supabase
+guarda `phone_hash` (hash de un solo sentido, por privacidad), no el
+teléfono en claro ni el `prospectId` — no sirve para esto. En vez de eso,
+`POST /send/birthday` recibe el número de teléfono en claro (lo escribe la
+persona en el dashboard) y lo resuelve a un prospecto con
+`GET /prospect-by?phoneNumber=...` (confirmado presente en el
+`swagger.json` real, no probado en vivo todavía).
+
+**Body de la request:** `{ "phoneNumber": "..." }`.
+Protegido con header `x-send-secret` == secret `SEND_TRIGGER_SECRET` (mismo
+patrón que `CLEANUP_TRIGGER_SECRET`, ver `handleScanAndWarn`). El caller es
+un endpoint de Cloudflare Pages Functions en `cecmarketing`
+(`functions/api/send-birthday.js`) que el frontend del dashboard llama
+directo — el secret nunca llega al navegador.
+
+**Estado (2026-08-04):** la plantilla ya se creó en Zenvia (sin
+placeholder, texto fijo) y está pendiente de aprobación de Meta.
+
+**NO PROBADO EN VIVO — pendientes reales antes de que esto funcione:**
+1. Que Meta apruebe la plantilla — de ahí sale el `templateId` real.
+2. Confirmar que la API key de Zenvia tiene el scope
+   `messages:transactional` habilitado (los demás scopes usados por este
+   Worker sí lo están; este no se ha verificado).
+3. `wrangler secret put SEND_TRIGGER_SECRET` y
+   `wrangler secret put BIRTHDAY_TEMPLATE_ID` (con el `templateId` real del
+   punto 1) antes de que el endpoint responda otra cosa que no sea 503.
+4. Deploy del Worker (sigue sin desplegarse, ver estado al inicio de este
+   README).
+
+Si más adelante se quiere personalizar el mensaje con el nombre, hay que
+crear una nueva versión de la plantilla con `{{1}}`, volver a someterla a
+Meta, y pasar `variables: { "1": name }` en vez de `{}` (reintroduciendo un
+campo `name` en el body y en el formulario del dashboard).
+
+---
+
 ## 6. Cosas a tener en cuenta / próximos pasos
 
 - **El group ID, los IDs de agentes y el channel de WhatsApp están
