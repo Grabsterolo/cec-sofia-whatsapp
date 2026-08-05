@@ -1187,6 +1187,60 @@ escalaciones.
 
 ---
 
+## 5e. Cierre automático de conversaciones inactivas por cron
+
+JP encontró 659 conversaciones abiertas en Zenvia, 407 de ellas inactivas
+≥24h, y ninguna marcada "pending" — el botón manual de limpieza
+("Cerrar conversaciones inactivas" en el dashboard, `mode: closeDirect`)
+llevaba tiempo sin correrse. Causa raíz: cerrar conversaciones era 100%
+manual. El cron que ya corría cada 30 min (`scheduled()`) solo ejecutaba
+`closeInactiveConversations()` — fase 2 del flujo `warn` (cerrar lo que ya
+fue advertido y no respondió) — pero nada usa el modo `warn` en la
+práctica, así que ese cron era esencialmente un no-op.
+
+**Fix:** `scheduled()` ahora también corre `scanAndWarn(env, ctx, {
+dryRun: false, mode: "closeDirect" })` — la misma lógica que ya usaba el
+botón del dashboard — cada 30 min. `CLEANUP_BATCH_LIMIT` (20 por corrida)
+es de sobra para mantenerse al día una vez que el backlog existente se
+vacíe (40/hora en estado estable). El backlog que ya existía cuando se
+detectó el problema se vació aparte, corriendo el endpoint manualmente
+varias veces (mismo mecanismo, solo que de una sola vez).
+
+---
+
+## 5f. Índice de conversión de Sofía — `GET /stats/conversion`
+
+JP preguntó si hay forma de saber la tasa de conversión de Sofía. No
+existía ningún dato cruzado para calcularla: `sofia_conversations` en
+Supabase solo guardaba `phone_hash` (hash de un solo sentido, por
+privacidad) — sin el `prospectId` real no hay forma de consultar en
+Zenvia si ese prospecto terminó en venta.
+
+**Cambios:**
+- Columna nueva `sofia_conversations.prospect_id` (migración
+  `add_prospect_id_to_sofia_conversations`, vía Supabase MCP) —
+  `upsertConversation()` ahora la guarda en cada turno. Solo aplica hacia
+  adelante desde 2026-08-05; las ~2920 filas anteriores no se pueden
+  backfillear (el hash no es reversible).
+- `GET /stats/conversion` (header `x-stats-secret` ==
+  `STATS_TRIGGER_SECRET`): junta los `prospect_id` distintos de
+  `sofia_conversations` (opcionalmente filtrados por `?since=` ISO date),
+  trae todos los prospectos archivados del grupo
+  (`fetchProspectsByStatus(..., "archived")`, mismo helper que ya usa la
+  limpieza) y cruza cada `prospect_id` contra su `archivingReason`.
+  "Convertido" = `archivingReason` en `converted` ("Venta") o
+  `campaignConversion` ("Venta de campaña") — confirmado en vivo vía
+  `GET /as-user/archiving-reasons`.
+- El dashboard (`cecmarketing`) lo muestra en Inicio, tarjeta "Conversión
+  de Sofía" — `functions/api/conversion-stats.js` hace de proxy (mismo
+  patrón que `send-birthday.js`, secret nunca llega al navegador).
+
+**Limitación real:** el número solo va a tener sentido después de que se
+acumulen suficientes conversaciones nuevas — el día que se implementó
+esto arrancó en `0/0`. No es retroactivo.
+
+---
+
 ## 6. Cosas a tener en cuenta / próximos pasos
 
 - **El group ID, los IDs de agentes y el channel de WhatsApp están

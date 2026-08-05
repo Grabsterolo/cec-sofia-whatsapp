@@ -85,11 +85,35 @@ export default {
       return handleSendBirthday(request, env);
     }
 
+    if (request.method === "GET" && url.pathname === "/stats/conversion") {
+      return handleConversionStats(request, env);
+    }
+
     return new Response("Not found", { status: 404 });
   },
 
   async scheduled(event, env, ctx) {
+    // Phase 2 of the (unused) "warn" flow — closes conversations that were
+    // warned and never replied. Kept even though nothing currently puts a
+    // row into "warned" state (see closeDirect below); harmless no-op in
+    // that case (dueRows.length === 0 returns immediately).
     ctx.waitUntil(closeInactiveConversations(env));
+
+    // JP found 659 open conversations, 407 of them stale ≥24h, and nothing
+    // had been auto-closing them — the dashboard's "Cerrar conversaciones
+    // inactivas" button (mode: closeDirect) was the *only* thing that ever
+    // closed a stale conversation, and it's 100% manual, so the backlog
+    // just grows until someone remembers to click it. Running the same
+    // closeDirect scan here, every 30 min via the existing cron, means it
+    // never needs to build up again — CLEANUP_BATCH_LIMIT (20) per run is
+    // plenty once the backlog is actually caught up (40/hour steady-state).
+    // The one-time backlog itself still needs the manual button (or repeat
+    // cron ticks) to clear — this only prevents it from recurring.
+    ctx.waitUntil(
+      scanAndWarn(env, ctx, { dryRun: false, mode: "closeDirect" }).then((result) =>
+        console.log("scheduled closeDirect:", JSON.stringify(result))
+      )
+    );
   },
 };
 
@@ -325,6 +349,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     await saveSession(env, phoneHash, updatedHistory, channel);
     await upsertConversation(env, {
       phoneHash,
+      prospectId,
       channel,
       lastMessage: limitReply,
       escalated: true,
@@ -414,6 +439,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
 
   await upsertConversation(env, {
     phoneHash,
+    prospectId,
     channel,
     lastMessage: reply,
     escalated,
@@ -850,6 +876,7 @@ async function getConversationState(env, phoneHash) {
 // fresh from 0, same as a genuinely new conversation.
 async function upsertConversation(env, {
   phoneHash,
+  prospectId,
   channel,
   lastMessage,
   escalated,
@@ -884,6 +911,11 @@ async function upsertConversation(env, {
         last_interaction_id: interactionId,
         procedure_interest: procedureInterest ?? null,
         sentiment: sentiment ?? null,
+        // prospectId doesn't change across turns for the same phone_hash,
+        // but writing it every time (instead of only on insert) means any
+        // row created before this column existed still gets backfilled the
+        // next time that conversation continues.
+        prospect_id: prospectId ?? null,
       }),
     });
   } else {
@@ -892,6 +924,7 @@ async function upsertConversation(env, {
       headers: { ...headers, Prefer: "return=minimal" },
       body: JSON.stringify({
         phone_hash: phoneHash,
+        prospect_id: prospectId ?? null,
         channel,
         last_message: lastMessage,
         escalated,
@@ -1404,6 +1437,77 @@ async function handleScanAndWarn(request, env, ctx) {
 // them). Two calls instead of one unfiltered pull: keeps each request well
 // under the API's 5000-result cap even as the group grows, without needing
 // pagination the API doesn't support.
+// Conversion rate for conversations Sofía has handled. Only meaningful
+// going forward from 2026-08-05, when sofia_conversations started storing
+// prospect_id (see upsertConversation) — older rows only have phone_hash
+// (one-way, can't be reversed to look up in Zenvia), so they're silently
+// excluded rather than counted as "not converted".
+//
+// "Converted" = Zenvia's own archivingReason for a prospect that became a
+// sale: "converted" ("Venta") or "campaignConversion" ("Venta de
+// campaña") — confirmed live via GET /as-user/archiving-reasons. Fetches
+// every archived prospect in the group once (fetchProspectsByStatus,
+// same helper the cleanup flow uses) and looks up each of our
+// prospect_ids in that set, instead of one Zenvia call per conversation
+// (would blow the subrequest limit past a few dozen).
+async function handleConversionStats(request, env) {
+  if (!env.STATS_TRIGGER_SECRET || request.headers.get("x-stats-secret") !== env.STATS_TRIGGER_SECRET) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const url = new URL(request.url);
+  const since = url.searchParams.get("since"); // ISO date, optional
+
+  let query = `${env.SUPABASE_URL}/rest/v1/sofia_conversations?select=prospect_id&prospect_id=not.is.null`;
+  if (since) query += `&created_at=gte.${encodeURIComponent(since)}`;
+
+  const rowsRes = await fetch(query, {
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    },
+  });
+  if (!rowsRes.ok) {
+    return new Response(JSON.stringify({ error: `Error leyendo sofia_conversations: ${rowsRes.status}` }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const rows = await rowsRes.json();
+  const prospectIds = [...new Set(rows.map((r) => r.prospect_id))];
+
+  if (prospectIds.length === 0) {
+    return new Response(JSON.stringify({
+      conversationsWithProspectId: 0,
+      converted: 0,
+      conversionRate: null,
+      note: "Sin conversaciones con prospect_id todavía — la columna se empezó a llenar el 2026-08-05, así que esto crece con conversaciones nuevas, no aplica a conversaciones viejas.",
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
+
+  const archivedProspects = await fetchProspectsByStatus(env, CEC_GROUP_ID, "archived");
+  const reasonById = new Map(archivedProspects.map((p) => [p.id, p.archivingReason]));
+
+  const CONVERTED_REASONS = new Set(["converted", "campaignConversion"]);
+  let converted = 0;
+  const breakdown = {};
+  for (const id of prospectIds) {
+    const reason = reasonById.get(id) ?? "sinArchivar";
+    breakdown[reason] = (breakdown[reason] || 0) + 1;
+    if (CONVERTED_REASONS.has(reason)) converted++;
+  }
+
+  return new Response(JSON.stringify({
+    conversationsWithProspectId: prospectIds.length,
+    converted,
+    conversionRate: converted / prospectIds.length,
+    breakdown,
+  }), { status: 200, headers: { "content-type": "application/json" } });
+}
+
 async function getOpenProspects(env, groupId) {
   const [followUp, unclaimed] = await Promise.all([
     fetchProspectsByStatus(env, groupId, "followUp"),
