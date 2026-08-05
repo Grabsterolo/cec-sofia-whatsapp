@@ -1112,24 +1112,78 @@ un endpoint de Cloudflare Pages Functions en `cecmarketing`
 (`functions/api/send-birthday.js`) que el frontend del dashboard llama
 directo — el secret nunca llega al navegador.
 
-**Estado (2026-08-04):** la plantilla ya se creó en Zenvia (sin
-placeholder, texto fijo) y está pendiente de aprobación de Meta.
+**Estado (2026-08-05): EN PRODUCCIÓN, probado en vivo con éxito.** Worker
+desplegado, webhook de Zenvia registrado, plantilla "Cumpleaños" aprobada
+por Meta (`key`/`BIRTHDAY_TEMPLATE_ID`: `74e35668-994e-4fb5-b891-063e578ede5b`,
+sin placeholder — texto fijo, decisión de JP). Probado end-to-end contra un
+número real (+50661130913) — envío exitoso, `200 ok`.
 
-**NO PROBADO EN VIVO — pendientes reales antes de que esto funcione:**
-1. Que Meta apruebe la plantilla — de ahí sale el `templateId` real.
-2. Confirmar que la API key de Zenvia tiene el scope
-   `messages:transactional` habilitado (los demás scopes usados por este
-   Worker sí lo están; este no se ha verificado).
-3. `wrangler secret put SEND_TRIGGER_SECRET` y
-   `wrangler secret put BIRTHDAY_TEMPLATE_ID` (con el `templateId` real del
-   punto 1) antes de que el endpoint responda otra cosa que no sea 503.
-4. Deploy del Worker (sigue sin desplegarse, ver estado al inicio de este
-   README).
+Dos bugs reales encontrados y corregidos durante la prueba en vivo, ninguno
+visible solo leyendo el swagger:
+1. **403 "Invalid scope... need messages:transactional"** incluso después
+   de que JP agregó el scope a la API key en Zenvia y guardó — resultó ser
+   caché de autorización del lado de Zenvia en ese endpoint específico
+   (`GET /integration` ya reflejaba el scope nuevo, pero el endpoint de
+   envío tardó ~15-20 min más en verlo). No es nada que arreglar en este
+   repo, solo esperar si vuelve a pasar.
+2. **400 SCHEMA_VALIDATION_FAILED: "must have required property 'key'"** —
+   el body real de `NewTemplateMessage` es `{ key, parameters }`, no
+   `{ templateId, variables }` como se había asumido de un resumen de IA
+   del swagger.json (ver el fetch original en la sección de arriba, que
+   quedó con el nombre de campo equivocado). Confirmado contra
+   `GET /messaging/channels`, que expone el `key` real de cada plantilla —
+   coincidía exactamente con el `BIRTHDAY_TEMPLATE_ID` que JP había dado.
+   `sendTemplateMessage()` ya usa los nombres correctos.
+
+**Después de un envío exitoso, el prospecto se transfiere a Sofía**
+(`transferProspectToAgent(env, prospectId, SOFIA_AGENT_ID)`, mismo
+mecanismo que ya usa `processInboundMessage()` para reclamar conversaciones
+nuevas) — JP pidió que si la persona responde al mensaje de cumpleaños,
+Sofía siga la conversación. Sin esto, un prospecto que ya había hablado con
+CEC antes casi siempre tiene un agente humano asignado de esa conversación
+previa, y el gate de "conversación de un humano, no tocar" en
+`processInboundMessage()` la habría dejado en silencio. Best-effort: si la
+transferencia falla, no se convierte el envío exitoso en un error de
+respuesta — solo significa que la respuesta del paciente cae donde ya
+estaba antes, como pasaba antes de este fix.
+
+**No cubierto por este fix:** si ese mismo teléfono ya había escalado a un
+humano *a través de Sofía* antes (`sofia_conversations.escalated=true` en
+Supabase) y el `status` del prospecto en Zenvia no es `"archived"`, el gate
+de "ya escalado" separado en `processInboundMessage()` sigue aplicando sin
+importar quién sea el dueño actual — un mensaje de cumpleaños no lo
+resetea. No se resolvió porque no está claro que deba (podría ser
+intencional seguir sin tocar esas conversaciones).
 
 Si más adelante se quiere personalizar el mensaje con el nombre, hay que
 crear una nueva versión de la plantilla con `{{1}}`, volver a someterla a
-Meta, y pasar `variables: { "1": name }` en vez de `{}` (reintroduciendo un
-campo `name` en el body y en el formulario del dashboard).
+Meta, y pasar `parameters: { "prospect.firstName": ... }` en vez de `{}`
+(reintroduciendo un campo `name` en el body y en el formulario del
+dashboard) — revisar el `key` real que Zenvia asigne al placeholder vía
+`GET /messaging/channels` antes de asumir el nombre exacto.
+
+---
+
+## 5d. Fix: conversaciones sin escalar no quedaban etiquetadas en Zenvia
+
+JP reportó que Sofía no está etiquetando las conversaciones. Causa: las
+etiquetas de Zenvia (`addLabelToProspect()`, `POST
+/prospect/{id}/as-user/label`) solo se aplicaban dentro de
+`runEscalationAgility()`, llamada únicamente en la rama `if (escalated)` de
+`processInboundMessage()` (y en el flujo de límite de mensajes, que también
+escala). La rama `else` — donde Sofía resuelve la conversación por su
+cuenta, que según el propio comentario del código es "la gran mayoría" de
+los casos — llamaba a `classifyEscalationWithHaiku()` con una lista de
+etiquetas vacía a propósito ("no hace falta etiqueta de Zenvia aquí"), así
+que esas conversaciones sí quedaban con `procedure_interest`/`sentiment` en
+Supabase, pero nunca con etiqueta en Zenvia.
+
+**Fix:** la rama `else` ahora llama `getAvailableLabels()` y pasa la lista
+real a `classifyEscalationWithHaiku()`, y aplica `addLabelToProspect()`
+igual que la rama de escalación. Costo: una llamada más a Zenvia
+(`getAvailableLabels`) y potencialmente otra (`addLabelToProspect`) por
+cada turno no escalado — aceptable, mismo patrón que ya existía para
+escalaciones.
 
 ---
 

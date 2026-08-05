@@ -390,10 +390,18 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     // Classify every non-escalated turn too (not just escalations) so the
     // dashboard's conversation list shows a real topic/sentiment instead of
     // "sin clasificar" for the conversations Sofía resolves on her own — the
-    // large majority of them. No Zenvia labels needed here (that's only
-    // relevant when handing off to a human), so pass an empty label list to
-    // skip the extra Zenvia call runEscalationAgility would otherwise make.
-    agility = await classifyEscalationWithHaiku(env, updatedHistory, []);
+    // large majority of them. Also apply the resulting label in Zenvia
+    // itself (addLabelToProspect) — JP reported Sofía wasn't tagging
+    // conversations at all, and this was the reason: labels only ever got
+    // applied via runEscalationAgility() in the `if (escalated)` branch
+    // above, so every conversation Sofía resolved on her own (most of them)
+    // stayed unlabeled in Zenvia even though Supabase had the
+    // procedure_interest/sentiment data all along.
+    const availableLabels = await getAvailableLabels(env);
+    agility = await classifyEscalationWithHaiku(env, updatedHistory, availableLabels);
+    if (agility.label) {
+      await addLabelToProspect(env, prospectId, agility.label);
+    }
 
     // [CERRAR] — casos que no necesitan seguimiento humano ni quedar
     // abiertos en la bandeja (ej. consultas de vacantes, ver system_prompt).
@@ -1245,6 +1253,25 @@ async function handleSendBirthday(request, env) {
       headers: { "content-type": "application/json" },
     });
   }
+
+  // JP asked for Sofía to pick up the conversation if the person replies to
+  // the birthday message — but processInboundMessage() unconditionally
+  // skips any prospect currently owned by a human agent (see the
+  // human-owned gate there), and a prospect who already talked to CEC
+  // before very often has a human agent attached from that earlier
+  // conversation (our own test prospect did — owned by Angie). Claiming the
+  // prospect for Sofía right after sending closes that gap. Best-effort:
+  // failing to claim shouldn't turn a successful send into an error
+  // response, since the message did go out — it would just mean the
+  // person's reply lands with whoever already owned the conversation
+  // instead of Sofía, same as it would have before this fix.
+  //
+  // Not handled here: if this same phone previously escalated to a human
+  // *through Sofía* (sofia_conversations.escalated=true in Supabase) and
+  // Zenvia's prospect.status isn't "archived", processInboundMessage()'s
+  // separate already-escalated gate still holds regardless of who
+  // currently owns the prospect — a birthday message doesn't clear that.
+  await transferProspectToAgent(env, prospectId, SOFIA_AGENT_ID);
 
   return new Response(JSON.stringify({ ok: true, prospectId }), {
     status: 200,
