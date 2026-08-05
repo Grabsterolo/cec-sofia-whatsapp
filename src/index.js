@@ -1252,9 +1252,16 @@ async function handleSendBirthday(request, env) {
   });
 }
 
-// GET /prospect-by?phoneNumber=... — live-confirmed present in swagger.json,
-// not yet exercised against a real phone number. Returns null on no match
-// or any failure (caller responds 404, never guesses a prospect).
+// GET /prospect-by?phoneNumber=... — live-confirmed working (2026-08-05,
+// real phone +50661130913). Two things not obvious from the swagger schema
+// alone: (1) it returns an *array* of prospects, not a single object; (2)
+// each prospect's id field is `_id`, not `id`/`prospectId` (unlike the
+// `Prospect` objects returned by GET /prospect/{id} elsewhere in this file,
+// which do use `id` — this endpoint's response shape is a different,
+// lead-search-flavored shape). Matching also isn't picky about format:
+// "50661130913" and "+50661130913" both matched; the caller still passes
+// through whatever the dashboard sent, unmodified.  Returns null on no
+// match or any failure (caller responds 404, never guesses a prospect).
 async function findProspectIdByPhone(env, phoneNumber) {
   try {
     const res = await fetch(
@@ -1263,19 +1270,27 @@ async function findProspectIdByPhone(env, phoneNumber) {
     if (!res.ok) return null;
     const data = await res.json();
     const prospect = Array.isArray(data) ? data[0] : data;
-    return prospect?.id ?? prospect?.prospectId ?? null;
+    return prospect?._id ?? prospect?.id ?? prospect?.prospectId ?? null;
   } catch {
     return null;
   }
 }
 
-async function sendTemplateMessage(env, prospectId, channel, templateId, variables) {
+// Body schema is NewTemplateMessage: { key: string, parameters?: object }
+// (live-confirmed 2026-08-05 via the real swagger.json — the "templateId" /
+// "variables" field names originally assumed here, from an AI summary of
+// the swagger, were both wrong and caused a 400 SCHEMA_VALIDATION_FAILED
+// until fixed). `templateKey` here is what GET /messaging/channels calls a
+// template's `key` — for the birthday template it happens to equal
+// BIRTHDAY_TEMPLATE_ID, confirmed by cross-checking that endpoint's
+// response against the id JP gave us.
+async function sendTemplateMessage(env, prospectId, channel, templateKey, parameters) {
   const res = await fetch(
     `${ZENVIA_API_BASE}/prospect/${prospectId}/messaging/${channel}/notification?api-key=${env.ZENVIA_API_KEY}`,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ templateId, variables }),
+      body: JSON.stringify({ key: templateKey, parameters }),
     }
   );
   if (res.ok) return { ok: true, status: res.status };
