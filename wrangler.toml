@@ -23,3 +23,5 @@ id = "94958807d92548389718c4036ea1b178"
 #   wrangler secret put ANTHROPIC_API_KEY
 #   wrangler secret put WEBHOOK_SHARED_SECRET   # optional, see README
 #   wrangler secret put CLEANUP_TRIGGER_SECRET  # protects POST /cleanup/scan-and-warn
+#   wrangler secret put SEND_TRIGGER_SECRET     # protects POST /send/birthday
+#   wrangler secret put BIRTHDAY_TEMPLATE_ID    # Zenvia templateId, set once the birthday template is approved

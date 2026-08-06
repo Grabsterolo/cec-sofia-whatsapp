@@ -1065,6 +1065,182 @@ adjunto, revisar `wrangler tail` para confirmar que el campo coincide.
 
 ---
 
+## 5c. Envío manual de mensaje de cumpleaños — `POST /send/birthday`
+
+JP pidió poder mandarle a alguien un mensaje de cumpleaños por WhatsApp
+apretando un botón en el dashboard de `cecmarketing` — no automático, no
+disparado por cron, una persona decide cuándo.
+
+**Por qué no reutiliza `sendChannelMessage()` (la que usa Sofía para
+responder):** ese endpoint (`messaging/{channel}`, sin `/notification`)
+solo funciona si el prospecto tiene conversación abierta o escribió por
+WhatsApp en las últimas 24h (ventana estándar de WhatsApp Business, ver
+1.4). Un mensaje de cumpleaños lo iniciamos nosotros, así que va a caer
+fuera de esa ventana casi siempre. El endpoint correcto para eso es el
+hermano mencionado en 1.4 y nunca antes usado:
+
+```
+POST /prospect/{prospectId}/messaging/{channel}/notification?api-key=...
+Content-Type: application/json
+
+{ "templateId": "...", "variables": {} }
+```
+
+(`variables` viaja vacío a propósito — la plantilla que JP creó no tiene
+placeholder `{{1}}`, texto fijo igual para todos. Decisión explícita suya:
+no vale la pena volver a someter la plantilla a revisión de Meta solo por
+personalizar el nombre.)
+
+(`operationId` no confirmado en vivo; schema `NewTemplateMessage` leído del
+`swagger.json` real vía fetch — `{ templateId: string, variables: object }`
+— scope `messages:transactional`. No requiere ventana de 24h porque manda
+una plantilla de WhatsApp Business pre-aprobada por Meta, que es justamente
+para esto.)
+
+**Cómo se identifica al prospecto:** `sofia_conversations` en Supabase
+guarda `phone_hash` (hash de un solo sentido, por privacidad), no el
+teléfono en claro ni el `prospectId` — no sirve para esto. En vez de eso,
+`POST /send/birthday` recibe el número de teléfono en claro (lo escribe la
+persona en el dashboard) y lo resuelve a un prospecto con
+`GET /prospect-by?phoneNumber=...` (confirmado presente en el
+`swagger.json` real, no probado en vivo todavía).
+
+**Body de la request:** `{ "phoneNumber": "..." }`.
+Protegido con header `x-send-secret` == secret `SEND_TRIGGER_SECRET` (mismo
+patrón que `CLEANUP_TRIGGER_SECRET`, ver `handleScanAndWarn`). El caller es
+un endpoint de Cloudflare Pages Functions en `cecmarketing`
+(`functions/api/send-birthday.js`) que el frontend del dashboard llama
+directo — el secret nunca llega al navegador.
+
+**Estado (2026-08-05): EN PRODUCCIÓN, probado en vivo con éxito.** Worker
+desplegado, webhook de Zenvia registrado, plantilla "Cumpleaños" aprobada
+por Meta (`key`/`BIRTHDAY_TEMPLATE_ID`: `74e35668-994e-4fb5-b891-063e578ede5b`,
+sin placeholder — texto fijo, decisión de JP). Probado end-to-end contra un
+número real (+50661130913) — envío exitoso, `200 ok`.
+
+Dos bugs reales encontrados y corregidos durante la prueba en vivo, ninguno
+visible solo leyendo el swagger:
+1. **403 "Invalid scope... need messages:transactional"** incluso después
+   de que JP agregó el scope a la API key en Zenvia y guardó — resultó ser
+   caché de autorización del lado de Zenvia en ese endpoint específico
+   (`GET /integration` ya reflejaba el scope nuevo, pero el endpoint de
+   envío tardó ~15-20 min más en verlo). No es nada que arreglar en este
+   repo, solo esperar si vuelve a pasar.
+2. **400 SCHEMA_VALIDATION_FAILED: "must have required property 'key'"** —
+   el body real de `NewTemplateMessage` es `{ key, parameters }`, no
+   `{ templateId, variables }` como se había asumido de un resumen de IA
+   del swagger.json (ver el fetch original en la sección de arriba, que
+   quedó con el nombre de campo equivocado). Confirmado contra
+   `GET /messaging/channels`, que expone el `key` real de cada plantilla —
+   coincidía exactamente con el `BIRTHDAY_TEMPLATE_ID` que JP había dado.
+   `sendTemplateMessage()` ya usa los nombres correctos.
+
+**Después de un envío exitoso, el prospecto se transfiere a Sofía**
+(`transferProspectToAgent(env, prospectId, SOFIA_AGENT_ID)`, mismo
+mecanismo que ya usa `processInboundMessage()` para reclamar conversaciones
+nuevas) — JP pidió que si la persona responde al mensaje de cumpleaños,
+Sofía siga la conversación. Sin esto, un prospecto que ya había hablado con
+CEC antes casi siempre tiene un agente humano asignado de esa conversación
+previa, y el gate de "conversación de un humano, no tocar" en
+`processInboundMessage()` la habría dejado en silencio. Best-effort: si la
+transferencia falla, no se convierte el envío exitoso en un error de
+respuesta — solo significa que la respuesta del paciente cae donde ya
+estaba antes, como pasaba antes de este fix.
+
+**No cubierto por este fix:** si ese mismo teléfono ya había escalado a un
+humano *a través de Sofía* antes (`sofia_conversations.escalated=true` en
+Supabase) y el `status` del prospecto en Zenvia no es `"archived"`, el gate
+de "ya escalado" separado en `processInboundMessage()` sigue aplicando sin
+importar quién sea el dueño actual — un mensaje de cumpleaños no lo
+resetea. No se resolvió porque no está claro que deba (podría ser
+intencional seguir sin tocar esas conversaciones).
+
+Si más adelante se quiere personalizar el mensaje con el nombre, hay que
+crear una nueva versión de la plantilla con `{{1}}`, volver a someterla a
+Meta, y pasar `parameters: { "prospect.firstName": ... }` en vez de `{}`
+(reintroduciendo un campo `name` en el body y en el formulario del
+dashboard) — revisar el `key` real que Zenvia asigne al placeholder vía
+`GET /messaging/channels` antes de asumir el nombre exacto.
+
+---
+
+## 5d. Fix: conversaciones sin escalar no quedaban etiquetadas en Zenvia
+
+JP reportó que Sofía no está etiquetando las conversaciones. Causa: las
+etiquetas de Zenvia (`addLabelToProspect()`, `POST
+/prospect/{id}/as-user/label`) solo se aplicaban dentro de
+`runEscalationAgility()`, llamada únicamente en la rama `if (escalated)` de
+`processInboundMessage()` (y en el flujo de límite de mensajes, que también
+escala). La rama `else` — donde Sofía resuelve la conversación por su
+cuenta, que según el propio comentario del código es "la gran mayoría" de
+los casos — llamaba a `classifyEscalationWithHaiku()` con una lista de
+etiquetas vacía a propósito ("no hace falta etiqueta de Zenvia aquí"), así
+que esas conversaciones sí quedaban con `procedure_interest`/`sentiment` en
+Supabase, pero nunca con etiqueta en Zenvia.
+
+**Fix:** la rama `else` ahora llama `getAvailableLabels()` y pasa la lista
+real a `classifyEscalationWithHaiku()`, y aplica `addLabelToProspect()`
+igual que la rama de escalación. Costo: una llamada más a Zenvia
+(`getAvailableLabels`) y potencialmente otra (`addLabelToProspect`) por
+cada turno no escalado — aceptable, mismo patrón que ya existía para
+escalaciones.
+
+---
+
+## 5e. Cierre automático de conversaciones inactivas por cron
+
+JP encontró 659 conversaciones abiertas en Zenvia, 407 de ellas inactivas
+≥24h, y ninguna marcada "pending" — el botón manual de limpieza
+("Cerrar conversaciones inactivas" en el dashboard, `mode: closeDirect`)
+llevaba tiempo sin correrse. Causa raíz: cerrar conversaciones era 100%
+manual. El cron que ya corría cada 30 min (`scheduled()`) solo ejecutaba
+`closeInactiveConversations()` — fase 2 del flujo `warn` (cerrar lo que ya
+fue advertido y no respondió) — pero nada usa el modo `warn` en la
+práctica, así que ese cron era esencialmente un no-op.
+
+**Fix:** `scheduled()` ahora también corre `scanAndWarn(env, ctx, {
+dryRun: false, mode: "closeDirect" })` — la misma lógica que ya usaba el
+botón del dashboard — cada 30 min. `CLEANUP_BATCH_LIMIT` (20 por corrida)
+es de sobra para mantenerse al día una vez que el backlog existente se
+vacíe (40/hora en estado estable). El backlog que ya existía cuando se
+detectó el problema se vació aparte, corriendo el endpoint manualmente
+varias veces (mismo mecanismo, solo que de una sola vez).
+
+---
+
+## 5f. Índice de conversión de Sofía — `GET /stats/conversion`
+
+JP preguntó si hay forma de saber la tasa de conversión de Sofía. No
+existía ningún dato cruzado para calcularla: `sofia_conversations` en
+Supabase solo guardaba `phone_hash` (hash de un solo sentido, por
+privacidad) — sin el `prospectId` real no hay forma de consultar en
+Zenvia si ese prospecto terminó en venta.
+
+**Cambios:**
+- Columna nueva `sofia_conversations.prospect_id` (migración
+  `add_prospect_id_to_sofia_conversations`, vía Supabase MCP) —
+  `upsertConversation()` ahora la guarda en cada turno. Solo aplica hacia
+  adelante desde 2026-08-05; las ~2920 filas anteriores no se pueden
+  backfillear (el hash no es reversible).
+- `GET /stats/conversion` (header `x-stats-secret` ==
+  `STATS_TRIGGER_SECRET`): junta los `prospect_id` distintos de
+  `sofia_conversations` (opcionalmente filtrados por `?since=` ISO date),
+  trae todos los prospectos archivados del grupo
+  (`fetchProspectsByStatus(..., "archived")`, mismo helper que ya usa la
+  limpieza) y cruza cada `prospect_id` contra su `archivingReason`.
+  "Convertido" = `archivingReason` en `converted` ("Venta") o
+  `campaignConversion` ("Venta de campaña") — confirmado en vivo vía
+  `GET /as-user/archiving-reasons`.
+- El dashboard (`cecmarketing`) lo muestra en Inicio, tarjeta "Conversión
+  de Sofía" — `functions/api/conversion-stats.js` hace de proxy (mismo
+  patrón que `send-birthday.js`, secret nunca llega al navegador).
+
+**Limitación real:** el número solo va a tener sentido después de que se
+acumulen suficientes conversaciones nuevas — el día que se implementó
+esto arrancó en `0/0`. No es retroactivo.
+
+---
+
 ## 6. Cosas a tener en cuenta / próximos pasos
 
 - **El group ID, los IDs de agentes y el channel de WhatsApp están

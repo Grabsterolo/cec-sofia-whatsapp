@@ -81,11 +81,39 @@ export default {
       return handleScanAndWarn(request, env, ctx);
     }
 
+    if (request.method === "POST" && url.pathname === "/send/birthday") {
+      return handleSendBirthday(request, env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/stats/conversion") {
+      return handleConversionStats(request, env);
+    }
+
     return new Response("Not found", { status: 404 });
   },
 
   async scheduled(event, env, ctx) {
+    // Phase 2 of the (unused) "warn" flow — closes conversations that were
+    // warned and never replied. Kept even though nothing currently puts a
+    // row into "warned" state (see closeDirect below); harmless no-op in
+    // that case (dueRows.length === 0 returns immediately).
     ctx.waitUntil(closeInactiveConversations(env));
+
+    // JP found 659 open conversations, 407 of them stale ≥24h, and nothing
+    // had been auto-closing them — the dashboard's "Cerrar conversaciones
+    // inactivas" button (mode: closeDirect) was the *only* thing that ever
+    // closed a stale conversation, and it's 100% manual, so the backlog
+    // just grows until someone remembers to click it. Running the same
+    // closeDirect scan here, every 30 min via the existing cron, means it
+    // never needs to build up again — CLEANUP_BATCH_LIMIT (20) per run is
+    // plenty once the backlog is actually caught up (40/hour steady-state).
+    // The one-time backlog itself still needs the manual button (or repeat
+    // cron ticks) to clear — this only prevents it from recurring.
+    ctx.waitUntil(
+      scanAndWarn(env, ctx, { dryRun: false, mode: "closeDirect" }).then((result) =>
+        console.log("scheduled closeDirect:", JSON.stringify(result))
+      )
+    );
   },
 };
 
@@ -321,6 +349,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     await saveSession(env, phoneHash, updatedHistory, channel);
     await upsertConversation(env, {
       phoneHash,
+      prospectId,
       channel,
       lastMessage: limitReply,
       escalated: true,
@@ -386,10 +415,18 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     // Classify every non-escalated turn too (not just escalations) so the
     // dashboard's conversation list shows a real topic/sentiment instead of
     // "sin clasificar" for the conversations Sofía resolves on her own — the
-    // large majority of them. No Zenvia labels needed here (that's only
-    // relevant when handing off to a human), so pass an empty label list to
-    // skip the extra Zenvia call runEscalationAgility would otherwise make.
-    agility = await classifyEscalationWithHaiku(env, updatedHistory, []);
+    // large majority of them. Also apply the resulting label in Zenvia
+    // itself (addLabelToProspect) — JP reported Sofía wasn't tagging
+    // conversations at all, and this was the reason: labels only ever got
+    // applied via runEscalationAgility() in the `if (escalated)` branch
+    // above, so every conversation Sofía resolved on her own (most of them)
+    // stayed unlabeled in Zenvia even though Supabase had the
+    // procedure_interest/sentiment data all along.
+    const availableLabels = await getAvailableLabels(env);
+    agility = await classifyEscalationWithHaiku(env, updatedHistory, availableLabels);
+    if (agility.label) {
+      await addLabelToProspect(env, prospectId, agility.label);
+    }
 
     // [CERRAR] — casos que no necesitan seguimiento humano ni quedar
     // abiertos en la bandeja (ej. consultas de vacantes, ver system_prompt).
@@ -402,6 +439,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
 
   await upsertConversation(env, {
     phoneHash,
+    prospectId,
     channel,
     lastMessage: reply,
     escalated,
@@ -838,6 +876,7 @@ async function getConversationState(env, phoneHash) {
 // fresh from 0, same as a genuinely new conversation.
 async function upsertConversation(env, {
   phoneHash,
+  prospectId,
   channel,
   lastMessage,
   escalated,
@@ -872,6 +911,11 @@ async function upsertConversation(env, {
         last_interaction_id: interactionId,
         procedure_interest: procedureInterest ?? null,
         sentiment: sentiment ?? null,
+        // prospectId doesn't change across turns for the same phone_hash,
+        // but writing it every time (instead of only on insert) means any
+        // row created before this column existed still gets backfilled the
+        // next time that conversation continues.
+        prospect_id: prospectId ?? null,
       }),
     });
   } else {
@@ -880,6 +924,7 @@ async function upsertConversation(env, {
       headers: { ...headers, Prefer: "return=minimal" },
       body: JSON.stringify({
         phone_hash: phoneHash,
+        prospect_id: prospectId ?? null,
         channel,
         last_message: lastMessage,
         escalated,
@@ -1169,6 +1214,151 @@ async function transferToNextAgentInPool(env, prospectId) {
   return transferProspectToAgent(env, prospectId, agentId);
 }
 
+// ---------------------------------------------------------------------------
+// Manual outbound send — birthday messages triggered from the cecmarketing
+// dashboard (a person clicks a button; this is never automatic). Sofía is
+// otherwise purely reactive (replies to inbound webhooks), so this is the
+// one path that originates a WhatsApp conversation from our side.
+//
+// A regular `messaging/{channel}` send (see sendChannelMessage()) only
+// works inside the 24h WhatsApp session window, which a birthday message
+// will usually fall outside of. `messaging/{channel}/notification` sends a
+// pre-approved WhatsApp template instead, which isn't bound by that window
+// (scope `messages:transactional`, confirmed live-accessible via
+// GET /swagger.json — NewTemplateMessage: { templateId, variables }).
+//
+// NOT YET LIVE-TESTED: the birthday template is created in Zenvia but still
+// pending Meta's review, so BIRTHDAY_TEMPLATE_ID isn't set yet and this path
+// has never actually sent a message.
+//
+// The template has no placeholder (JP's call — fixed text, same message for
+// everyone) — `sendTemplateMessage()` is called with `variables: {}`. If a
+// future template version adds a {{1}} for the name, pass
+// `{ "1": name }` instead (the common WhatsApp convention for template
+// variables, unconfirmed against this account's swagger since no template
+// here has ever used one) and reintroduce a `name` field on the request
+// body / dashboard form.
+async function handleSendBirthday(request, env) {
+  if (!env.SEND_TRIGGER_SECRET || request.headers.get("x-send-secret") !== env.SEND_TRIGGER_SECRET) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  if (!env.BIRTHDAY_TEMPLATE_ID) {
+    return new Response(JSON.stringify({ error: "BIRTHDAY_TEMPLATE_ID no está configurado todavía (falta aprobar la plantilla en Zenvia)." }), {
+      status: 503,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Body inválido, se esperaba JSON." }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const phoneNumber = (body.phoneNumber || "").trim();
+  if (!phoneNumber) {
+    return new Response(JSON.stringify({ error: "Se requiere phoneNumber." }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const prospectId = await findProspectIdByPhone(env, phoneNumber);
+  if (!prospectId) {
+    return new Response(JSON.stringify({ error: `No se encontró ningún prospecto en Zenvia con el teléfono ${phoneNumber}.` }), {
+      status: 404,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const result = await sendTemplateMessage(env, prospectId, "whatsapp", env.BIRTHDAY_TEMPLATE_ID, {});
+  if (!result.ok) {
+    return new Response(JSON.stringify({ error: `Zenvia respondió ${result.status} al enviar la plantilla.`, detail: result.detail }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // JP asked for Sofía to pick up the conversation if the person replies to
+  // the birthday message — but processInboundMessage() unconditionally
+  // skips any prospect currently owned by a human agent (see the
+  // human-owned gate there), and a prospect who already talked to CEC
+  // before very often has a human agent attached from that earlier
+  // conversation (our own test prospect did — owned by Angie). Claiming the
+  // prospect for Sofía right after sending closes that gap. Best-effort:
+  // failing to claim shouldn't turn a successful send into an error
+  // response, since the message did go out — it would just mean the
+  // person's reply lands with whoever already owned the conversation
+  // instead of Sofía, same as it would have before this fix.
+  //
+  // Not handled here: if this same phone previously escalated to a human
+  // *through Sofía* (sofia_conversations.escalated=true in Supabase) and
+  // Zenvia's prospect.status isn't "archived", processInboundMessage()'s
+  // separate already-escalated gate still holds regardless of who
+  // currently owns the prospect — a birthday message doesn't clear that.
+  await transferProspectToAgent(env, prospectId, SOFIA_AGENT_ID);
+
+  return new Response(JSON.stringify({ ok: true, prospectId }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+// GET /prospect-by?phoneNumber=... — live-confirmed working (2026-08-05,
+// real phone +50661130913). Two things not obvious from the swagger schema
+// alone: (1) it returns an *array* of prospects, not a single object; (2)
+// each prospect's id field is `_id`, not `id`/`prospectId` (unlike the
+// `Prospect` objects returned by GET /prospect/{id} elsewhere in this file,
+// which do use `id` — this endpoint's response shape is a different,
+// lead-search-flavored shape). Matching also isn't picky about format:
+// "50661130913" and "+50661130913" both matched; the caller still passes
+// through whatever the dashboard sent, unmodified.  Returns null on no
+// match or any failure (caller responds 404, never guesses a prospect).
+async function findProspectIdByPhone(env, phoneNumber) {
+  try {
+    const res = await fetch(
+      `${ZENVIA_API_BASE}/prospect-by?phoneNumber=${encodeURIComponent(phoneNumber)}&api-key=${env.ZENVIA_API_KEY}`
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const prospect = Array.isArray(data) ? data[0] : data;
+    return prospect?._id ?? prospect?.id ?? prospect?.prospectId ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Body schema is NewTemplateMessage: { key: string, parameters?: object }
+// (live-confirmed 2026-08-05 via the real swagger.json — the "templateId" /
+// "variables" field names originally assumed here, from an AI summary of
+// the swagger, were both wrong and caused a 400 SCHEMA_VALIDATION_FAILED
+// until fixed). `templateKey` here is what GET /messaging/channels calls a
+// template's `key` — for the birthday template it happens to equal
+// BIRTHDAY_TEMPLATE_ID, confirmed by cross-checking that endpoint's
+// response against the id JP gave us.
+async function sendTemplateMessage(env, prospectId, channel, templateKey, parameters) {
+  const res = await fetch(
+    `${ZENVIA_API_BASE}/prospect/${prospectId}/messaging/${channel}/notification?api-key=${env.ZENVIA_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key: templateKey, parameters }),
+    }
+  );
+  if (res.ok) return { ok: true, status: res.status };
+  const detail = await res.text();
+  console.error("sendTemplateMessage failed", channel, res.status, detail);
+  return { ok: false, status: res.status, detail };
+}
+
 async function pickNextPoolAgent(env) {
   const headers = {
     apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1247,6 +1437,77 @@ async function handleScanAndWarn(request, env, ctx) {
 // them). Two calls instead of one unfiltered pull: keeps each request well
 // under the API's 5000-result cap even as the group grows, without needing
 // pagination the API doesn't support.
+// Conversion rate for conversations Sofía has handled. Only meaningful
+// going forward from 2026-08-05, when sofia_conversations started storing
+// prospect_id (see upsertConversation) — older rows only have phone_hash
+// (one-way, can't be reversed to look up in Zenvia), so they're silently
+// excluded rather than counted as "not converted".
+//
+// "Converted" = Zenvia's own archivingReason for a prospect that became a
+// sale: "converted" ("Venta") or "campaignConversion" ("Venta de
+// campaña") — confirmed live via GET /as-user/archiving-reasons. Fetches
+// every archived prospect in the group once (fetchProspectsByStatus,
+// same helper the cleanup flow uses) and looks up each of our
+// prospect_ids in that set, instead of one Zenvia call per conversation
+// (would blow the subrequest limit past a few dozen).
+async function handleConversionStats(request, env) {
+  if (!env.STATS_TRIGGER_SECRET || request.headers.get("x-stats-secret") !== env.STATS_TRIGGER_SECRET) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const url = new URL(request.url);
+  const since = url.searchParams.get("since"); // ISO date, optional
+
+  let query = `${env.SUPABASE_URL}/rest/v1/sofia_conversations?select=prospect_id&prospect_id=not.is.null`;
+  if (since) query += `&created_at=gte.${encodeURIComponent(since)}`;
+
+  const rowsRes = await fetch(query, {
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    },
+  });
+  if (!rowsRes.ok) {
+    return new Response(JSON.stringify({ error: `Error leyendo sofia_conversations: ${rowsRes.status}` }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const rows = await rowsRes.json();
+  const prospectIds = [...new Set(rows.map((r) => r.prospect_id))];
+
+  if (prospectIds.length === 0) {
+    return new Response(JSON.stringify({
+      conversationsWithProspectId: 0,
+      converted: 0,
+      conversionRate: null,
+      note: "Sin conversaciones con prospect_id todavía — la columna se empezó a llenar el 2026-08-05, así que esto crece con conversaciones nuevas, no aplica a conversaciones viejas.",
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
+
+  const archivedProspects = await fetchProspectsByStatus(env, CEC_GROUP_ID, "archived");
+  const reasonById = new Map(archivedProspects.map((p) => [p.id, p.archivingReason]));
+
+  const CONVERTED_REASONS = new Set(["converted", "campaignConversion"]);
+  let converted = 0;
+  const breakdown = {};
+  for (const id of prospectIds) {
+    const reason = reasonById.get(id) ?? "sinArchivar";
+    breakdown[reason] = (breakdown[reason] || 0) + 1;
+    if (CONVERTED_REASONS.has(reason)) converted++;
+  }
+
+  return new Response(JSON.stringify({
+    conversationsWithProspectId: prospectIds.length,
+    converted,
+    conversionRate: converted / prospectIds.length,
+    breakdown,
+  }), { status: 200, headers: { "content-type": "application/json" } });
+}
+
 async function getOpenProspects(env, groupId) {
   const [followUp, unclaimed] = await Promise.all([
     fetchProspectsByStatus(env, groupId, "followUp"),
