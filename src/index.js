@@ -1778,6 +1778,18 @@ async function scanAndWarn(env, ctx, { dryRun, mode }) {
   // seguros; lo que sobra queda tal cual (ni "pending" ni "closed"), así
   // que el siguiente click/scan lo vuelve a recoger solo — batchRemaining
   // le dice al dashboard si hace falta correrlo de nuevo.
+  //
+  // GET /prospects de Zenvia devuelve los resultados por `created`
+  // descendente (más nuevo primero) — confirmado inspeccionando la
+  // respuesta real. Sin este sort, cada corrida tomaba "los primeros 20"
+  // de esa lista, es decir, los prospectos stale creados más recientemente;
+  // los realmente antiguos (semanas sin actividad) quedaban siempre al
+  // final y nunca les tocaba turno mientras seguían entrando prospectos
+  // stale más nuevos por delante — cola sin prioridad, backlog viejo
+  // atascado indefinidamente. Se ordena por `created` ascendente para que
+  // cada lote limitado ataque primero el backlog más viejo de verdad.
+  toProcess.sort((a, b) => new Date(a.created) - new Date(b.created));
+
   const CLEANUP_BATCH_LIMIT = 20;
   const batch = toProcess.slice(0, CLEANUP_BATCH_LIMIT);
   const batchRemaining = toProcess.length - batch.length;
