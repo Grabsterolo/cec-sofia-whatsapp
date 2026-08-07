@@ -1241,6 +1241,60 @@ esto arrancó en `0/0`. No es retroactivo.
 
 ---
 
+## 5g. Confiabilidad: reintentos ante fallas transitorias de Claude/Zenvia
+
+Bug en producción reportado por JP: Sofía a veces no respondía mensajes de
+**texto normal**, no solo adjuntos (ver 5b para el bug de adjuntos, que es
+distinto). Causa raíz encontrada por lectura de código, sin necesidad de
+reproducir en vivo: tres funciones críticas hacían un solo intento de red,
+sin reintento, y cualquier falla transitoria (rate limit, sobrecarga
+momentánea, timeout) se traducía en silencio total para el paciente:
+
+1. **`callClaude()`** — si la llamada a la API de Claude fallaba, `content`
+   no traía ningún bloque `type: "text"`, `rawText` quedaba en `""`, y el
+   código seguía el flujo normal mandando un mensaje **vacío** a
+   `sendChannelMessage()` (que tampoco lanza si Zenvia lo rechaza). La
+   conversación se marcaba como procesada exitosamente aunque el paciente no
+   recibió nada.
+2. **`getCurrentProspectAgentId()`** y **`getProspectStatus()`** —
+   fail-closed por diseño (correcto: evita que Sofía le responda encima de
+   un humano, ver 1.8) pero sin ningún reintento — un solo hipo de red en
+   Zenvia se trataba igual que "definitivamente hay un humano atendiendo",
+   y la conversación quedaba en silencio.
+
+**Cambios:**
+- Las tres funciones ahora reintentan hasta 3 intentos totales, con espera
+  corta entre intentos (400ms, 900ms — `RETRY_DELAYS_MS`). `callClaude()`
+  además valida que la respuesta traiga un bloque `type: "text"` real antes
+  de darla por buena, no solo que el HTTP status sea `2xx`.
+- Si `callClaude()` agota los 3 intentos sin una respuesta válida, ya **no**
+  se manda un reply vacío: se sigue el mismo patrón que ya existía para
+  `MAX_CONVERSATION_TURNS` (mensaje de disculpa corto —
+  `TECHNICAL_FAILURE_REPLIES` —, `runEscalationAgility()` con
+  `escalationReason: "falla_tecnica_claude"`, y
+  `transferToNextAgentInPool()`), para que un humano se entere en vez de
+  que la conversación quede coja. Se loguea
+  `console.error("CLAUDE_CALL_FAILED", { prospectId, attempts: 3 })` antes.
+- `getCurrentProspectAgentId()` y `getProspectStatus()` mantienen el mismo
+  comportamiento fail-closed de siempre después de agotar los reintentos —
+  esto solo reduce falsos positivos por hipos de red, no cambia la lógica
+  de seguridad de 1.8/1.9.
+- Tabla nueva en Supabase, `sofia_reliability_events` (migración
+  `create_sofia_reliability_events`, vía Supabase MCP): `id`, `created_at`,
+  `event_type` (`claude_call_failed` | `zenvia_lookup_failed`),
+  `prospect_id`, `phone_hash`, `detail`. Se inserta una fila (best-effort,
+  vía `logReliabilityEvent()`, nunca bloquea ni puede ser la causa de que
+  el paciente se quede sin respuesta) cada vez que se dispara el fallback
+  de `callClaude()` o el fail-closed de los chequeos de Zenvia después de
+  agotar reintentos — visibilidad medible en vez de depender solo de
+  `wrangler tail` en vivo.
+
+**No tocado:** `ragSearch()` (ya maneja sus fallos devolviendo `[]` sin
+romper el flujo, no es parte de este bug), la dedup por `interactionId`, ni
+el chequeo de `whatsapp_enabled`.
+
+---
+
 ## 6. Cosas a tener en cuenta / próximos pasos
 
 - **El group ID, los IDs de agentes y el channel de WhatsApp están

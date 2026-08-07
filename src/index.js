@@ -54,6 +54,29 @@ function pickMessageLimitReply() {
   return MESSAGE_LIMIT_REPLIES[Math.floor(Math.random() * MESSAGE_LIMIT_REPLIES.length)];
 }
 
+// Sent when callClaude() exhausts its retries — same "hand off to a human"
+// shape as MESSAGE_LIMIT_REPLIES above, but for a technical failure instead
+// of hitting the turn limit (see README "Confiabilidad: reintentos ante
+// fallas transitorias").
+const TECHNICAL_FAILURE_REPLIES = [
+  "Disculpe, tuve un problema técnico momentáneo. Ya la voy a conectar con nuestro equipo para que le ayude directamente.",
+  "Disculpe las molestias, tuve un inconveniente técnico de mi lado. La voy a poner en contacto con nuestro equipo para que le sigan ayudando.",
+];
+
+function pickTechnicalFailureReply() {
+  return TECHNICAL_FAILURE_REPLIES[Math.floor(Math.random() * TECHNICAL_FAILURE_REPLIES.length)];
+}
+
+// Retries for transient Claude/Zenvia failures — see callClaude(),
+// getCurrentProspectAgentId(), getProspectStatus() and README "Confiabilidad:
+// reintentos ante fallas transitorias". 3 attempts total, short waits between
+// them so a single rate-limit/timeout blip doesn't read as a hard failure.
+const RETRY_DELAYS_MS = [400, 900];
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // Sent to a prospect that's had no activity in INACTIVITY_WARNING_HOURS —
 // warm, formal "usted", zero emojis, matching Sofía's own tone (see
 // sofia_config.system_prompt) even though this path doesn't call Claude.
@@ -264,6 +287,12 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     return;
   }
 
+  // Computed early (only depends on `phone`) so it's available for
+  // sofia_reliability_events logging on the fail-closed branch right below,
+  // not just later where it was originally needed for session/conversation
+  // lookups.
+  const phoneHash = await sha256Hex(phone);
+
   // A human already has this conversation (Adrian, Angie, Ingrid, or
   // Jordan) — don't touch it at all, on ANY message, unconditionally. This
   // used to trust the `agentId` field on the inbound webhook payload, which
@@ -273,18 +302,26 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // replying after Angie had already taken over (see README "Sofía sigue
   // respondiendo tras reasignación a un humano"). Fetching the prospect's
   // current agent directly from Zenvia closes that gap. Fails closed: any
-  // lookup error is treated as "a human might own this" and skipped, never
-  // as "safe to proceed" — same fail-safe direction as the payload-agentId
-  // fix this replaces.
+  // lookup error (after its own internal retries — see
+  // getCurrentProspectAgentId) is treated as "a human might own this" and
+  // skipped, never as "safe to proceed" — same fail-safe direction as the
+  // payload-agentId fix this replaces.
   const { agentId: liveAgentId, failed: agentLookupFailed } = await getCurrentProspectAgentId(env, prospectId);
   if (agentLookupFailed || (liveAgentId && HUMAN_AGENT_IDS.has(liveAgentId))) {
     console.log(
       `Skipping inbound message: prospect ${prospectId} is owned by a human agent (live check: agentId=${liveAgentId}, lookupFailed=${agentLookupFailed})`
     );
+    if (agentLookupFailed) {
+      await logReliabilityEvent(env, {
+        eventType: "zenvia_lookup_failed",
+        prospectId,
+        phoneHash,
+        detail: "getCurrentProspectAgentId exhausted retries",
+      });
+    }
     return;
   }
 
-  const phoneHash = await sha256Hex(phone);
   const conversationState = await getConversationState(env, phoneHash);
 
   // Hard stop once this conversation has been escalated — by Sofía's own
@@ -306,6 +343,14 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       console.log(
         `Skipping inbound message: conversation for prospect ${prospectId} is already escalated (Zenvia status=${prospectStatus})`
       );
+      if (prospectStatus === null) {
+        await logReliabilityEvent(env, {
+          eventType: "zenvia_lookup_failed",
+          prospectId,
+          phoneHash,
+          detail: "getProspectStatus exhausted retries",
+        });
+      }
       return;
     }
     console.log(`Conversation for prospect ${prospectId} was archived in Zenvia — resuming Sofía.`);
@@ -389,6 +434,51 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // this invocation ends — Workers don't guarantee in-flight fetches
   // complete once the handler returns without an explicit await.
   await claimPromise;
+
+  // callClaude() already retried transient failures internally (see its
+  // definition) — null here means all 3 attempts failed to produce a valid
+  // text reply. Sending nothing (the old behavior: rawText fell back to ""
+  // and an empty message went out, silently, to the patient) is exactly the
+  // "Sofía a veces no responde" bug this fixes. Same shape as the
+  // MAX_CONVERSATION_TURNS branch above: apologize, escalate, hand off to
+  // the pool, and return early instead of falling through to the normal
+  // parseEscalation() path with an empty rawText.
+  if (!claudeData) {
+    console.error("CLAUDE_CALL_FAILED", { prospectId, attempts: 3 });
+    await logReliabilityEvent(env, {
+      eventType: "claude_call_failed",
+      prospectId,
+      phoneHash,
+      detail: "callClaude exhausted 3 attempts",
+    });
+
+    const technicalReply = pickTechnicalFailureReply();
+    await sendChannelMessage(env, prospectId, channel, technicalReply);
+    const failureAgility = await runEscalationAgility(env, {
+      prospectId,
+      history,
+      escalationReason: "falla_tecnica_claude",
+    });
+    await transferToNextAgentInPool(env, prospectId);
+
+    const updatedHistoryAfterFailure = [...history, { role: "assistant", content: technicalReply }].slice(
+      -MAX_HISTORY_MESSAGES
+    );
+    await saveSession(env, phoneHash, updatedHistoryAfterFailure, channel);
+    await upsertConversation(env, {
+      phoneHash,
+      prospectId,
+      channel,
+      lastMessage: technicalReply,
+      escalated: true,
+      escalationReason: "falla_tecnica_claude",
+      interactionId,
+      resetCounters,
+      procedureInterest: failureAgility.procedureInterest,
+      sentiment: failureAgility.sentiment,
+    });
+    return;
+  }
 
   // claude-sonnet-5 returns extended thinking by default, so content[0] is
   // often a {type: "thinking"} block rather than the reply — find the text
@@ -810,28 +900,51 @@ function formatCostaRicaDateTime(date = new Date()) {
   return `${weekday} ${day} de ${month} de ${year}, ${hour12}:${minute}${period}`;
 }
 
+// Up to 3 attempts total (see RETRY_DELAYS_MS) — retries on a thrown
+// exception, a non-ok response, or a response that parses but has no
+// type:"text" block in content (which used to slip through as an empty
+// reply sent to the patient, see the caller's CLAUDE_CALL_FAILED branch).
+// Returns null once all attempts are exhausted; callers must treat that as
+// "no reply available", never fall back to an empty string.
 async function callClaude(env, systemBlocks, history) {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": "prompt-caching-2024-07-31",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      // Promo pricing through 2026-08-31 — re-evaluate the model choice after that.
-      model: "claude-sonnet-5",
-      max_tokens: 1024,
-      // claude-sonnet-5 runs adaptive thinking by default, which put the
-      // reply text in content[1] instead of content[0] (see callers of
-      // this function). Disabling it keeps content[0] a plain text block.
-      thinking: { type: "disabled" },
-      system: systemBlocks,
-      messages: history,
-    }),
-  });
-  return response.json();
+  let lastFailure = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": "prompt-caching-2024-07-31",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          // Promo pricing through 2026-08-31 — re-evaluate the model choice after that.
+          model: "claude-sonnet-5",
+          max_tokens: 1024,
+          // claude-sonnet-5 runs adaptive thinking by default, which put the
+          // reply text in content[1] instead of content[0] (see callers of
+          // this function). Disabling it keeps content[0] a plain text block.
+          thinking: { type: "disabled" },
+          system: systemBlocks,
+          messages: history,
+        }),
+      });
+      if (response.ok) {
+        const data = await response.json();
+        const hasTextBlock = Array.isArray(data?.content) && data.content.some((b) => b.type === "text");
+        if (hasTextBlock) return data;
+        lastFailure = "response ok but no text block in content";
+      } else {
+        lastFailure = `http ${response.status}`;
+      }
+    } catch (err) {
+      lastFailure = err?.message || "network error";
+    }
+    if (attempt < 3) await sleep(RETRY_DELAYS_MS[attempt - 1]);
+  }
+  console.error("callClaude exhausted 3 attempts", lastFailure);
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -961,6 +1074,35 @@ async function upsertConversation(env, {
   }
 }
 
+// Records a transient Claude/Zenvia failure (after retries were already
+// exhausted by the caller — see callClaude, getCurrentProspectAgentId,
+// getProspectStatus) so it's measurable from the dashboard/Supabase instead
+// of only visible live via wrangler tail. Best-effort: wrapped in try/catch
+// so a failure writing this row is never the reason a patient is left
+// without a reply — the caller has already sent (or attempted) its own
+// reply/escalation by the time this runs.
+async function logReliabilityEvent(env, { eventType, prospectId, phoneHash, detail }) {
+  try {
+    await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_reliability_events`, {
+      method: "POST",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        event_type: eventType,
+        prospect_id: prospectId ?? null,
+        phone_hash: phoneHash ?? null,
+        detail: detail ?? null,
+      }),
+    });
+  } catch (err) {
+    console.error("logReliabilityEvent failed", err);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Zenvia Conversion API calls
 // ---------------------------------------------------------------------------
@@ -970,36 +1112,53 @@ async function upsertConversation(env, {
 // "archived" — unlike Interaction.id (fresh per message, not per thread, see
 // README 1.7/1.8), status only changes when the conversation is genuinely
 // wrapped up ("archived"). Used to decide whether a previously-escalated
-// conversation can safely resume with Sofía. Returns null on any failure —
-// callers must treat that as "not archived" (stay silent), never as
-// "archived".
+// conversation can safely resume with Sofía. Retries transient failures up
+// to 3 attempts total (see RETRY_DELAYS_MS) before giving up. Returns null
+// once retries are exhausted — callers must treat that as "not archived"
+// (stay silent), never as "archived". Retrying only reduces false positives
+// from a single network hiccup; the fail-closed behavior after exhausting
+// retries is unchanged.
 async function getProspectStatus(env, prospectId) {
-  try {
-    const res = await fetch(`${ZENVIA_API_BASE}/prospect/${prospectId}?api-key=${env.ZENVIA_API_KEY}`);
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.status ?? null;
-  } catch {
-    return null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(`${ZENVIA_API_BASE}/prospect/${prospectId}?api-key=${env.ZENVIA_API_KEY}`);
+      if (res.ok) {
+        const data = await res.json();
+        return data.status ?? null;
+      }
+    } catch {
+      // fall through to retry/backoff below
+    }
+    if (attempt < 3) await sleep(RETRY_DELAYS_MS[attempt - 1]);
   }
+  return null;
 }
 
 // The prospect object carries a full `agent: {id, firstName, ...}` object
 // reflecting who currently owns it in Zenvia right now (live-confirmed via
 // GET /prospects) — distinct from, and more trustworthy than, the agentId
 // field on an inbound webhook payload, which can be stale on a redelivered
-// event. `failed: true` on any error — callers must treat that the same as
-// "a human owns this" (fail closed), never as "safe to proceed", since this
-// guards against Sofía overriding a human agent.
+// event. Retries transient failures up to 3 attempts total (see
+// RETRY_DELAYS_MS) before giving up. `failed: true` once retries are
+// exhausted — callers must treat that the same as "a human owns this" (fail
+// closed), never as "safe to proceed", since this guards against Sofía
+// overriding a human agent. Retrying only reduces false positives from a
+// single network hiccup; the fail-closed behavior after exhausting retries
+// is unchanged.
 async function getCurrentProspectAgentId(env, prospectId) {
-  try {
-    const res = await fetch(`${ZENVIA_API_BASE}/prospect/${prospectId}?api-key=${env.ZENVIA_API_KEY}`);
-    if (!res.ok) return { agentId: null, failed: true };
-    const data = await res.json();
-    return { agentId: data.agent?.id ?? null, failed: false };
-  } catch {
-    return { agentId: null, failed: true };
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(`${ZENVIA_API_BASE}/prospect/${prospectId}?api-key=${env.ZENVIA_API_KEY}`);
+      if (res.ok) {
+        const data = await res.json();
+        return { agentId: data.agent?.id ?? null, failed: false };
+      }
+    } catch {
+      // fall through to retry/backoff below
+    }
+    if (attempt < 3) await sleep(RETRY_DELAYS_MS[attempt - 1]);
   }
+  return { agentId: null, failed: true };
 }
 
 async function sendChannelMessage(env, prospectId, channel, content) {
