@@ -205,13 +205,24 @@ function extractInboundFromInteraction(interaction) {
   // message.attachment). Not yet confirmed against a live attachment
   // message from this account — see README on media support.
   const attachment = message.attachment ?? null;
-  // A photo/voice note with no caption has empty text but a real
-  // attachment — still a message worth processing, so only drop it if
-  // BOTH are empty.
-  if ((!text && !attachment) || !phone || !prospectId) return null;
+  // phone/prospectId are the only real requirements to be able to reply —
+  // drop the interaction if either is missing.
+  if (!phone || !prospectId) return null;
 
   const agentId = interaction.agentId ?? interaction.agent?.id ?? null;
   const channel = SUPPORTED_CHANNELS[interaction.via];
+
+  // Both text and attachment came out empty. Either this is a genuinely
+  // content-less interaction (e.g. a WhatsApp reaction/read receipt) or —
+  // per the caveat above — the attachment/message shape Zenvia actually
+  // sent doesn't match what we parse for. Log it instead of silently
+  // dropping it, so the next real occurrence tells us the real shape via
+  // wrangler tail, and let the candidate flow through the normal pipeline
+  // (resolveInboundContent has a matching fallback that replies asking the
+  // patient to write their message as text).
+  if (!text && !attachment) {
+    console.error("UNRECOGNIZED_MESSAGE_SHAPE", JSON.stringify(interaction));
+  }
 
   return { text, phone, prospectId, interactionId: interaction.id, agentId, channel, attachment };
 }
@@ -657,6 +668,18 @@ async function resolveInboundContent(env, { text, attachment }) {
     if (!imageBlock) {
       appendNote("[El paciente envió una imagen que Sofía no pudo abrir. Pídale que la vuelva a enviar o la describa en texto.]");
     }
+  }
+
+  // Last-resort fallback: nothing above (AUDIO/VIDEO/FILE/IMAGE) recognized
+  // this message, and there's still no text — e.g. an attachment shape/type
+  // Zenvia sent that we don't parse (see extractInboundFromInteraction's
+  // UNRECOGNIZED_MESSAGE_SHAPE log). Same pattern as the VIDEO/FILE note
+  // above: tell Claude so it can ask the patient to write it as text instead
+  // of leaving them without a reply.
+  if (!resolvedText && !attachment) {
+    appendNote(
+      "[El paciente envió un mensaje que Sofía no logró interpretar — probablemente un tipo de contenido no compatible (podría ser una nota de voz, reacción, o adjunto que no se reconoció). Pídale amablemente que escriba su consulta en texto.]"
+    );
   }
 
   const contentForHistory = resolvedText || "[mensaje sin texto]";
