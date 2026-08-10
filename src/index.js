@@ -67,6 +67,23 @@ function pickTechnicalFailureReply() {
   return TECHNICAL_FAILURE_REPLIES[Math.floor(Math.random() * TECHNICAL_FAILURE_REPLIES.length)];
 }
 
+// Sent when Sofía escalates ([ESCALAR: motivo]) but wrote nothing before the
+// tag — parseEscalation() then returns reply === "", and without this
+// fallback the patient gets total silence while Zenvia already shows the
+// conversation as taken (bug real: caso "Un Día A La Vez"). Phrasing lifted
+// verbatim from the system_prompt's own "Cómo escalar" examples, so it
+// matches what Sofía says when she does write a transition line herself.
+const ESCALATION_FALLBACK_REPLIES = [
+  "Con gusto le paso la información al equipo para que le contacten a la brevedad.",
+  "Nuestro equipo de asesores le va a estar contactando para coordinar eso.",
+  "Le voy a pasar con el equipo para que le ayuden con ese proceso.",
+  "Para coordinar eso le va a contactar uno de nuestros asesores.",
+];
+
+function pickEscalationFallbackReply() {
+  return ESCALATION_FALLBACK_REPLIES[Math.floor(Math.random() * ESCALATION_FALLBACK_REPLIES.length)];
+}
+
 // Retries for transient Claude/Zenvia failures — see callClaude(),
 // getCurrentProspectAgentId(), getProspectStatus() and README "Confiabilidad:
 // reintentos ante fallas transitorias". 3 attempts total, short waits between
@@ -487,7 +504,14 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   const rawText = textBlock?.text ?? "";
   const { reply, escalated, escalation_reason, shouldClose } = parseEscalation(rawText);
 
-  const updatedHistory = [...history, { role: "assistant", content: reply }].slice(
+  // Sofía usually writes a transition line before [ESCALAR] (see
+  // system_prompt "Cómo escalar"), but not always — when she doesn't, reply
+  // is "". finalReply is what actually goes out to the patient and gets
+  // persisted everywhere below (history, session, lastMessage), so nothing
+  // downstream ever sees the empty string.
+  const finalReply = escalated && !reply ? pickEscalationFallbackReply() : reply;
+
+  const updatedHistory = [...history, { role: "assistant", content: finalReply }].slice(
     -MAX_HISTORY_MESSAGES
   );
   await saveSession(env, phoneHash, updatedHistory, channel);
@@ -498,13 +522,11 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     // Give the human agent context before they open the chat cold.
     await addEscalationNote(env, prospectId, escalation_reason, updatedHistory.slice(-2));
 
-    // Sofía already wrote a transition line before the [ESCALAR] tag (e.g.
-    // "nuestro equipo de asesores le va a estar contactando") — send it
-    // before handing off, so the patient isn't left hanging. Skip only if
-    // there's truly nothing to send (Sofía wrote nothing before the tag).
-    if (reply) {
-      await sendChannelMessage(env, prospectId, channel, reply);
-    }
+    // Send the transition line before handing off, so the patient isn't left
+    // hanging. finalReply is never empty here: it's either what Sofía wrote
+    // before the [ESCALAR] tag, or the pickEscalationFallbackReply() default
+    // computed above when she wrote nothing.
+    await sendChannelMessage(env, prospectId, channel, finalReply);
     agility = await runEscalationAgility(env, {
       prospectId,
       history: updatedHistory,
@@ -542,7 +564,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     phoneHash,
     prospectId,
     channel,
-    lastMessage: reply,
+    lastMessage: finalReply,
     escalated,
     escalationReason: escalation_reason,
     interactionId,
