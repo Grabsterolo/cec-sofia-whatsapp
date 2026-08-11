@@ -2,12 +2,10 @@ name = "cec-sofia-whatsapp"
 main = "src/index.js"
 compatibility_date = "2026-07-01"
 
-# Fase 2 of the inactivity cleanup — closes conversations that were warned
-# INACTIVITY_CLOSE_AFTER_WARNING_HOURS ago and are still inactive. Every
-# 30 minutes is frequent enough that the 2h window is enforced with well
-# under 30min of slop.
-[triggers]
-crons = ["*/30 * * * *"]
+# No [triggers]/cron — automatic inactivity closing was removed 2026-08-11
+# (see the comment on the removed `scheduled()` export in src/index.js).
+# Cleanup is manual-only again: the dashboard's "Revisar" / "Confirmar y
+# cerrar" buttons call POST /cleanup/scan-and-warn directly.
 
 # Deduplicación de entregas repetidas de webhook (mismo interactionId) — ver
 # processInboundMessage(). TTL corto, no es un dato que necesite persistir.

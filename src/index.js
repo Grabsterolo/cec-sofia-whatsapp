@@ -94,15 +94,11 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Sent to a prospect that's had no activity in INACTIVITY_WARNING_HOURS —
-// warm, formal "usted", zero emojis, matching Sofía's own tone (see
-// sofia_config.system_prompt) even though this path doesn't call Claude.
-const INACTIVITY_WARNING_MESSAGE =
-  "Como no hemos tenido noticias suyas, vamos a pausar esta conversación por el momento. " +
-  "Si más adelante necesita algo más o quiere retomar el tema, con gusto lo atendemos — solo escríbanos por aquí.";
-
+// Staleness threshold for the manual "cerrar conversaciones inactivas"
+// button in the dashboard (ConfigureSofiaSection.jsx) — POST
+// /cleanup/scan-and-warn. Sofía never closes a conversation on her own;
+// this only runs when a human clicks the button (see scanAndWarn).
 const INACTIVITY_WARNING_HOURS = 24;
-const INACTIVITY_CLOSE_AFTER_WARNING_HOURS = 2;
 const INACTIVITY_ARCHIVE_REASON = "inactive";
 
 export default {
@@ -132,29 +128,15 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 
-  async scheduled(event, env, ctx) {
-    // Phase 2 of the (unused) "warn" flow — closes conversations that were
-    // warned and never replied. Kept even though nothing currently puts a
-    // row into "warned" state (see closeDirect below); harmless no-op in
-    // that case (dueRows.length === 0 returns immediately).
-    ctx.waitUntil(closeInactiveConversations(env));
-
-    // JP found 659 open conversations, 407 of them stale ≥24h, and nothing
-    // had been auto-closing them — the dashboard's "Cerrar conversaciones
-    // inactivas" button (mode: closeDirect) was the *only* thing that ever
-    // closed a stale conversation, and it's 100% manual, so the backlog
-    // just grows until someone remembers to click it. Running the same
-    // closeDirect scan here, every 30 min via the existing cron, means it
-    // never needs to build up again — CLEANUP_BATCH_LIMIT (20) per run is
-    // plenty once the backlog is actually caught up (40/hour steady-state).
-    // The one-time backlog itself still needs the manual button (or repeat
-    // cron ticks) to clear — this only prevents it from recurring.
-    ctx.waitUntil(
-      scanAndWarn(env, ctx, { dryRun: false, mode: "closeDirect" }).then((result) =>
-        console.log("scheduled closeDirect:", JSON.stringify(result))
-      )
-    );
-  },
+  // No `scheduled()` handler — automatic closing was removed 2026-08-11 (see
+  // wrangler.toml). JP decided the risk of auto-archiving a real
+  // conversation (confirmed happening — both from the account-wide sweep
+  // missing recent activity, and separately from closing conversations
+  // already assigned to a human agent) outweighed the convenience of not
+  // having to click the dashboard button. Cleanup is manual-only again:
+  // "Revisar" / "Confirmar y cerrar" in ConfigureSofiaSection.jsx, which
+  // still calls POST /cleanup/scan-and-warn below — that endpoint itself is
+  // unchanged, only the automatic trigger is gone.
 };
 
 // ---------------------------------------------------------------------------
@@ -502,7 +484,27 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // block explicitly instead of assuming it's first.
   const textBlock = (claudeData?.content || []).find((b) => b.type === "text");
   const rawText = textBlock?.text ?? "";
-  const { reply, escalated, escalation_reason, shouldClose } = parseEscalation(rawText);
+  const { reply, escalated: taggedEscalated, escalation_reason: taggedReason, shouldClose } = parseEscalation(rawText);
+
+  // Sofía sometimes tells the patient she's passing their case to the team
+  // ("le voy a pasar la información al equipo", "le voy a transferir...")
+  // without including the [ESCALAR] tag that actually triggers the handoff
+  // — confirmed in the 2026-08-11 conversation audit: 88 conversations (65
+  // in the prior 7 days) where she said this but escalated stayed false, so
+  // no internal note got added, nobody got transferred, and the patient's
+  // "our team will contact you" never actually happened on our end. This
+  // detects that phrase pattern in what she actually wrote and forces a
+  // real escalation even when she forgot the tag — a deterministic net
+  // instead of relying on the model to tag it correctly every time, same
+  // spirit as the finalReply fallback above (2026-08-10 fix) for the
+  // opposite gap (tagged but wrote nothing).
+  const impliedHandoff = !taggedEscalated && mentionsHandoffPromise(reply);
+  const escalated = taggedEscalated || impliedHandoff;
+  const escalation_reason = taggedEscalated
+    ? taggedReason
+    : impliedHandoff
+      ? "frase de traspaso detectada sin etiqueta [ESCALAR]"
+      : null;
 
   // Sofía usually writes a transition line before [ESCALAR] (see
   // system_prompt "Cómo escalar"), but not always — when she doesn't, reply
@@ -572,6 +574,22 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     procedureInterest: agility.procedureInterest,
     sentiment: agility.sentiment,
   });
+}
+
+// Phrases pulled directly from the 88 real conversations found in the
+// 2026-08-11 audit where Sofía said one of these but never tagged
+// [ESCALAR] — see the comment where this is called in processInboundMessage.
+const HANDOFF_PROMISE_PATTERNS = [
+  /le voy a pasar/i,
+  /equipo de seguimiento/i,
+  /lo voy a escalar/i,
+  /le voy a transferir/i,
+  /le va a contactar (nuestro |el )?equipo/i,
+  /nuestro equipo le va a (estar contactando|contactar)/i,
+];
+
+function mentionsHandoffPromise(text) {
+  return HANDOFF_PROMISE_PATTERNS.some((re) => re.test(text));
 }
 
 function parseEscalation(rawText) {
@@ -1623,13 +1641,8 @@ async function handleScanAndWarn(request, env, ctx) {
     // as an empty {}
   }
   const dryRun = body.dryRun !== false; // default true — a real run must opt in explicitly
-  // "warn" = original flow (WhatsApp warning, closes 2h later if no reply).
-  // "closeDirect" = archive stale conversations immediately, no WhatsApp
-  // message sent at all — added because warning each one costs a real
-  // WhatsApp message and JP asked to skip that cost entirely.
-  const mode = body.mode === "closeDirect" ? "closeDirect" : "warn";
 
-  const result = await scanAndWarn(env, ctx, { dryRun, mode });
+  const result = await scanAndWarn(env, ctx, { dryRun });
   return new Response(JSON.stringify(result), {
     status: 200,
     headers: { "content-type": "application/json" },
@@ -1740,26 +1753,62 @@ async function fetchProspectsByStatus(env, groupId, status) {
 // Prospect ids with at least one interaction since `sinceIso`, across the
 // whole account (the interactions endpoint has no group filter — group
 // membership is enforced by intersecting with getOpenProspects() instead).
+//
+// Properly paginated (2026-08-11 fix) — the old version made one call with
+// `limit=5000`, which is 5x Zenvia's own documented recommendation ("no more
+// than 1000"). On high-traffic days that single call silently returned an
+// incomplete slice of the 24h window (confirmed live: prospects were being
+// archived after ~19-20h of real inactivity instead of 24h, because their
+// actual recent activity fell outside what came back). Zenvia's spec
+// confirms this endpoint sorts results by descending creation date and
+// supports cursor pagination via `before=<id>` ("results created before this
+// id"), so this now walks the full window a page at a time — however many
+// pages that takes — instead of trusting one bounded call to cover it.
 async function getRecentlyActiveProspectIds(env, sinceIso) {
-  const res = await fetch(
-    `${ZENVIA_API_BASE}/prospects/interactions?createdAfter=${encodeURIComponent(sinceIso)}&limit=5000&api-key=${env.ZENVIA_API_KEY}`
-  );
-  if (!res.ok) {
-    console.error("getRecentlyActiveProspectIds failed", res.status, await res.text());
-    // Fail closed: treat every prospect as "recently active" so a broken
-    // lookup skips the whole scan instead of warning/closing everything.
-    return null;
+  const PAGE_LIMIT = 1000; // Zenvia's documented recommended max
+  const MAX_PAGES = 20; // 20k interactions/24h safety ceiling — see below if ever hit
+  const distinctIds = new Set();
+  let cursor = null;
+  let pages = 0;
+  let rawTotal = 0;
+
+  while (pages < MAX_PAGES) {
+    let url = `${ZENVIA_API_BASE}/prospects/interactions?createdAfter=${encodeURIComponent(sinceIso)}&limit=${PAGE_LIMIT}&api-key=${env.ZENVIA_API_KEY}`;
+    if (cursor) url += `&before=${cursor}`;
+
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.error("getRecentlyActiveProspectIds failed", res.status, await res.text(), { pages, cursor });
+      // Fail closed: treat every prospect as "recently active" so a broken
+      // lookup skips the whole scan instead of warning/closing everything.
+      return null;
+    }
+    const page = await res.json();
+    pages++;
+    rawTotal += page.length;
+    for (const i of page) distinctIds.add(i.prospectId);
+
+    if (page.length < PAGE_LIMIT) break; // shorter than a full page — reached the end of the window
+    cursor = page[page.length - 1].id; // oldest item in this page (descending order) — next page continues from here
   }
-  const interactions = await res.json();
-  if (interactions.length === 5000) {
+
+  if (pages === MAX_PAGES) {
     console.error(
-      "getRecentlyActiveProspectIds hit the 5000 result cap — recent-activity data may be incomplete for this window"
+      `getRecentlyActiveProspectIds hit the ${MAX_PAGES}-page safety ceiling (${rawTotal} interactions) — window may still be incomplete, raise MAX_PAGES if this fires`
     );
   }
-  return new Set(interactions.map((i) => i.prospectId));
+
+  console.log("getRecentlyActiveProspectIds diag", {
+    sinceIso,
+    pages,
+    rawInteractions: rawTotal,
+    distinctProspectIds: distinctIds.size,
+  });
+
+  return distinctIds;
 }
 
-async function scanAndWarn(env, ctx, { dryRun, mode }) {
+async function scanAndWarn(env, ctx, { dryRun }) {
   const sinceIso = new Date(Date.now() - INACTIVITY_WARNING_HOURS * 60 * 60 * 1000).toISOString();
 
   const [openProspects, recentlyActiveIds] = await Promise.all([
@@ -1770,34 +1819,19 @@ async function scanAndWarn(env, ctx, { dryRun, mode }) {
   if (recentlyActiveIds === null) {
     return {
       dryRun,
-      mode,
-      error: "Could not determine recent activity — aborted without warning or closing anything.",
+      error: "Could not determine recent activity — aborted without closing anything.",
     };
   }
 
-  const staleProspects = openProspects.filter((p) => !recentlyActiveIds.has(p.id));
-  const alreadyPending = await getPendingCleanupProspectIds(env);
+  const toProcess = openProspects.filter((p) => !recentlyActiveIds.has(p.id));
 
-  const toProcess = [];
-  let alreadyPendingCount = 0;
-
-  for (const prospect of staleProspects) {
-    if (alreadyPending.has(prospect.id)) {
-      alreadyPendingCount++;
-      continue;
-    }
-    toProcess.push(prospect);
-  }
-
-  // Cada prospecto en closeDirect gasta 2 subrequests (archivar + 1
-  // escritura a Supabase); "warn" gasta 2 también (enviar WhatsApp + 1
-  // escritura). Sumado a los ~4 subrequests de arranque de este mismo
-  // scanAndWarn (getOpenProspects x2, getRecentlyActiveProspectIds,
-  // getPendingCleanupProspectIds), procesar todo en una sola invocación
-  // choca contra el límite de subrequests por invocación de Cloudflare
-  // ("Too many subrequests") apenas pasan ~20 prospectos — el lote se
-  // cortaba en silencio a mitad de camino, sin avisar. Se procesa en lotes
-  // seguros; lo que sobra queda tal cual (ni "pending" ni "closed"), así
+  // Cada prospecto gasta hasta 3 subrequests (chequeo de agente humano +
+  // chequeo puntual de actividad + archivar) además de los ~2 de arranque de
+  // este mismo scanAndWarn (getOpenProspects x2, getRecentlyActiveProspectIds
+  // ya paginada). Procesar todo en una sola invocación choca contra el
+  // límite de subrequests por invocación de Cloudflare apenas pasan unos
+  // pocos prospectos — el lote se cortaba en silencio a mitad de camino, sin
+  // avisar. Se procesa en lotes seguros; lo que sobra queda tal cual, así
   // que el siguiente click/scan lo vuelve a recoger solo — batchRemaining
   // le dice al dashboard si hace falta correrlo de nuevo.
   //
@@ -1816,22 +1850,20 @@ async function scanAndWarn(env, ctx, { dryRun, mode }) {
   const batch = toProcess.slice(0, CLEANUP_BATCH_LIMIT);
   const batchRemaining = toProcess.length - batch.length;
 
-  // Ambos modos tocan hasta CLEANUP_BATCH_LIMIT prospectos uno a la vez —
-  // más de lo que un request HTTP interactivo (dashboard -> Pages Function
-  // -> este Worker) puede esperar. ctx.waitUntil() lo sigue corriendo en
-  // segundo plano después de que la respuesta de abajo ya se envió, así el
-  // botón responde rápido ("queued N") en vez de que toda la cadena haga
-  // timeout a mitad de camino.
+  // Toca hasta CLEANUP_BATCH_LIMIT prospectos uno a la vez — más de lo que
+  // un request HTTP interactivo (dashboard -> Pages Function -> este
+  // Worker) puede esperar. ctx.waitUntil() lo sigue corriendo en segundo
+  // plano después de que la respuesta de abajo ya se envió, así el botón
+  // responde rápido ("queued N") en vez de que toda la cadena haga timeout
+  // a mitad de camino.
   if (!dryRun && batch.length > 0) {
-    ctx.waitUntil(mode === "closeDirect" ? closeDirectly(env, batch) : sendWarnings(env, batch));
+    ctx.waitUntil(closeDirectly(env, batch, sinceIso));
   }
 
   return {
     dryRun,
-    mode,
     openConversations: openProspects.length,
-    staleConversations: staleProspects.length,
-    alreadyPendingClosure: alreadyPendingCount,
+    staleConversations: toProcess.length,
     warned: dryRun ? 0 : batch.length, // queued in the background, not yet confirmed done — see sofia_inactivity_cleanup for progress
     wouldWarn: dryRun ? toProcess.length : 0,
     batchRemaining, // > 0 significa que hay que volver a correr el scan para terminar
@@ -1839,12 +1871,48 @@ async function scanAndWarn(env, ctx, { dryRun, mode }) {
   };
 }
 
-// mode: "closeDirect" — archives stale conversations right away with no
-// WhatsApp message at all (each warning message has a real cost; JP asked
-// to skip it and just close everything already ≥24h inactive).
-async function closeDirectly(env, prospects) {
+// Archives stale conversations right away, no WhatsApp message sent — only
+// ever called from the manual dashboard button (POST /cleanup/scan-and-warn
+// with dryRun:false), never automatically. See the removed `scheduled()`
+// export at the top of this file for why there's no cron anymore.
+//
+// `sinceIso` is passed through so each prospect gets a final per-prospect
+// confirmation right before the irreversible archive call (see
+// hasRecentActivityForProspect below) — the account-wide sweep that built
+// this candidate list (getRecentlyActiveProspectIds) hits a hard 5000-result
+// cap from Zenvia on high-traffic days and can silently miss real recent
+// activity for a specific prospect (confirmed by the 2026-08-10
+// investigation: prospects were getting archived after ~19-20h of real
+// inactivity instead of the intended 24h). A single prospect's own
+// interaction history is always small, so this check is never subject to
+// that cap — it catches exactly the false positives the account-wide sweep
+// produces, without needing to know why the sweep missed them.
+//
+// Also skips anything already assigned to a human agent (Adrian, Angie,
+// Ingrid, Jordan) — confirmed happening live (2026-08-11, "Tatiana Sánchez
+// Mattey" / Venta): a prospect Sofía had transferred to Angie, with the
+// patient waiting on a follow-up, got auto-archived as "Inactivo" a day
+// later because nothing here ever checked who owned it. This mirrors the
+// same gate processInboundMessage() already uses for the webhook path
+// (getCurrentProspectAgentId / HUMAN_AGENT_IDS) — the cleanup path needs its
+// own copy of that check since it never goes through processInboundMessage.
+async function closeDirectly(env, prospects, sinceIso) {
   for (const prospect of prospects) {
     try {
+      const { agentId, failed: agentLookupFailed } = await getCurrentProspectAgentId(env, prospect.id);
+      if (agentLookupFailed || HUMAN_AGENT_IDS.has(agentId)) {
+        console.log(
+          `closeDirectly: skipping ${prospect.id} — assigned to a human agent (agentId=${agentId}, lookupFailed=${agentLookupFailed})`
+        );
+        continue;
+      }
+      const recentlyActive = await hasRecentActivityForProspect(env, prospect.id, sinceIso);
+      if (recentlyActive) {
+        console.log(
+          `closeDirectly: skipping ${prospect.id} — per-prospect check found activity the account-wide sweep missed`
+        );
+        continue;
+      }
       const archiveRes = await archiveProspect(env, prospect.id, INACTIVITY_ARCHIVE_REASON);
       if (!archiveRes.ok) continue; // don't record as closed if it wasn't — leave it for the next scan to retry
       await upsertCleanupRowClosed(env, { prospectId: prospect.id, groupId: CEC_GROUP_ID });
@@ -1854,51 +1922,22 @@ async function closeDirectly(env, prospects) {
   }
 }
 
-async function sendWarnings(env, prospects) {
-  // Dormant mode (the dashboard button always sends mode: "closeDirect" —
-  // see the inactivity cleanup section below). getOpenProspects() doesn't
-  // return each prospect's channel, so this still assumes WhatsApp; would
-  // need that added before "warn" is safe to use for Facebook prospects too.
-  for (const prospect of prospects) {
-    try {
-      await sendChannelMessage(env, prospect.id, "whatsapp", INACTIVITY_WARNING_MESSAGE);
-      await upsertCleanupRow(env, {
-        prospectId: prospect.id,
-        groupId: CEC_GROUP_ID,
-        warnedAt: new Date().toISOString(),
-      });
-    } catch (err) {
-      console.error("sendWarnings failed for", prospect.id, err);
-    }
-  }
-}
-
-// Fase 2: runs on the cron schedule (wrangler.toml [triggers]). Closes
-// conversations that were warned INACTIVITY_CLOSE_AFTER_WARNING_HOURS ago
-// and still have no new activity since the warning was sent.
-async function closeInactiveConversations(env) {
-  const dueRows = await getDueForClosure(env, INACTIVITY_CLOSE_AFTER_WARNING_HOURS);
-  if (dueRows.length === 0) return;
-
-  const oldestWarnedAt = dueRows.reduce(
-    (min, r) => (r.warned_at < min ? r.warned_at : min),
-    dueRows[0].warned_at
+// Confirms a single prospect's real last-activity time directly against
+// Zenvia, scoped to just that one prospect — see the comment on
+// closeDirectly for why this exists. Fails closed: if the lookup itself
+// fails, treat the prospect as recently active (skip archiving it this
+// round) rather than risk closing on bad data — the next scan retries it.
+async function hasRecentActivityForProspect(env, prospectId, sinceIso) {
+  const res = await fetch(
+    `${ZENVIA_API_BASE}/prospect/${prospectId}/interactions?api-key=${env.ZENVIA_API_KEY}`
   );
-  const activeSinceWarning = await getRecentlyActiveProspectIds(env, oldestWarnedAt);
-
-  if (activeSinceWarning === null) {
-    console.error("closeInactiveConversations aborted — could not determine recent activity");
-    return;
+  if (!res.ok) {
+    console.error("hasRecentActivityForProspect failed", prospectId, res.status, await res.text());
+    return true;
   }
-
-  for (const row of dueRows) {
-    if (activeSinceWarning.has(row.prospect_id)) {
-      await markCleanupRowSkipped(env, row.prospect_id, "respondió");
-      continue;
-    }
-    await archiveProspect(env, row.prospect_id, INACTIVITY_ARCHIVE_REASON);
-    await markCleanupRowClosed(env, row.prospect_id);
-  }
+  const interactions = await res.json();
+  const cutoff = new Date(sinceIso).getTime();
+  return interactions.some((i) => new Date(i.createdAt).getTime() > cutoff);
 }
 
 async function archiveProspect(env, prospectId, archivingReason) {
@@ -1920,54 +1959,7 @@ async function archiveProspect(env, prospectId, archivingReason) {
 // sofia_inactivity_cleanup persistence
 // ---------------------------------------------------------------------------
 
-async function getPendingCleanupProspectIds(env) {
-  const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_inactivity_cleanup?closed_at=is.null&select=prospect_id`,
-    {
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
-  );
-  if (!res.ok) return new Set();
-  const rows = await res.json();
-  return new Set(rows.map((r) => r.prospect_id));
-}
-
-async function getDueForClosure(env, hoursSinceWarning) {
-  const cutoff = new Date(Date.now() - hoursSinceWarning * 60 * 60 * 1000).toISOString();
-  const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_inactivity_cleanup?closed_at=is.null&warned_at=lte.${cutoff}&select=prospect_id,warned_at`,
-    {
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
-  );
-  if (!res.ok) {
-    console.error("getDueForClosure failed", res.status, await res.text());
-    return [];
-  }
-  return res.json();
-}
-
-async function upsertCleanupRow(env, { prospectId, groupId, warnedAt }) {
-  await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_inactivity_cleanup?on_conflict=prospect_id`, {
-    method: "POST",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "resolution=merge-duplicates,return=minimal",
-    },
-    body: JSON.stringify({ prospect_id: prospectId, group_id: groupId, warned_at: warnedAt }),
-  });
-}
-
-// Upsert + "closed" en una sola llamada (antes eran dos: upsertCleanupRow
-// seguido de markCleanupRowClosed) — closeDirectly() procesa cientos de
+// Upsert + "closed" en una sola llamada — closeDirectly() procesa cientos de
 // prospectos secuencialmente dentro de un único ctx.waitUntil(), y cada
 // subrequest cuenta contra el límite por invocación de Cloudflare. Con 3
 // llamadas por prospecto (archivar + 2 escrituras) el lote se cortaba en
@@ -1988,31 +1980,5 @@ async function upsertCleanupRowClosed(env, { prospectId, groupId }) {
       warned_at: null,
       closed_at: new Date().toISOString(),
     }),
-  });
-}
-
-async function markCleanupRowClosed(env, prospectId) {
-  await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_inactivity_cleanup?prospect_id=eq.${prospectId}`, {
-    method: "PATCH",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "return=minimal",
-    },
-    body: JSON.stringify({ closed_at: new Date().toISOString() }),
-  });
-}
-
-async function markCleanupRowSkipped(env, prospectId, skippedReason) {
-  await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_inactivity_cleanup?prospect_id=eq.${prospectId}`, {
-    method: "PATCH",
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "return=minimal",
-    },
-    body: JSON.stringify({ closed_at: new Date().toISOString(), skipped_reason: skippedReason }),
   });
 }
