@@ -1201,19 +1201,35 @@ async function getCurrentProspectAgentId(env, prospectId) {
   return { agentId: null, failed: true };
 }
 
+// Retries transient failures (same RETRY_DELAYS_MS pattern as
+// getProspectStatus/getCurrentProspectAgentId) and never throws — a raw
+// network-level fetch() rejection here used to propagate up through
+// processInboundMessage() and abort it before reaching upsertConversation(),
+// so an escalation that Sofía had already decided on (and possibly already
+// told the patient about) never got persisted as escalated=true. That left
+// the next inbound message reading escalated=false and getting answered by
+// Sofía again — "manda el mensaje de escalación pero sigue contestando".
 async function sendChannelMessage(env, prospectId, channel, content) {
-  const res = await fetch(
-    `${ZENVIA_API_BASE}/prospect/${prospectId}/messaging/${channel}?api-key=${env.ZENVIA_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ content }),
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(
+        `${ZENVIA_API_BASE}/prospect/${prospectId}/messaging/${channel}?api-key=${env.ZENVIA_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ content }),
+        }
+      );
+      if (!res.ok) {
+        console.error("sendChannelMessage failed", channel, res.status, await res.text());
+      }
+      return res;
+    } catch (err) {
+      console.error("sendChannelMessage threw", channel, err);
     }
-  );
-  if (!res.ok) {
-    console.error("sendChannelMessage failed", channel, res.status, await res.text());
+    if (attempt < 3) await sleep(RETRY_DELAYS_MS[attempt - 1]);
   }
-  return res;
+  return null;
 }
 
 // Attaches a "note"-type interaction to the prospect (POST
@@ -1228,18 +1244,26 @@ async function addEscalationNote(env, prospectId, escalationReason, recentMessag
     `Escalado por Sofía CEC. Motivo: ${escalationReason || "no especificado"}\n\n` +
     transcript;
 
-  const res = await fetch(
-    `${ZENVIA_API_BASE}/prospect/${prospectId}/interactions?api-key=${env.ZENVIA_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ type: "note", content }),
+  // try/catch so a raw network failure here (not just a non-ok response)
+  // can never abort processInboundMessage() before it reaches
+  // upsertConversation() — same reasoning as sendChannelMessage above.
+  try {
+    const res = await fetch(
+      `${ZENVIA_API_BASE}/prospect/${prospectId}/interactions?api-key=${env.ZENVIA_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "note", content }),
+      }
+    );
+    if (!res.ok) {
+      console.error("addEscalationNote failed", res.status, await res.text());
     }
-  );
-  if (!res.ok) {
-    console.error("addEscalationNote failed", res.status, await res.text());
+    return res;
+  } catch (err) {
+    console.error("addEscalationNote threw", err);
+    return null;
   }
-  return res;
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,19 +1430,33 @@ async function runEscalationAgility(env, { prospectId, history, escalationReason
   }
 }
 
+// Retries transient failures and never throws — this is the call that
+// actually hands the conversation to a human in Zenvia, so a raw network
+// failure here must not (a) abort processInboundMessage() before
+// upsertConversation() persists escalated=true, nor (b) silently leave the
+// conversation un-transferred with nobody knowing. Same RETRY_DELAYS_MS
+// pattern as getProspectStatus/getCurrentProspectAgentId.
 async function transferProspectToAgent(env, prospectId, agentId) {
-  const res = await fetch(
-    `${ZENVIA_API_BASE}/prospect/${prospectId}/as-user/transfer?api-key=${env.ZENVIA_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ user: agentId }),
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(
+        `${ZENVIA_API_BASE}/prospect/${prospectId}/as-user/transfer?api-key=${env.ZENVIA_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ user: agentId }),
+        }
+      );
+      if (!res.ok) {
+        console.error("transferProspectToAgent failed", res.status, await res.text());
+      }
+      return res;
+    } catch (err) {
+      console.error("transferProspectToAgent threw", err);
     }
-  );
-  if (!res.ok) {
-    console.error("transferProspectToAgent failed", res.status, await res.text());
+    if (attempt < 3) await sleep(RETRY_DELAYS_MS[attempt - 1]);
   }
-  return res;
+  return null;
 }
 
 // Escalation used to go to the whole group ("whoever's available picks it
@@ -1581,6 +1619,10 @@ async function sendTemplateMessage(env, prospectId, channel, templateKey, parame
   return { ok: false, status: res.status, detail };
 }
 
+// try/catch so a raw network failure reading/advancing the round-robin
+// counter can never abort processInboundMessage() before it reaches
+// upsertConversation() — falls back to the first human agent instead of
+// blocking the handoff (same reasoning as sendChannelMessage above).
 async function pickNextPoolAgent(env) {
   const headers = {
     apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1588,21 +1630,26 @@ async function pickNextPoolAgent(env) {
     "Content-Type": "application/json",
   };
 
-  const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_config?id=eq.1&select=escalation_round_robin_index`,
-    { headers }
-  );
-  const currentIndex = res.ok ? (await res.json())[0]?.escalation_round_robin_index ?? 0 : 0;
+  try {
+    const res = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/sofia_config?id=eq.1&select=escalation_round_robin_index`,
+      { headers }
+    );
+    const currentIndex = res.ok ? (await res.json())[0]?.escalation_round_robin_index ?? 0 : 0;
 
-  const agent = HUMAN_AGENTS[currentIndex % HUMAN_AGENTS.length];
+    const agent = HUMAN_AGENTS[currentIndex % HUMAN_AGENTS.length];
 
-  await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_config?id=eq.1`, {
-    method: "PATCH",
-    headers: { ...headers, Prefer: "return=minimal" },
-    body: JSON.stringify({ escalation_round_robin_index: currentIndex + 1 }),
-  });
+    await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_config?id=eq.1`, {
+      method: "PATCH",
+      headers: { ...headers, Prefer: "return=minimal" },
+      body: JSON.stringify({ escalation_round_robin_index: currentIndex + 1 }),
+    });
 
-  return agent.id;
+    return agent.id;
+  } catch (err) {
+    console.error("pickNextPoolAgent threw", err);
+    return HUMAN_AGENTS[0].id;
+  }
 }
 
 // ---------------------------------------------------------------------------
