@@ -1151,6 +1151,20 @@ async function getConversationState(env, phoneHash) {
 // set (Zenvia's prospect.status confirmed "archived" for a previously
 // escalated conversation — see processInboundMessage) — then it starts
 // fresh from 0, same as a genuinely new conversation.
+//
+// escalated/escalation_reason are sticky, not overwritten every turn — bug
+// found 2026-08-19 reviewing a real conversation: mentionsHandoffPromise
+// correctly matched on an early turn ("nuestro equipo le va a estar
+// contactando"), but the patient's later "gracias"/"igualmente" turns don't
+// match any handoff pattern, so escalated=false on those later turns
+// overwrote the true set earlier — sofia_conversations ended up showing
+// escalated=false for a conversation that should have stayed flagged. That
+// also meant the next real inbound message from the same patient would
+// read escalated=false at the top of processInboundMessage and let Sofía
+// keep auto-replying instead of staying silent for a conversation that was
+// supposed to already be with a human. Once true, escalated now stays true
+// until resetCounters (Zenvia confirmed the prospect archived) explicitly
+// starts the conversation over.
 async function upsertConversation(env, {
   phoneHash,
   prospectId,
@@ -1170,11 +1184,21 @@ async function upsertConversation(env, {
   };
 
   const existingRes = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=id,message_count&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=id,message_count,escalated,escalation_reason&limit=1`,
     { headers }
   );
   const existing = existingRes.ok ? await existingRes.json() : [];
   const baselineMessageCount = resetCounters ? 0 : existing[0]?.message_count ?? 0;
+  const previousEscalated = existing[0]?.escalated ?? false;
+  const previousEscalationReason = existing[0]?.escalation_reason ?? null;
+  const stickyEscalated = resetCounters ? escalated : previousEscalated || escalated;
+  const stickyEscalationReason = resetCounters
+    ? escalationReason
+    : escalated
+      ? escalationReason
+      : previousEscalated
+        ? previousEscalationReason
+        : escalationReason;
 
   if (existing[0]) {
     await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_conversations?id=eq.${existing[0].id}`, {
@@ -1182,8 +1206,8 @@ async function upsertConversation(env, {
       headers: { ...headers, Prefer: "return=minimal" },
       body: JSON.stringify({
         last_message: lastMessage,
-        escalated,
-        escalation_reason: escalationReason,
+        escalated: stickyEscalated,
+        escalation_reason: stickyEscalationReason,
         message_count: baselineMessageCount + 1,
         last_interaction_id: interactionId,
         procedure_interest: procedureInterest ?? null,
