@@ -148,15 +148,21 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 
-  // No `scheduled()` handler — automatic closing was removed 2026-08-11 (see
-  // wrangler.toml). JP decided the risk of auto-archiving a real
-  // conversation (confirmed happening — both from the account-wide sweep
-  // missing recent activity, and separately from closing conversations
-  // already assigned to a human agent) outweighed the convenience of not
-  // having to click the dashboard button. Cleanup is manual-only again:
-  // "Revisar" / "Confirmar y cerrar" in ConfigureSofiaSection.jsx, which
-  // still calls POST /cleanup/scan-and-warn below — that endpoint itself is
-  // unchanged, only the automatic trigger is gone.
+  // Inactivity closing (archiving) is still manual-only — see the
+  // 2026-08-11 note on handleScanAndWarn/scanAndWarn below; that risk
+  // assessment (auto-archiving real conversations on bad data) doesn't
+  // apply here. retryStuckEscalations() never archives, closes, or messages
+  // anyone — it only re-attempts transferProspectToAgent() for a
+  // conversation Supabase already has flagged escalated=true, and only
+  // when Zenvia's own live state confirms no human actually owns it yet.
+  // Same function, same rules, same logging as the inline retry in
+  // processInboundMessage() — this just also covers the patient-never-
+  // writes-again case that inline retry can't reach. Worst case on bad
+  // data is a redundant transfer call to the same agent, not a lost or
+  // wrongly-closed conversation.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(retryStuckEscalations(env));
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -1630,6 +1636,52 @@ async function transferToNextAgentInPool(env, prospectId, { phoneHash } = {}) {
     });
   }
   return succeeded;
+}
+
+// Cloudflare subrequest budget per invocation — same reasoning as the batch
+// cap on scanAndWarn below. Escalations are infrequent (per the round-robin
+// comment above), so this should clear any backlog within one or two runs.
+const MAX_STUCK_ESCALATIONS_PER_RUN = 25;
+
+// Single source of truth for "retry a stuck handoff": reuses
+// transferToNextAgentInPool() exactly as processInboundMessage()'s inline
+// retry does — same function, same HUMAN_AGENT_IDS/archived rules, same
+// transfer_failed logging. This is that same safety net on a timer instead
+// of only firing when the patient happens to write again, so a
+// conversation nobody replies to after the failed handoff doesn't sit
+// forever assigned to nobody real. Never archives, closes, or messages the
+// patient — the only side effect is retrying a Zenvia agent reassignment.
+async function retryStuckEscalations(env) {
+  const headers = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+  };
+
+  const res = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?escalated=eq.true&prospect_id=not.is.null&select=prospect_id,phone_hash&limit=${MAX_STUCK_ESCALATIONS_PER_RUN}`,
+    { headers }
+  );
+  if (!res.ok) {
+    console.error("retryStuckEscalations: failed to load escalated conversations", res.status);
+    return;
+  }
+
+  const rows = await res.json();
+  for (const { prospect_id: prospectId, phone_hash: phoneHash } of rows) {
+    // Exact same fail-safe rule as the top of processInboundMessage(): a
+    // human already owns it, or the live lookup itself failed — leave it
+    // alone either way, never assume it's safe to touch.
+    const { agentId: liveAgentId, failed: lookupFailed } = await getCurrentProspectAgentId(env, prospectId);
+    if (lookupFailed || (liveAgentId && HUMAN_AGENT_IDS.has(liveAgentId))) continue;
+
+    // Genuinely resolved (Zenvia says archived) — the next real inbound
+    // message will resume Sofía normally; nothing to retry here.
+    const prospectStatus = await getProspectStatus(env, prospectId);
+    if (prospectStatus === "archived") continue;
+
+    console.log(`retryStuckEscalations: retrying transfer for prospect ${prospectId}`);
+    await transferToNextAgentInPool(env, prospectId, { phoneHash });
+  }
 }
 
 // ---------------------------------------------------------------------------

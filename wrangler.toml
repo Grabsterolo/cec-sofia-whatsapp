@@ -2,10 +2,20 @@ name = "cec-sofia-whatsapp"
 main = "src/index.js"
 compatibility_date = "2026-07-01"
 
-# No [triggers]/cron — automatic inactivity closing was removed 2026-08-11
-# (see the comment on the removed `scheduled()` export in src/index.js).
-# Cleanup is manual-only again: the dashboard's "Revisar" / "Confirmar y
-# cerrar" buttons call POST /cleanup/scan-and-warn directly.
+# Inactivity closing (archiving) stays manual-only — the dashboard's
+# "Revisar" / "Confirmar y cerrar" buttons call POST /cleanup/scan-and-warn
+# directly (see the 2026-08-11 note on scanAndWarn in src/index.js for why
+# that one specifically is not automatic).
+#
+# This cron is a different, narrower job: every 20 minutes, retryStuckEscalations()
+# re-attempts the Zenvia handoff for conversations Supabase already has
+# flagged escalated=true where no human actually owns them yet in Zenvia —
+# same transferToNextAgentInPool() the live webhook path already uses, same
+# rules, same transfer_failed logging. It never archives, closes, or
+# messages anyone, so the 2026-08-11 risk (auto-archiving on bad data)
+# doesn't apply here.
+[triggers]
+crons = ["*/20 * * * *"]
 
 # Deduplicación de entregas repetidas de webhook (mismo interactionId) — ver
 # processInboundMessage(). TTL corto, no es un dato que necesite persistir.
