@@ -370,6 +370,17 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
           detail: "getProspectStatus exhausted retries",
         });
       }
+      // Self-healing retry (2026-08-19, same incident as the comment on
+      // transferToNextAgentInPool): reaching this branch means the "a human
+      // owns this" check above already confirmed liveAgentId is NOT a human
+      // — so if this conversation is marked escalated but not archived,
+      // either the original transfer never stuck, or a human reassigned it
+      // back to Sofía without archiving it. Retrying here means a patient
+      // who writes again doesn't sit indefinitely assigned to nobody real;
+      // transferToNextAgentInPool logs a transfer_failed event if this
+      // retry doesn't stick either. Sofía still stays silent either way —
+      // this only re-attempts the handoff, it never generates a reply.
+      await transferToNextAgentInPool(env, prospectId, { phoneHash });
       return;
     }
     console.log(`Conversation for prospect ${prospectId} was archived in Zenvia — resuming Sofía.`);
@@ -416,7 +427,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       history,
       escalationReason: limitReasonText,
     });
-    await transferToNextAgentInPool(env, prospectId);
+    await transferToNextAgentInPool(env, prospectId, { phoneHash });
 
     const updatedHistory = await saveSessionWithRetry(
       env, phoneHash, channel, session.messages, session.version,
@@ -478,7 +489,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       history,
       escalationReason: "falla_tecnica_claude",
     });
-    await transferToNextAgentInPool(env, prospectId);
+    await transferToNextAgentInPool(env, prospectId, { phoneHash });
 
     const updatedHistoryAfterFailure = await saveSessionWithRetry(
       env, phoneHash, channel, session.messages, session.version,
@@ -554,7 +565,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       history: updatedHistory,
       escalationReason: escalation_reason,
     });
-    await transferToNextAgentInPool(env, prospectId);
+    await transferToNextAgentInPool(env, prospectId, { phoneHash });
   } else {
     await sendChannelMessage(env, prospectId, channel, reply);
     // Classify every non-escalated turn too (not just escalations) so the
@@ -1594,9 +1605,31 @@ async function transferProspectToAgent(env, prospectId, agentId) {
 // could in theory read the same value and both go to the same agent —
 // acceptable: escalations are infrequent enough that this is a non-issue
 // in practice, and the cost of a rare skipped/doubled turn is low.
-async function transferToNextAgentInPool(env, prospectId) {
+//
+// Bug found 2026-08-19 (real case: "Carmen Claramunt", prospect
+// 6a8605233d9cc6f84b045ef2) — Sofía sent the escalation message to the
+// patient ("nuestro equipo le va a estar contactando") but the actual
+// Zenvia transfer never stuck; nobody knew until JP found it and
+// transferred her manually. transferProspectToAgent() already retries 3x
+// on a non-ok response, but every one of the 3 call sites just did
+// `await transferToNextAgentInPool(...)` and threw the result away — a
+// transfer that failed after all 3 retries left zero trace anywhere.
+// Now logged to sofia_reliability_events (transfer_failed) so it's at
+// least visible, and callers get back whether it actually succeeded.
+async function transferToNextAgentInPool(env, prospectId, { phoneHash } = {}) {
   const agentId = await pickNextPoolAgent(env);
-  return transferProspectToAgent(env, prospectId, agentId);
+  const res = await transferProspectToAgent(env, prospectId, agentId);
+  const succeeded = !!res?.ok;
+  if (!succeeded) {
+    console.error("transferToNextAgentInPool: transfer did not stick", prospectId, agentId, res?.status);
+    await logReliabilityEvent(env, {
+      eventType: "transfer_failed",
+      prospectId,
+      phoneHash: phoneHash ?? null,
+      detail: `transferProspectToAgent failed after retries (agent ${agentId}, status ${res?.status ?? "network error"})`,
+    });
+  }
+  return succeeded;
 }
 
 // ---------------------------------------------------------------------------
