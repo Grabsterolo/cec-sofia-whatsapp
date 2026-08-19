@@ -190,7 +190,7 @@ async function handleWebhook(request, env) {
     });
   }
 
-  const inboundMessages = extractInboundMessages(body);
+  const inboundMessages = await extractInboundMessages(body, env);
 
   // Always ack 200 once the payload parses, even if downstream processing
   // fails — this avoids Zenvia retry storms that could duplicate replies.
@@ -214,7 +214,7 @@ async function handleWebhook(request, env) {
 // (Zenvia does not publish it). Handles: a bare Interaction object, an array
 // of Interactions, and {topic, event/action, data: Interaction | Interaction[]}
 // envelopes. See README "Forma del payload del webhook" for details.
-function extractInboundMessages(body) {
+async function extractInboundMessages(body, env) {
   const candidates = [];
   const rawItems = Array.isArray(body) ? body : [body];
 
@@ -223,7 +223,7 @@ function extractInboundMessages(body) {
     const data = item.data ?? item.interaction ?? item;
     const dataItems = Array.isArray(data) ? data : [data];
     for (const interaction of dataItems) {
-      const inbound = extractInboundFromInteraction(interaction);
+      const inbound = await extractInboundFromInteraction(interaction, env);
       if (inbound) candidates.push(inbound);
     }
   }
@@ -231,23 +231,49 @@ function extractInboundMessages(body) {
   return candidates;
 }
 
-function extractInboundFromInteraction(interaction) {
+// Bug found 2026-08-19 (two real cases, "Marjorie" and a WhatsApp message to
+// prospect 6a86162d2826301c6a73dde6 — confirmed came in via WhatsApp, so the
+// unsupported-channel branch wasn't it) — a message that Zenvia assigned to
+// Sofía's own agent but that never got a reply and left zero trace anywhere:
+// not in sofia_conversations, not in sofia_reliability_events. The 3 early
+// `return null`s below were the only place in the whole pipeline that could
+// silently eat a message with no record at all — every other failure mode
+// in this file at least logs something. Each one now logs
+// inbound_message_dropped with enough detail (which check fired, and the
+// raw interaction) to diagnose the next occurrence instead of reconstructing
+// it after the fact from what's absent.
+async function extractInboundFromInteraction(interaction, env) {
   if (!interaction || typeof interaction !== "object") return null;
 
   const message = interaction.output?.message;
   if (!message) return null;
 
+  const prospectId = interaction.prospectId ?? null;
+  const phone = message.sender ?? null;
+  const phoneHash = phone ? await sha256Hex(phone) : null;
+
   // "integration" = message came in from the prospect via the channel.
   // "agent"/bot performers are our own outbound traffic — never reply to those.
-  if (message.performer !== "integration") return null;
-  if (!interaction.via || !(interaction.via in SUPPORTED_CHANNELS)) return null;
+  if (message.performer !== "integration") {
+    await logReliabilityEvent(env, {
+      eventType: "inbound_message_dropped",
+      prospectId,
+      phoneHash,
+      detail: `performer !== "integration" (was "${message.performer}"); via=${interaction.via ?? "unknown"}`,
+    });
+    return null;
+  }
+  if (!interaction.via || !(interaction.via in SUPPORTED_CHANNELS)) {
+    await logReliabilityEvent(env, {
+      eventType: "inbound_message_dropped",
+      prospectId,
+      phoneHash,
+      detail: `unsupported channel: via="${interaction.via ?? "missing"}"`,
+    });
+    return null;
+  }
 
   const text = (message.content || message.body || "").trim();
-  // "phone" for WhatsApp; for every other channel this is whatever
-  // identifier that channel uses for the sender (e.g. a Facebook PSID) —
-  // still a unique per-prospect string, just not literally a phone number.
-  const phone = message.sender;
-  const prospectId = interaction.prospectId;
   // { type: "IMAGE"|"AUDIO"|"VIDEO"|"FILE", url } per the real schema
   // (confirmed via Zenvia's swagger — AttachmentTypes/Interaction.output.
   // message.attachment). Not yet confirmed against a live attachment
@@ -255,7 +281,15 @@ function extractInboundFromInteraction(interaction) {
   const attachment = message.attachment ?? null;
   // phone/prospectId are the only real requirements to be able to reply —
   // drop the interaction if either is missing.
-  if (!phone || !prospectId) return null;
+  if (!phone || !prospectId) {
+    await logReliabilityEvent(env, {
+      eventType: "inbound_message_dropped",
+      prospectId,
+      phoneHash,
+      detail: `missing ${!phone ? "phone" : ""}${!phone && !prospectId ? " and " : ""}${!prospectId ? "prospectId" : ""} — raw interaction: ${JSON.stringify(interaction).slice(0, 1000)}`,
+    });
+    return null;
+  }
 
   const agentId = interaction.agentId ?? interaction.agent?.id ?? null;
   const channel = SUPPORTED_CHANNELS[interaction.via];
