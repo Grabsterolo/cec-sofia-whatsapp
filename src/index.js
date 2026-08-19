@@ -94,6 +94,26 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const DEFAULT_FETCH_TIMEOUT_MS = 8000;
+
+// Explicit timeout for calls to Claude/Zenvia/OpenAI — without this, a
+// connection that hangs without erroring or closing has no defense beyond
+// Cloudflare's platform-level limit, never one we chose on purpose. Mirrors
+// the AbortController pattern fetchLinkTextSnippet already used below, just
+// factored out so every external call gets it. Throws like a bare fetch()
+// would on abort/network failure — the try/catch and retry loops already
+// wrapped around each call site handle that the same way they handle any
+// other network error.
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 // Staleness threshold for the manual "cerrar conversaciones inactivas"
 // button in the dashboard (ConfigureSofiaSection.jsx) — POST
 // /cleanup/scan-and-warn. Sofía never closes a conversation on her own;
@@ -651,7 +671,7 @@ async function downloadBytes(url, maxBytes) {
     // Some hosts (confirmed with Wikimedia during testing — likely not an
     // issue for Zenvia's own presigned attachment URLs, but cheap to set
     // unconditionally) 403 requests with no/generic User-Agent.
-    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible; SofiaCEC/1.0; +https://cec.co.cr)" } });
+    const res = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible; SofiaCEC/1.0; +https://cec.co.cr)" } }, 15000);
     if (!res.ok) {
       console.error("downloadBytes non-ok response", url, res.status);
       return null;
@@ -698,11 +718,11 @@ async function transcribeAudio(env, url) {
     const ext = dl.contentType.includes("mpeg") || dl.contentType.includes("mp3") ? "mp3" : "ogg";
     form.append("file", new Blob([dl.bytes], { type: dl.contentType || "audio/ogg" }), `voice.${ext}`);
     form.append("model", "whisper-1");
-    const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    const res = await fetchWithTimeout("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
       headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
       body: form,
-    });
+    }, 15000);
     if (!res.ok) {
       console.error("transcribeAudio failed", res.status, await res.text());
       return null;
@@ -828,7 +848,7 @@ async function ragSearch(env, history) {
     .join(" ");
 
   try {
-    const embedRes = await fetch("https://api.openai.com/v1/embeddings", {
+    const embedRes = await fetchWithTimeout("https://api.openai.com/v1/embeddings", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${env.OPENAI_API_KEY}`,
@@ -950,7 +970,7 @@ async function callClaude(env, systemBlocks, history) {
   let lastFailure = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
+      const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
           "x-api-key": env.ANTHROPIC_API_KEY,
@@ -969,7 +989,7 @@ async function callClaude(env, systemBlocks, history) {
           system: systemBlocks,
           messages: history,
         }),
-      });
+      }, 15000);
       if (response.ok) {
         const data = await response.json();
         const hasTextBlock = Array.isArray(data?.content) && data.content.some((b) => b.type === "text");
@@ -1242,7 +1262,7 @@ async function logReliabilityEvent(env, { eventType, prospectId, phoneHash, deta
 async function getProspectStatus(env, prospectId) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await fetch(`${ZENVIA_API_BASE}/prospect/${prospectId}?api-key=${env.ZENVIA_API_KEY}`);
+      const res = await fetchWithTimeout(`${ZENVIA_API_BASE}/prospect/${prospectId}?api-key=${env.ZENVIA_API_KEY}`);
       if (res.ok) {
         const data = await res.json();
         return data.status ?? null;
@@ -1269,7 +1289,7 @@ async function getProspectStatus(env, prospectId) {
 async function getCurrentProspectAgentId(env, prospectId) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await fetch(`${ZENVIA_API_BASE}/prospect/${prospectId}?api-key=${env.ZENVIA_API_KEY}`);
+      const res = await fetchWithTimeout(`${ZENVIA_API_BASE}/prospect/${prospectId}?api-key=${env.ZENVIA_API_KEY}`);
       if (res.ok) {
         const data = await res.json();
         return { agentId: data.agent?.id ?? null, failed: false };
@@ -1294,7 +1314,7 @@ async function sendChannelMessage(env, prospectId, channel, content) {
   let lastRes = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await fetch(
+      const res = await fetchWithTimeout(
         `${ZENVIA_API_BASE}/prospect/${prospectId}/messaging/${channel}?api-key=${env.ZENVIA_API_KEY}`,
         {
           method: "POST",
@@ -1329,7 +1349,7 @@ async function addEscalationNote(env, prospectId, escalationReason, recentMessag
   // can never abort processInboundMessage() before it reaches
   // upsertConversation() — same reasoning as sendChannelMessage above.
   try {
-    const res = await fetch(
+    const res = await fetchWithTimeout(
       `${ZENVIA_API_BASE}/prospect/${prospectId}/interactions?api-key=${env.ZENVIA_API_KEY}`,
       {
         method: "POST",
@@ -1355,7 +1375,7 @@ async function addEscalationNote(env, prospectId, escalationReason, recentMessag
 
 async function getAvailableLabels(env) {
   try {
-    const res = await fetch(`${ZENVIA_API_BASE}/as-user/labels?api-key=${env.ZENVIA_API_KEY}`);
+    const res = await fetchWithTimeout(`${ZENVIA_API_BASE}/as-user/labels?api-key=${env.ZENVIA_API_KEY}`);
     if (!res.ok) return [];
     return await res.json();
   } catch (err) {
@@ -1386,7 +1406,7 @@ async function classifyEscalationWithHaiku(env, history, availableLabels) {
     // have listed several unrelated procedures as options.
     const firstPatientMessage = history.find((m) => m.role === "user")?.content || null;
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "x-api-key": env.ANTHROPIC_API_KEY,
@@ -1424,7 +1444,7 @@ async function classifyEscalationWithHaiku(env, history, availableLabels) {
           },
         ],
       }),
-    });
+    }, 10000);
     const data = await response.json();
     const textBlock = (data?.content || []).find((b) => b.type === "text");
     // Haiku sometimes wraps the JSON in a ```json ... ``` fence despite the
@@ -1446,7 +1466,7 @@ async function classifyEscalationWithHaiku(env, history, availableLabels) {
 
 async function addLabelToProspect(env, prospectId, label) {
   try {
-    const res = await fetch(
+    const res = await fetchWithTimeout(
       `${ZENVIA_API_BASE}/prospect/${prospectId}/as-user/label?api-key=${env.ZENVIA_API_KEY}`,
       {
         method: "POST",
@@ -1474,7 +1494,7 @@ async function sendEscalationNotification(env, escalationReason) {
     const title = "Sofía escaló una conversación";
     const body = escalationReason || "Revisar conversación de WhatsApp";
     const platformPayload = { title, body };
-    const res = await fetch(`${ZENVIA_API_BASE}/apps/notifications?api-key=${env.ZENVIA_API_KEY}`, {
+    const res = await fetchWithTimeout(`${ZENVIA_API_BASE}/apps/notifications?api-key=${env.ZENVIA_API_KEY}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -1521,7 +1541,7 @@ async function transferProspectToAgent(env, prospectId, agentId) {
   let lastRes = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await fetch(
+      const res = await fetchWithTimeout(
         `${ZENVIA_API_BASE}/prospect/${prospectId}/as-user/transfer?api-key=${env.ZENVIA_API_KEY}`,
         {
           method: "POST",
@@ -1665,7 +1685,7 @@ async function handleSendBirthday(request, env) {
 // match or any failure (caller responds 404, never guesses a prospect).
 async function findProspectIdByPhone(env, phoneNumber) {
   try {
-    const res = await fetch(
+    const res = await fetchWithTimeout(
       `${ZENVIA_API_BASE}/prospect-by?phoneNumber=${encodeURIComponent(phoneNumber)}&api-key=${env.ZENVIA_API_KEY}`
     );
     if (!res.ok) return null;
@@ -1686,7 +1706,7 @@ async function findProspectIdByPhone(env, phoneNumber) {
 // BIRTHDAY_TEMPLATE_ID, confirmed by cross-checking that endpoint's
 // response against the id JP gave us.
 async function sendTemplateMessage(env, prospectId, channel, templateKey, parameters) {
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `${ZENVIA_API_BASE}/prospect/${prospectId}/messaging/${channel}/notification?api-key=${env.ZENVIA_API_KEY}`,
     {
       method: "POST",
@@ -1862,7 +1882,7 @@ async function getOpenProspects(env, groupId) {
 }
 
 async function fetchProspectsByStatus(env, groupId, status) {
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `${ZENVIA_API_BASE}/prospects?group=${groupId}&status=${status}&limit=5000&api-key=${env.ZENVIA_API_KEY}`
   );
   if (!res.ok) {
@@ -1904,7 +1924,7 @@ async function getRecentlyActiveProspectIds(env, sinceIso) {
     let url = `${ZENVIA_API_BASE}/prospects/interactions?createdAfter=${encodeURIComponent(sinceIso)}&limit=${PAGE_LIMIT}&api-key=${env.ZENVIA_API_KEY}`;
     if (cursor) url += `&before=${cursor}`;
 
-    const res = await fetch(url);
+    const res = await fetchWithTimeout(url);
     if (!res.ok) {
       console.error("getRecentlyActiveProspectIds failed", res.status, await res.text(), { pages, cursor });
       // Fail closed: treat every prospect as "recently active" so a broken
@@ -2056,7 +2076,7 @@ async function closeDirectly(env, prospects, sinceIso) {
 // fails, treat the prospect as recently active (skip archiving it this
 // round) rather than risk closing on bad data — the next scan retries it.
 async function hasRecentActivityForProspect(env, prospectId, sinceIso) {
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `${ZENVIA_API_BASE}/prospect/${prospectId}/interactions?api-key=${env.ZENVIA_API_KEY}`
   );
   if (!res.ok) {
@@ -2069,7 +2089,7 @@ async function hasRecentActivityForProspect(env, prospectId, sinceIso) {
 }
 
 async function archiveProspect(env, prospectId, archivingReason) {
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `${ZENVIA_API_BASE}/prospect/${prospectId}/as-user/archive?api-key=${env.ZENVIA_API_KEY}`,
     {
       method: "POST",
