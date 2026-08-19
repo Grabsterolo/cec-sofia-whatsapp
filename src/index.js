@@ -398,10 +398,10 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     });
     await transferToNextAgentInPool(env, prospectId);
 
-    const updatedHistory = [...history, { role: "assistant", content: limitReply }].slice(
-      -MAX_HISTORY_MESSAGES
+    const updatedHistory = await saveSessionWithRetry(
+      env, phoneHash, channel, session.messages, session.version,
+      [{ role: "user", content: contentForHistory }, { role: "assistant", content: limitReply }]
     );
-    await saveSession(env, phoneHash, updatedHistory, channel);
     await upsertConversation(env, {
       phoneHash,
       prospectId,
@@ -460,10 +460,10 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     });
     await transferToNextAgentInPool(env, prospectId);
 
-    const updatedHistoryAfterFailure = [...history, { role: "assistant", content: technicalReply }].slice(
-      -MAX_HISTORY_MESSAGES
+    const updatedHistoryAfterFailure = await saveSessionWithRetry(
+      env, phoneHash, channel, session.messages, session.version,
+      [{ role: "user", content: contentForHistory }, { role: "assistant", content: technicalReply }]
     );
-    await saveSession(env, phoneHash, updatedHistoryAfterFailure, channel);
     await upsertConversation(env, {
       phoneHash,
       prospectId,
@@ -513,10 +513,10 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // downstream ever sees the empty string.
   const finalReply = escalated && !reply ? pickEscalationFallbackReply() : reply;
 
-  const updatedHistory = [...history, { role: "assistant", content: finalReply }].slice(
-    -MAX_HISTORY_MESSAGES
+  const updatedHistory = await saveSessionWithRetry(
+    env, phoneHash, channel, session.messages, session.version,
+    [{ role: "user", content: contentForHistory }, { role: "assistant", content: finalReply }]
   );
-  await saveSession(env, phoneHash, updatedHistory, channel);
 
   let agility = { procedureInterest: null, sentiment: null };
 
@@ -997,9 +997,13 @@ async function sha256Hex(input) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// version is null when no row exists yet for this phoneHash (brand new
+// conversation) — distinct from 0, which means a row exists at its initial
+// version. saveSessionWithRetry() branches on that distinction (insert vs
+// conditional update) — see there for why.
 async function getOrCreateSession(env, phoneHash) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?phone_hash=eq.${phoneHash}&select=messages&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?phone_hash=eq.${phoneHash}&select=messages,version&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1007,12 +1011,87 @@ async function getOrCreateSession(env, phoneHash) {
       },
     }
   );
-  if (!res.ok) return { messages: [] };
+  if (!res.ok) return { messages: [], version: null };
   const rows = await res.json();
-  return { messages: rows[0]?.messages ?? [] };
+  if (!rows[0]) return { messages: [], version: null };
+  return { messages: rows[0].messages ?? [], version: rows[0].version ?? 0 };
 }
 
-async function saveSession(env, phoneHash, messages, channel) {
+// Fixes the lost-message race: two inbound messages from the same patient
+// arriving close together (normal WhatsApp behavior — two bubbles sent back
+// to back) trigger two near-simultaneous webhook deliveries, each reading
+// the same session.messages before either has saved. Without version
+// protection, whichever save lands last silently overwrote the other's
+// turn — both the patient's message AND Sofía's reply to it vanished from
+// the stored history forever, even though the patient did receive that
+// reply over WhatsApp. Real bug, no mitigation before this.
+//
+// baseVersion/baseMessages are what processInboundMessage read earlier
+// (via getOrCreateSession); newTurns is just this turn's
+// [{role:"user",...}, {role:"assistant",...}] pair to append on top of
+// that base — never the caller's own precomputed "history" array, which
+// may be stale by the time we get here. On a version conflict (another
+// request already advanced it) we re-read the freshest session and rebase
+// newTurns on top of that instead of retrying blind. baseVersion === null
+// means no row exists yet — plain insert, which itself fails closed if a
+// concurrent first-message from the same phone already created the row
+// (unique constraint on phone_hash), falling through to the same
+// re-read-and-retry path.
+async function saveSessionWithRetry(env, phoneHash, channel, baseMessages, baseVersion, newTurns) {
+  const headers = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    "Content-Type": "application/json",
+    Prefer: "return=representation",
+  };
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const combined = [...baseMessages, ...newTurns].slice(-MAX_HISTORY_MESSAGES);
+    let succeeded = false;
+
+    try {
+      if (baseVersion === null) {
+        const res = await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ phone_hash: phoneHash, messages: combined, channel, version: 1 }),
+        });
+        succeeded = res.ok;
+      } else {
+        const res = await fetch(
+          `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?phone_hash=eq.${phoneHash}&version=eq.${baseVersion}`,
+          {
+            method: "PATCH",
+            headers,
+            body: JSON.stringify({ messages: combined, channel, version: baseVersion + 1 }),
+          }
+        );
+        if (res.ok) {
+          const rows = await res.json().catch(() => []);
+          succeeded = rows.length > 0;
+        }
+      }
+    } catch (err) {
+      console.error("saveSessionWithRetry threw", phoneHash, err);
+    }
+
+    if (succeeded) return combined;
+
+    console.log(`saveSessionWithRetry: version conflict for phone_hash ${phoneHash}, attempt ${attempt}`);
+    if (attempt < 3) {
+      await sleep(RETRY_DELAYS_MS[attempt - 1]);
+      const fresh = await getOrCreateSession(env, phoneHash);
+      baseMessages = fresh.messages;
+      baseVersion = fresh.version;
+    }
+  }
+
+  // Exhausted retries under real contention (rare — needs a 3rd concurrent
+  // writer on the same phoneHash). Force a merge write on top of the
+  // freshest base we have rather than dropping the turn entirely; this
+  // last write isn't version-protected against a 4th simultaneous writer,
+  // but that's an acceptable residual risk for how rare this branch is.
+  const combined = [...baseMessages, ...newTurns].slice(-MAX_HISTORY_MESSAGES);
   await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?on_conflict=phone_hash`, {
     method: "POST",
     headers: {
@@ -1021,8 +1100,10 @@ async function saveSession(env, phoneHash, messages, channel) {
       "Content-Type": "application/json",
       Prefer: "resolution=merge-duplicates,return=minimal",
     },
-    body: JSON.stringify({ phone_hash: phoneHash, messages, channel }),
+    body: JSON.stringify({ phone_hash: phoneHash, messages: combined, channel }),
   });
+  console.error("saveSessionWithRetry exhausted retries, force-wrote", phoneHash);
+  return combined;
 }
 
 async function getConversationState(env, phoneHash) {
