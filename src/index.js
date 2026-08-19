@@ -231,17 +231,20 @@ async function extractInboundMessages(body, env) {
   return candidates;
 }
 
-// Bug found 2026-08-19 (two real cases, "Marjorie" and a WhatsApp message to
-// prospect 6a86162d2826301c6a73dde6 — confirmed came in via WhatsApp, so the
-// unsupported-channel branch wasn't it) — a message that Zenvia assigned to
-// Sofía's own agent but that never got a reply and left zero trace anywhere:
-// not in sofia_conversations, not in sofia_reliability_events. The 3 early
-// `return null`s below were the only place in the whole pipeline that could
-// silently eat a message with no record at all — every other failure mode
-// in this file at least logs something. Each one now logs
-// inbound_message_dropped with enough detail (which check fired, and the
-// raw interaction) to diagnose the next occurrence instead of reconstructing
-// it after the fact from what's absent.
+// Bug found 2026-08-19 ("Marjorie" and prospect 6a86162d2826301c6a73dde6) —
+// a WhatsApp message that Zenvia assigned to Sofía's own agent but that
+// never got a reply and left zero trace anywhere. Only the missing
+// phone/prospectId branch below logs (inbound_message_dropped) — it's the
+// one genuinely anomalous case for a channel we support. The other two
+// early returns are NOT logged, on purpose, after the first deploy of this
+// fix flooded sofia_reliability_events with false positives within minutes:
+// performer !== "integration" fires constantly and correctly on Zenvia's
+// own echo of every agent/manager reply (never a real problem — this is
+// the filter working as designed), and the unsupported-channel branch
+// fires constantly for Instagram, which this Zenvia account has connected
+// but Sofía was never asked to handle (JP: "instagram no me importa por el
+// momento, de eso se encargan ellos" — out of scope by explicit decision,
+// not a gap to alert on).
 async function extractInboundFromInteraction(interaction, env) {
   if (!interaction || typeof interaction !== "object") return null;
 
@@ -254,24 +257,10 @@ async function extractInboundFromInteraction(interaction, env) {
 
   // "integration" = message came in from the prospect via the channel.
   // "agent"/bot performers are our own outbound traffic — never reply to those.
-  if (message.performer !== "integration") {
-    await logReliabilityEvent(env, {
-      eventType: "inbound_message_dropped",
-      prospectId,
-      phoneHash,
-      detail: `performer !== "integration" (was "${message.performer}"); via=${interaction.via ?? "unknown"}`,
-    });
-    return null;
-  }
-  if (!interaction.via || !(interaction.via in SUPPORTED_CHANNELS)) {
-    await logReliabilityEvent(env, {
-      eventType: "inbound_message_dropped",
-      prospectId,
-      phoneHash,
-      detail: `unsupported channel: via="${interaction.via ?? "missing"}"`,
-    });
-    return null;
-  }
+  if (message.performer !== "integration") return null;
+  // Only WhatsApp and Facebook are wired up (SUPPORTED_CHANNELS) — Instagram
+  // traffic on this account is handled by the team directly, by design.
+  if (!interaction.via || !(interaction.via in SUPPORTED_CHANNELS)) return null;
 
   const text = (message.content || message.body || "").trim();
   // { type: "IMAGE"|"AUDIO"|"VIDEO"|"FILE", url } per the real schema
@@ -461,7 +450,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     const limitReasonText = "límite de mensajes alcanzado";
     const limitReply = pickMessageLimitReply();
     await claimPromise;
-    await sendChannelMessage(env, prospectId, channel, limitReply);
+    await sendChannelMessageOrEscalate(env, prospectId, channel, limitReply, { phoneHash });
     const limitAgility = await runEscalationAgility(env, {
       prospectId,
       history,
@@ -523,7 +512,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     });
 
     const technicalReply = pickTechnicalFailureReply();
-    await sendChannelMessage(env, prospectId, channel, technicalReply);
+    await sendChannelMessageOrEscalate(env, prospectId, channel, technicalReply, { phoneHash });
     const failureAgility = await runEscalationAgility(env, {
       prospectId,
       history,
@@ -599,7 +588,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     // hanging. finalReply is never empty here: it's either what Sofía wrote
     // before the [ESCALAR] tag, or the pickEscalationFallbackReply() default
     // computed above when she wrote nothing.
-    await sendChannelMessage(env, prospectId, channel, finalReply);
+    await sendChannelMessageOrEscalate(env, prospectId, channel, finalReply, { phoneHash });
     agility = await runEscalationAgility(env, {
       prospectId,
       history: updatedHistory,
@@ -607,7 +596,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     });
     await transferToNextAgentInPool(env, prospectId, { phoneHash });
   } else {
-    await sendChannelMessage(env, prospectId, channel, reply);
+    await sendChannelMessageOrEscalate(env, prospectId, channel, reply, { phoneHash });
     // Classify every non-escalated turn too (not just escalations) so the
     // dashboard's conversation list shows a real topic/sentiment instead of
     // "sin clasificar" for the conversations Sofía resolves on her own — the
@@ -1406,6 +1395,31 @@ async function sendChannelMessage(env, prospectId, channel, content) {
     if (attempt < 3) await sleep(RETRY_DELAYS_MS[attempt - 1]);
   }
   return lastRes;
+}
+
+// The most direct way "Sofía no respondió por WhatsApp" can happen: all 4
+// call sites of sendChannelMessage() used to discard the result — if
+// delivery failed after all 3 retries, the patient got nothing, even though
+// internally that turn was already treated as "handled" and persisted to
+// history. Found 2026-08-19 auditing for exactly this gap (JP: "quiero
+// asegurarme que Sofía responda todo lo que llegue de WhatsApp"). On
+// failure this logs send_failed and immediately hands the conversation to
+// a human via transferToNextAgentInPool — same function every other
+// failure path in this file already uses, so a delivery failure always
+// ends with either the patient getting Sofía's reply, or a human getting
+// assigned to follow up, never silence on both ends.
+async function sendChannelMessageOrEscalate(env, prospectId, channel, content, { phoneHash } = {}) {
+  const res = await sendChannelMessage(env, prospectId, channel, content);
+  if (res?.ok) return true;
+  console.error("sendChannelMessageOrEscalate: delivery failed after retries", prospectId, channel, res?.status);
+  await logReliabilityEvent(env, {
+    eventType: "send_failed",
+    prospectId,
+    phoneHash: phoneHash ?? null,
+    detail: `sendChannelMessage failed after retries (channel ${channel}, status ${res?.status ?? "network error"})`,
+  });
+  await transferToNextAgentInPool(env, prospectId, { phoneHash });
+  return false;
 }
 
 // Attaches a "note"-type interaction to the prospect (POST
