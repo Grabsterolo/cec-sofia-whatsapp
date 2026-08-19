@@ -1210,6 +1210,7 @@ async function getCurrentProspectAgentId(env, prospectId) {
 // the next inbound message reading escalated=false and getting answered by
 // Sofía again — "manda el mensaje de escalación pero sigue contestando".
 async function sendChannelMessage(env, prospectId, channel, content) {
+  let lastRes = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const res = await fetch(
@@ -1220,16 +1221,15 @@ async function sendChannelMessage(env, prospectId, channel, content) {
           body: JSON.stringify({ content }),
         }
       );
-      if (!res.ok) {
-        console.error("sendChannelMessage failed", channel, res.status, await res.text());
-      }
-      return res;
+      if (res.ok) return res;
+      console.error("sendChannelMessage failed", channel, res.status, await res.text());
+      lastRes = res;
     } catch (err) {
       console.error("sendChannelMessage threw", channel, err);
     }
     if (attempt < 3) await sleep(RETRY_DELAYS_MS[attempt - 1]);
   }
-  return null;
+  return lastRes;
 }
 
 // Attaches a "note"-type interaction to the prospect (POST
@@ -1437,6 +1437,7 @@ async function runEscalationAgility(env, { prospectId, history, escalationReason
 // conversation un-transferred with nobody knowing. Same RETRY_DELAYS_MS
 // pattern as getProspectStatus/getCurrentProspectAgentId.
 async function transferProspectToAgent(env, prospectId, agentId) {
+  let lastRes = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const res = await fetch(
@@ -1447,16 +1448,15 @@ async function transferProspectToAgent(env, prospectId, agentId) {
           body: JSON.stringify({ user: agentId }),
         }
       );
-      if (!res.ok) {
-        console.error("transferProspectToAgent failed", res.status, await res.text());
-      }
-      return res;
+      if (res.ok) return res;
+      console.error("transferProspectToAgent failed", res.status, await res.text());
+      lastRes = res;
     } catch (err) {
       console.error("transferProspectToAgent threw", err);
     }
     if (attempt < 3) await sleep(RETRY_DELAYS_MS[attempt - 1]);
   }
-  return null;
+  return lastRes;
 }
 
 // Escalation used to go to the whole group ("whoever's available picks it
