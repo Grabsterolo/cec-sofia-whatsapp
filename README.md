@@ -1615,6 +1615,34 @@ igual se le escapa.
 
 ---
 
+## 5o. Reasignar a un prospecto escalado de vuelta a "Sofía CEC" ahora la resume de inmediato
+
+Pregunta real de JP (2026-08-20): en el flujo normal del equipo, un
+asesor (ej. Angie) a veces reasigna una conversación de vuelta a "Sofía
+CEC" a mitad de charla, para que la paciente no se quede sin respuesta
+mientras el asesor no está disponible. Antes de este fix, eso **no
+funcionaba** — la conversación seguía con `escalated: true` (pegajoso,
+ver 5k), y los únicos dos caminos para resumir eran "Zenvia dice
+`archived`" o el cooldown de 48h; ninguno de los dos aplica a una
+reasignación fresca en medio de una conversación activa. El próximo
+mensaje del paciente caía en el mismo "Skipping inbound message: ya está
+escalado" de siempre — y peor, el self-healing de 5l/5m intentaba
+retransferirla a OTRO humano por round robin, deshaciendo la reasignación
+manual que el asesor acababa de hacer a propósito.
+
+**Cambio:** dentro del chequeo de `conversationState.escalated`, ahora se
+suma una tercera condición para resumir — `reassignedToSofia =
+liveAgentId === SOFIA_AGENT_ID` (reusa el `liveAgentId` que ya se leyó
+para el chequeo de "¿la tiene un humano?" más arriba, no es un lookup
+nuevo) — junto a `archived` y el cooldown. Se chequea **antes** de la
+retransferencia self-healing de 5l, así esta última nunca se ejecuta
+cuando la razón real es una reasignación humana intencional. No toca los
+otros dos caminos de resumir, ni el chequeo de "humano dueño" (que sigue
+siendo absoluto y se evalúa antes que todo esto) — es una condición más
+con OR, no un reemplazo.
+
+---
+
 ## 6. Cosas a tener en cuenta / próximos pasos
 
 - **El group ID, los IDs de agentes y el channel de WhatsApp están

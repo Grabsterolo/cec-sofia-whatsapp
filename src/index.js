@@ -463,8 +463,17 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       ? Infinity
       : (Date.now() - lastActivityMs) / 3_600_000;
     const cooldownExpired = hoursSinceLastActivity >= ESCALATION_COOLDOWN_HOURS;
+    // A human explicitly reassigning the conversation back to Sofía (JP,
+    // 2026-08-20: e.g. Angie hands it back mid-conversation so the patient
+    // isn't left waiting) is a clear, deliberate signal to resume — no
+    // reason to make them wait for Zenvia to report "archived" or for the
+    // 48h cooldown. liveAgentId was already fetched above (the human-owned
+    // check) — reused here, not a new lookup. Checked first, before the
+    // self-healing transfer below, so that transfer never fires and undoes
+    // a reassignment a human just made on purpose.
+    const reassignedToSofia = liveAgentId === SOFIA_AGENT_ID;
 
-    if (prospectStatus !== "archived" && !cooldownExpired) {
+    if (prospectStatus !== "archived" && !cooldownExpired && !reassignedToSofia) {
       console.log(
         `Skipping inbound message: conversation for prospect ${prospectId} is already escalated (Zenvia status=${prospectStatus}, ${hoursSinceLastActivity.toFixed(1)}h since last activity, cooldown at ${ESCALATION_COOLDOWN_HOURS}h)`
       );
@@ -492,6 +501,8 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
 
     if (prospectStatus === "archived") {
       console.log(`Conversation for prospect ${prospectId} was archived in Zenvia — resuming Sofía.`);
+    } else if (reassignedToSofia) {
+      console.log(`Conversation for prospect ${prospectId} was reassigned to Sofía CEC by a human — resuming.`);
     } else {
       console.log(
         `Conversation for prospect ${prospectId} escalated ${hoursSinceLastActivity.toFixed(1)}h ago with no activity since (Zenvia status=${prospectStatus}, never reached "archived") — cooldown expired, resuming Sofía.`
