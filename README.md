@@ -8,15 +8,20 @@ Repo de referencia para el patrón de RAG + prompt caching:
 [Grabsterolo/cecmarketing](https://github.com/Grabsterolo/cecmarketing),
 en particular `functions/api/chat.js`.
 
-## ⚠️ Estado: listo para revisión, NO desplegado
+## ⚠️ Estado: EN PRODUCCIÓN — desplegado y con el webhook registrado
 
-Este repo está listo para que el usuario:
-1. Revise el código y este README.
-2. Corra `wrangler deploy` manualmente.
-3. Registre la suscripción al webhook (`POST /notifications/subscriptions`)
-   como último paso, una vez el Worker esté desplegado y la URL sea estable.
+Fue "listo para revisión, no desplegado" hasta el 2026-08-19. Ya no —
+Sofía está en vivo contestando WhatsApp/Facebook real del CEC desde ese
+día. Si estás leyendo esto en una sesión nueva de Claude Code: **antes de
+tocar nada**, corré `git log --oneline -20` y `git fetch origin` — este
+repo tuvo más de 15 commits y ~15 deploys en un solo día (2026-08-19 a
+2026-08-20), varios de otra sesión de Claude Code trabajando en paralelo.
+Lee las secciones 5g a 5n antes de asumir que un bug ya reportado sigue
+sin arreglar — es muy probable que ya lo esté, y que el hueco real sea
+otro relacionado.
 
-No se hizo deploy ni se registró ningún webhook durante el desarrollo.
+Deploy: `npm run deploy` (= `wrangler deploy`) desde este directorio,
+autenticado con la cuenta de Cloudflare de JP (`jpgamboa1309@gmail.com`).
 
 ---
 
@@ -1397,6 +1402,217 @@ probarlo. **Antes de correrlo con `dryRun:false`:**
    Zenvia — confirmar que la lista tiene sentido antes de mandar nada real.
 2. Si el número parece razonable, recién ahí `{"dryRun": false}`.
 
+**Actualización 2026-08-20 — ya probado en vivo, con más hallazgos, ver
+5m.**
+
+---
+
+## 5j. `fetch()` sin try/catch en 4 funciones del camino de escalación — podían abortar antes de guardar `escalated=true`
+
+Bug real: caso de microcirugía reconstructiva post-tumor (2026-08-19).
+Sofía le dijo al paciente "le voy a pasar esta información al equipo" y
+generó el tag `[ESCALAR]` correctamente, pero `escalated` nunca quedó
+`true` en Supabase — la conversación siguió respondiendo con normalidad
+varios turnos más, como si nunca hubiera escalado.
+
+Causa: `sendChannelMessage()`, `addEscalationNote()`,
+`transferProspectToAgent()` y `pickNextPoolAgent()` hacían `fetch()`
+directo, sin `try/catch`. Una falla de red real (no solo un status HTTP
+no-2xx, sino el `fetch()` mismo rechazando la promesa) en cualquiera de
+las cuatro lanzaba una excepción no capturada que abortaba
+`processInboundMessage()` **antes** de llegar a `upsertConversation()` —
+la única línea que persiste `escalated`. El resto del archivo ya seguía
+el patrón try/catch + reintento (ver 5g); estas cuatro eran la excepción.
+
+**Cambios:** las cuatro ahora siguen el mismo patrón que el resto del
+archivo — reintento con `RETRY_DELAYS_MS` donde aplica, nunca propagan la
+excepción hacia arriba. Sin cambio de comportamiento cuando Zenvia
+responde con éxito, solo cambia qué pasa cuando falla la red.
+
+---
+
+## 5k. `escalated=true` quedaba pegado para siempre si Zenvia nunca reportaba "archived" en el prospecto actual
+
+Bug real: número de JP (+50661130913), escalado el 2026-07-27 y sin
+ninguna actividad desde entonces pese a mensajes nuevos el 2026-08-19/20
+— confirmado en vivo cruzando Supabase contra Zenvia.
+
+Causa: el único camino para resetear `escalated` era que el `prospectId`
+del mensaje **entrante actual** reportara `status: "archived"` en
+Zenvia. Pero Zenvia arma un prospecto nuevo cada vez que una conversación
+se cierra y el paciente vuelve a escribir — ese prospecto nuevo nunca
+puede heredar el "archived" del viejo. El chequeo, tal como estaba
+escrito, no se podía volver a cumplir nunca para ese número — quedaba
+escalado de por vida, sin importar cuánto tiempo pasara.
+
+**Cambios:**
+- `ESCALATION_COOLDOWN_HOURS = 48` — si pasaron más de 48h desde la
+  última actividad real de la conversación sin que Zenvia haya reportado
+  "archived" tampoco, el siguiente mensaje entrante se trata como
+  conversación nueva de todas formas (resetea `escalated`/
+  `message_count`), sin depender del estado de Zenvia.
+- Para saber "cuánto pasó desde la última actividad real" hacía falta un
+  timestamp confiable, y no existía uno: `sofia_whatsapp_sessions.updated_at`
+  solo se llenaba con el `default now()` en el INSERT — nunca se
+  actualizaba en un PATCH/merge posterior (confirmado en vivo: una
+  conversación de 11 turnos seguía con `created_at === updated_at`).
+  `saveSessionWithRetry()` ahora lo setea explícitamente (`nowIso`) en
+  sus tres caminos de escritura (insert, patch por versión, y el
+  force-write de contingencia).
+- `getOrCreateSession()` ahora también trae `updated_at`, y
+  `processInboundMessage()` la lee **antes** del chequeo de escalación
+  (se movió esa llamada más arriba en la función) para tener el dato
+  disponible ahí.
+- Ajuste probado en vivo: con el número de JP backdateado a mano
+  (`updated_at` puesto 50h atrás para simular el cooldown), el siguiente
+  "hola" resucitó la conversación correctamente.
+
+---
+
+## 5l. `handleWebhook()` procesaba atado al ciclo de vida de la request HTTP entrante — una desconexión de Zenvia podía cancelar la ejecución a medias
+
+**El hallazgo más grande del 2026-08-19/20**, probablemente la causa de
+fondo de la mayoría de los "Sofía no contestó" reportados ese día
+(número de JP, caso Kattia Acuña Sossa, y muy probablemente varios de los
+1,772+ `escalated=true` sin actividad reciente vistos ese día).
+
+`processInboundMessage()` marca la interacción como procesada en
+`SOFIA_DEDUP` como **lo primero que hace**, antes de que ocurra ningún
+trabajo real (Claude, RAG, envío por Zenvia, escritura en Supabase).
+`handleWebhook()` hacía `await` de todo ese trabajo — que fácilmente toma
+varios segundos, más con los reintentos de 5g/5j encima — antes de
+devolver el `200` a Zenvia. Eso ataba la cadena completa al ciclo de vida
+de la conexión HTTP entrante.
+
+Confirmado en vivo vía `wrangler tail`: una invocación quedó `Canceled`
+(Cloudflare cortó la ejecución, probablemente porque Zenvia se cansó de
+esperar el `200` y cerró la conexión), y la redelivery inmediata de esa
+misma interacción cayó en `Skipping duplicate delivery` — ya estaba
+marcada procesada, así que ese mensaje se perdió para siempre: sin
+respuesta, sin fila en `sofia_conversations`, sin ningún evento en
+`sofia_reliability_events` (una cancelación externa mata la ejecución por
+fuera de cualquier `try/catch`, no hay forma de loguearla desde adentro).
+
+**Cambio:** el loop de `processInboundMessage()` ahora corre dentro de
+`ctx.waitUntil()`. El `200` se devuelve de inmediato (Zenvia nunca tiene
+motivo para desconectarse antes de tiempo) y el trabajo real sigue de
+fondo, inmune a qué pase con la conexión original. `handleWebhook` ahora
+recibe `ctx` (antes solo `request, env`).
+
+**⚠️ Límite real de `ctx.waitUntil()`, descubierto el mismo día en 5m:**
+esto NO le da tiempo ilimitado al trabajo de fondo — Cloudflare igual
+corta el `waitUntil()` si se pasa de cierta ventana después de que la
+response ya se envió (visto en vivo: `waitUntil() tasks did not complete
+within the allowed time... and have been cancelled`). Para un mensaje
+normal de un paciente (una llamada a Claude, unos pocos a Zenvia) esto
+casi nunca debería alcanzarse. Para un lote de varias conversaciones
+seguidas (ver `processRetryBatch` en 5i/5m) sí es un riesgo real y
+confirmado.
+
+---
+
+## 5m. `findPendingCandidate()` — el chequeo de "última interacción" no encontraba las conversaciones asignadas a Sofía, y lecciones reales de correr `/cleanup/retry-pending` con una lista explícita
+
+El escaneo automático de 5i (`retryPendingConversations`) exigía que la
+**última** interacción del prospecto fuera literalmente el mensaje del
+paciente. Pero Sofía reclama el prospecto justo después de recibir el
+mensaje (`claimPromise`, ver 2. Qué hace el Worker), y ese reclamo es su
+propia interacción — "Asignado a Sofía CEC" — con timestamp posterior al
+mensaje. La última interacción terminaba siendo la asignación, no el
+mensaje, y el escaneo descartaba en silencio justo las conversaciones que
+existía para encontrar. Confirmado en vivo: de 10 prospectos que JP
+encontró atascados a mano en la vista "Interacción pendiente" de Zenvia,
+el escaneo automático solo detectó 2.
+
+**Cambios:**
+- `findPendingCandidate(env, prospectId)` — función compartida, extraída
+  del loop que antes vivía inline en `retryPendingConversations()`. Salta
+  las interacciones sin `output.message` (asignaciones, notas, eventos de
+  sistema) para encontrar la más reciente que sí tenga un mensaje real —
+  solo cuenta como "esperando respuesta" si ese mensaje es del paciente
+  (`performer === "integration"`); si es de un agente, ya se contestó.
+- `POST /cleanup/retry-pending` ahora acepta `{"prospectIds": [...]}` en
+  el body — bypasea el escaneo automático (que sigue existiendo sin ese
+  campo) y chequea exactamente esos prospectos con
+  `findPendingCandidate()`. Pensado para cuando un humano ya encontró
+  casos atascados a mano en Zenvia y quiere reprocesarlos puntualmente.
+
+**Lecciones reales de correrlo en vivo con los 10 prospectos de JP
+(2026-08-20):**
+1. **El límite de `ctx.waitUntil()` (ver 5l) es real y se activó**: el
+   primer intento con los 10 juntos solo completó 6 — Cloudflare cortó el
+   resto a medias. Hubo que reintentar en lotes cada vez más chicos (4,
+   luego 1 a 1) hasta que todos completaron. **Recomendación:** correr
+   este endpoint con listas de 3-4 prospectos por llamada, no más, hasta
+   que se resuelva con una arquitectura distinta (ej. una cola en vez de
+   un loop secuencial).
+2. **La misma cancelación deja una marca de dedup a medio hacer**: un
+   intento cortado a medias por el límite de `waitUntil()` puede alcanzar
+   a escribir la key de `SOFIA_DEDUP` (`interaction:retry:<id>`) antes de
+   cortarse, dejando ese reintento puntual permanentemente "duplicado"
+   aunque nunca se haya completado — mismo patrón de fondo que 5l, pero
+   disparado por el timeout del batch en vez de una desconexión de
+   Zenvia. Se resolvió a mano con
+   `wrangler kv key delete "interaction:retry:<id>" --namespace-id
+   94958807d92548389718c4036ea1b178 --remote` (**el flag `--remote` es
+   obligatorio** — sin él, `wrangler kv` apunta a un namespace
+   local/preview vacío y dice "Value not found" aunque la key sí exista en
+   producción).
+3. **La ventana de 24h de WhatsApp es una regla de la plataforma, no de
+   este código** — un prospecto de más de 24h sin actividad (caso
+   "Marjoriecaravaca", del 2026-08-11) generó una respuesta válida en
+   Supabase que **nunca llegó a Zenvia/WhatsApp**, porque fuera de esa
+   ventana un mensaje libre se rechaza y solo un mensaje de plantilla
+   pre-aprobada puede reabrir la conversación (mismo tema que 5c, que
+   sigue sin plantilla aprobada salvo la de cumpleaños). La lista
+   explícita de `prospectIds` **no filtra por esta ventana** — a
+   diferencia del escaneo automático, que sí la respeta vía
+   `PENDING_RETRY_WINDOW_HOURS`. Si se le pasa a mano un prospecto viejo,
+   el endpoint igual va a intentar contestarle y la respuesta se va a
+   perder en silencio (queda en Supabase, nunca llega al paciente) — no
+   hay forma de saberlo desde la respuesta del endpoint, hay que
+   confirmarlo a mano en Zenvia como se hizo acá.
+4. **Dos mensajes seguidos del paciente sin respuesta entre medio** (caso
+   "Edwin": "Hola" y luego "No nada", casi al mismo segundo) — el primer
+   reintento solo contestó el primero; hizo falta un segundo reintento
+   para que `findPendingCandidate()` encontrara el segundo mensaje, ya
+   que pasó a ser "el más reciente con mensaje" una vez que el primero
+   quedó contestado.
+
+---
+
+## 5n. Cambios al `system_prompt` de Sofía (2026-08-19/20) — viven en Supabase, no en este repo
+
+El `system_prompt` de Sofía se edita en `sofia_config.system_prompt`
+(Supabase, proyecto `wuradlaomyoxkiagqvyi`) desde el dashboard de
+`cecmarketing` — no está versionado en git en ningún repo. Anotado acá
+para que quede rastro de qué cambió y por qué, ya que motivó/acompañó
+varios de los bugs de código de esta sección.
+
+1. **Fotos con contenido médico** — Sofía inventaba hallazgos clínicos al
+   recibir una foto sin texto (ej. "veo que la nariz se ve inflamada...",
+   sin que el paciente hubiera dicho una palabra). Ahora tiene instrucción
+   explícita de reconocer/validar sin diagnosticar ni describir lo que
+   "ve" clínicamente.
+2. **Cierre de escalación sin pregunta de seguimiento** — la regla general
+   de "cerrá casi toda respuesta con una pregunta" no tenía excepción para
+   los mensajes que escalan, así que Sofía seguía "indagando síntomas"
+   justo después de decir que pasaba el caso al equipo médico. Ahora la
+   sección "Cómo escalar" tiene una excepción explícita: el cierre de un
+   mensaje que escala es de acompañamiento, no de indagación.
+3. **Candidatura médica atípica** (2026-08-20, ver caso de microcirugía
+   reconstructiva en 5j) — la regla de "candidatura médica → escalar"
+   solo traía ejemplos de fraseo estético típico ("¿puedo operarme si
+   tengo X?"). Se amplió para cubrir explícitamente casos reconstructivos,
+   post-tumor, post-trauma u otros no puramente estéticos — cualquier
+   pregunta sobre si SU situación particular califica, sin importar cómo
+   esté redactada.
+
+Complementa (no reemplaza) el fix de código de 5j/`mentionsHandoffPromise`
+del 5h de la otra sesión: el prompt reduce cuántas veces el modelo se
+olvida de escalar en primer lugar; el código atrapa los casos donde
+igual se le escapa.
+
 ---
 
 ## 6. Cosas a tener en cuenta / próximos pasos
@@ -1405,10 +1621,11 @@ probarlo. **Antes de correrlo con `dryRun:false`:**
   hardcodeados** en `src/index.js` (no son secretos, son config específica
   del CEC en Zenvia). Si cambian los agentes del equipo o se agrega alguno
   nuevo, hay que actualizar el array `HUMAN_AGENTS` a mano.
-- El round robin de escalación es un placeholder simple (preferir online,
-  si no elegir al azar) — no hay memoria entre requests porque los Workers
-  son stateless por request. Si el volumen lo justifica, la mejora natural
-  es un contador en Workers KV o una columna en Supabase.
+- ~~El round robin de escalación es un placeholder simple...~~ **Ya no** —
+  desde `pickNextPoolAgent()` usa `sofia_config.escalation_round_robin_index`
+  en Supabase como contador persistente entre requests (fixed order Adrian
+  → Angie → Ingrid → Jordan → Adrian...). Ver 5j para el hardening de
+  reintentos de esa función.
 - La cuenta de Zenvia del CEC **ya tiene tráfico real de WhatsApp
   entrando** (se vio en la exploración) — cualquier prueba de este Worker en
   producción va a interactuar con esa cuenta real. Recomendado probar
