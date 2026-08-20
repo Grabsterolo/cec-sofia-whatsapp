@@ -16,7 +16,7 @@ día. Si estás leyendo esto en una sesión nueva de Claude Code: **antes de
 tocar nada**, corré `git log --oneline -20` y `git fetch origin` — este
 repo tuvo más de 15 commits y ~15 deploys en un solo día (2026-08-19 a
 2026-08-20), varios de otra sesión de Claude Code trabajando en paralelo.
-Lee las secciones 5g a 5n antes de asumir que un bug ya reportado sigue
+Lee las secciones 5g a 5p antes de asumir que un bug ya reportado sigue
 sin arreglar — es muy probable que ya lo esté, y que el hueco real sea
 otro relacionado.
 
@@ -1640,6 +1640,62 @@ cuando la razón real es una reasignación humana intencional. No toca los
 otros dos caminos de resumir, ni el chequeo de "humano dueño" (que sigue
 siendo absoluto y se evalúa antes que todo esto) — es una condición más
 con OR, no un reemplazo.
+
+---
+
+## 5p. Dedup de webhook por KV tenía una carrera real — reemplazado por Postgres (2026-08-20)
+
+Encontrado desde el otro lado: una auditoría de las métricas del dashboard
+`cecmarketing` (sesión de Claude Code separada, revisando de dónde salen
+los números de "Métricas Sofía") cruzó `sofia_conversations` contra
+`sofia_whatsapp_sessions` y encontró 13 pares de filas con el mismo
+`phone_hash`/`prospect_id`, creadas entre 19 y 90 milisegundos una de la
+otra — imposible que sea el paciente escribiendo dos veces. En varios
+pares, `last_message`/`procedure_interest` eran completamente distintos
+(ej. una fila explicando qué es Ultherapy, la otra cotizando un paquete de
+$1,250 — mismo número, mismo segundo): dos llamadas a Claude independientes
+para lo que debió ser un solo mensaje entrante.
+
+**Causa raíz:** la deduplicación en `processInboundMessage()` (ver sección
+2) hacía `env.SOFIA_DEDUP.get(dedupKey)` → si no estaba, `.put(...)` —
+Workers KV no ofrece compare-and-swap. Dos entregas concurrentes del mismo
+`interactionId` (Zenvia redelivery, o la propia infraestructura de
+Cloudflare) podían ambas leer "no procesado" antes de que ninguna llegara a
+escribir, y las dos corrían el pipeline completo: Claude, posible doble
+respuesta de WhatsApp al paciente, y `upsertConversation()` — que además,
+al no tener `sofia_conversations` un constraint único en `phone_hash` (ver
+sección 2, "la tabla no tiene constraint único en `phone_hash`"), terminaba
+insertando dos filas en vez de una.
+
+**Fix:** nueva tabla `sofia_interaction_dedup` (`interaction_id text
+primary key`, migración aplicada al proyecto Supabase compartido) —
+`claimInteraction()` hace un `INSERT` contra esa tabla antes que cualquier
+otra cosa en `processInboundMessage()` (mismo punto donde vivía el chequeo
+de KV, antes incluso del interruptor de emergencia); un `409` significa que
+otra entrega concurrente ya ganó la carrera, y se corta ahí sin haber
+llamado a Claude ni tocado Zenvia. A diferencia de KV, el `PRIMARY KEY` de
+Postgres sí es atómico. Fail-open ante error de red/timeout (se procesa
+igual) — perder un mensaje real de un paciente por un chequeo de dedup
+demasiado estricto sería peor que un duplicado ocasional.
+
+De paso, `upsertConversation()` ahora pide `order=created_at.asc` al leer
+la fila existente por `phone_hash` — sin eso, un `phone_hash` con más de
+una fila (residual de esta carrera, o cualquier caso futuro) podía recibir
+el `PATCH` de cada turno sobre una fila distinta de forma no determinística,
+repartiendo `escalated`/`message_count`/`sentiment` entre las dos en vez de
+mantenerlos juntos.
+
+`SOFIA_DEDUP` (KV) queda declarado en `wrangler.toml` pero sin uso en el
+código — no se borró el namespace de Cloudflare por si se quiere revertir.
+
+**Verificación:** `wrangler deploy --dry-run` (bundle limpio). No se probó
+contra tráfico real concurrente (no hay forma práctica de forzar la carrera
+en un test manual) — la confianza viene de que Postgres garantiza la
+atomicidad de `PRIMARY KEY` por diseño, a diferencia de KV. Las 13 filas
+duplicadas ya existentes en Supabase **no se tocaron** (0.2% del total,
+impacto despreciable en las métricas del dashboard) — si en algún momento
+se quiere limpiar ese backlog, hay que decidir a mano cuál de cada par
+conservar.
 
 ---
 
