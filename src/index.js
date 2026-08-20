@@ -158,7 +158,7 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/webhook") {
-      return handleWebhook(request, env);
+      return handleWebhook(request, env, ctx);
     }
 
     if (request.method === "POST" && url.pathname === "/cleanup/scan-and-warn") {
@@ -201,7 +201,7 @@ export default {
 // Webhook entrypoint
 // ---------------------------------------------------------------------------
 
-async function handleWebhook(request, env) {
+async function handleWebhook(request, env, ctx) {
   if (env.WEBHOOK_SHARED_SECRET) {
     const providedSecret = new URL(request.url).searchParams.get("secret");
     if (providedSecret !== env.WEBHOOK_SHARED_SECRET) {
@@ -224,16 +224,39 @@ async function handleWebhook(request, env) {
 
   const inboundMessages = await extractInboundMessages(body, env);
 
-  // Always ack 200 once the payload parses, even if downstream processing
-  // fails — this avoids Zenvia retry storms that could duplicate replies.
-  // Failures are logged (visible via `wrangler tail`) but not surfaced to Zenvia.
-  for (const inbound of inboundMessages) {
-    try {
-      await processInboundMessage(inbound, env);
-    } catch (err) {
-      console.error("Failed to process inbound message", inbound, err);
-    }
-  }
+  // Bug found 2026-08-20 (JP's number, live via wrangler tail): this used to
+  // `await` the whole processing loop before responding — so the entire
+  // Claude/Zenvia/Supabase chain ran tied to the original webhook request's
+  // lifecycle. processInboundMessage() marks the interaction "processed" in
+  // SOFIA_DEDUP as the very first thing it does, before any real work
+  // happens. If Zenvia's webhook caller gave up waiting (our chain can
+  // easily run several seconds under retries) and closed the connection,
+  // Cloudflare could cancel the in-flight execution — caught live as a
+  // "Canceled" invocation in wrangler tail, immediately followed by
+  // "Skipping duplicate delivery" on the next redelivery of that exact
+  // interaction. Net effect: the interaction was permanently marked done
+  // with nothing ever actually done — no reply, no Supabase write, no
+  // sofia_reliability_events entry (the cancellation kills execution
+  // outside of any try/catch), and every future retry of that same
+  // interaction silently deduped away forever.
+  //
+  // ctx.waitUntil() decouples the processing from the response: the ack
+  // below returns immediately (so Zenvia's client is happy fast and never
+  // has a reason to disconnect early), while the actual work keeps running
+  // in the background regardless of what happens to the original
+  // connection. Failures are still swallowed per-message (never surfaced to
+  // Zenvia, same as before) and logged (visible via `wrangler tail`).
+  ctx.waitUntil(
+    (async () => {
+      for (const inbound of inboundMessages) {
+        try {
+          await processInboundMessage(inbound, env);
+        } catch (err) {
+          console.error("Failed to process inbound message", inbound, err);
+        }
+      }
+    })()
+  );
 
   return new Response(JSON.stringify({ received: inboundMessages.length }), {
     status: 200,
