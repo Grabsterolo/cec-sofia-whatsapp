@@ -2356,65 +2356,107 @@ async function handleRetryPending(request, env, ctx) {
     // no body / invalid JSON -> treat as a real run with no options, same as an empty {}
   }
   const dryRun = body.dryRun !== false;
+  // Explicit list (JP, 2026-08-20): bypasses the discovery scan below and
+  // checks exactly these prospect ids instead — see retryPendingConversations.
+  const prospectIds = Array.isArray(body.prospectIds) ? body.prospectIds : null;
 
-  const result = await retryPendingConversations(env, ctx, { dryRun });
+  const result = await retryPendingConversations(env, ctx, { dryRun, prospectIds });
   return new Response(JSON.stringify(result), {
     status: 200,
     headers: { "content-type": "application/json" },
   });
 }
 
+// Given one prospect id, finds the most recent interaction that's an
+// unanswered patient message and confirms no human currently owns the
+// conversation. Shared by both discovery paths below.
+//
+// Bug found 2026-08-20 (JP's explicit list of 10 stuck prospects — see
+// retryPendingConversations): the original version of this check required
+// the very LAST interaction to literally be the patient's message. That
+// missed a real class of stuck conversations: Sofía claims the prospect
+// right after the message arrives (see the claimPromise comment in
+// processInboundMessage), and that claim is itself its own interaction
+// entry — "Asignado a Sofía CEC" — timestamped AFTER the message. So the
+// last interaction was the assignment, not the message, and the old check
+// silently skipped exactly the conversations it existed to find. This
+// version skips past interactions with no output.message (assignment/note/
+// system events) to find the most recent one that actually has a message —
+// only if THAT one is from the patient (performer === "integration") is
+// there still something waiting on a reply; if it's from an agent, someone
+// already answered and there's nothing to do.
+async function findPendingCandidate(env, prospectId) {
+  const res = await fetchWithTimeout(
+    `${ZENVIA_API_BASE}/prospect/${prospectId}/interactions?api-key=${env.ZENVIA_API_KEY}`
+  );
+  if (!res.ok) return null;
+  const interactions = await res.json();
+  if (!interactions.length) return null;
+
+  // Defensive sort instead of trusting response order — see the
+  // getRecentlyActiveProspectIds comment on Zenvia's documented descending
+  // sort; this endpoint's order isn't separately confirmed.
+  const sorted = [...interactions].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const last = sorted.find((i) => i.output?.message);
+  if (!last) return null;
+  const message = last.output.message;
+  // Most recent real message was from us/an agent — already answered.
+  if (message.performer !== "integration") return null;
+  if (!last.via || !(last.via in SUPPORTED_CHANNELS)) return null;
+
+  // Fail-closed the same way processInboundMessage() does — but this is
+  // only a first pass to size the candidate list; processInboundMessage()
+  // below re-checks this live, right before actually replying, since time
+  // passes between this scan and the batch actually running.
+  const { agentId: liveAgentId, failed } = await getCurrentProspectAgentId(env, prospectId);
+  if (failed || (liveAgentId && HUMAN_AGENT_IDS.has(liveAgentId))) return null;
+
+  return { prospect: { id: prospectId }, last, message };
+}
+
 // Reuses getOpenProspects/getRecentlyActiveProspectIds (already paginated,
 // already respects Zenvia's 5000-result cap — see scanAndWarn above) instead
 // of a fresh account-wide sweep. toCheck = open prospects with SOME activity
 // in the last 24h; each of those gets one extra call to its own (always
-// small) interaction history to find what the *last* interaction actually
-// was, same pattern hasRecentActivityForProspect already uses for the
-// cleanup path.
-async function retryPendingConversations(env, ctx, { dryRun }) {
-  const sinceIso = new Date(Date.now() - PENDING_RETRY_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
-
-  const [openProspects, recentlyActiveIds] = await Promise.all([
-    getOpenProspects(env, CEC_GROUP_ID),
-    getRecentlyActiveProspectIds(env, sinceIso),
-  ]);
-
-  if (recentlyActiveIds === null) {
-    return {
-      dryRun,
-      error: "Could not determine recent activity — aborted without retrying anything.",
-    };
-  }
-
-  const toCheck = openProspects.filter((p) => recentlyActiveIds.has(p.id));
-
+// small) interaction history via findPendingCandidate().
+//
+// prospectIds (JP, 2026-08-20): an explicit list bypasses the discovery
+// scan entirely and checks exactly those ids instead — for conversations a
+// human already found stuck in Zenvia's "Interacción pendiente" view that
+// the automatic scan's window/heuristics might not surface on their own.
+async function retryPendingConversations(env, ctx, { dryRun, prospectIds }) {
   const candidates = [];
-  for (const prospect of toCheck) {
-    const res = await fetchWithTimeout(
-      `${ZENVIA_API_BASE}/prospect/${prospect.id}/interactions?api-key=${env.ZENVIA_API_KEY}`
-    );
-    if (!res.ok) continue;
-    const interactions = await res.json();
-    if (!interactions.length) continue;
+  const meta = {};
 
-    // Defensive sort instead of trusting response order — see the
-    // getRecentlyActiveProspectIds comment on Zenvia's documented descending
-    // sort; this endpoint's order isn't separately confirmed.
-    const last = [...interactions].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
-    const message = last.output?.message;
-    // Last event wasn't the patient waiting on a reply — either we (or a
-    // human) already answered, or it's a non-message event. Nothing to retry.
-    if (!message || message.performer !== "integration") continue;
-    if (!last.via || !(last.via in SUPPORTED_CHANNELS)) continue;
+  if (prospectIds && prospectIds.length > 0) {
+    meta.requested = prospectIds.length;
+    for (const id of prospectIds) {
+      const candidate = await findPendingCandidate(env, id);
+      if (candidate) candidates.push(candidate);
+    }
+  } else {
+    const sinceIso = new Date(Date.now() - PENDING_RETRY_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
 
-    // Fail-closed the same way processInboundMessage() does — but this is
-    // only a first pass to size the candidate list; processInboundMessage()
-    // below re-checks this live, right before actually replying, since time
-    // passes between this scan and the batch actually running.
-    const { agentId: liveAgentId, failed } = await getCurrentProspectAgentId(env, prospect.id);
-    if (failed || (liveAgentId && HUMAN_AGENT_IDS.has(liveAgentId))) continue;
+    const [openProspects, recentlyActiveIds] = await Promise.all([
+      getOpenProspects(env, CEC_GROUP_ID),
+      getRecentlyActiveProspectIds(env, sinceIso),
+    ]);
 
-    candidates.push({ prospect, last, message });
+    if (recentlyActiveIds === null) {
+      return {
+        dryRun,
+        error: "Could not determine recent activity — aborted without retrying anything.",
+      };
+    }
+
+    const toCheck = openProspects.filter((p) => recentlyActiveIds.has(p.id));
+    meta.openProspectsInGroup = openProspects.length;
+    meta.recentlyActive = toCheck.length;
+
+    for (const prospect of toCheck) {
+      const candidate = await findPendingCandidate(env, prospect.id);
+      if (candidate) candidates.push(candidate);
+    }
   }
 
   // Oldest-stuck-first — same priority reasoning as scanAndWarn's sort.
@@ -2429,8 +2471,7 @@ async function retryPendingConversations(env, ctx, { dryRun }) {
 
   return {
     dryRun,
-    openProspectsInGroup: openProspects.length,
-    recentlyActive: toCheck.length,
+    ...meta,
     stuckAwaitingReply: candidates.length,
     retried: dryRun ? 0 : batch.length, // queued in the background, not yet confirmed done
     wouldRetry: dryRun ? candidates.length : 0,
