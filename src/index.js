@@ -357,6 +357,38 @@ async function extractInboundFromInteraction(interaction, env) {
 // Core processing
 // ---------------------------------------------------------------------------
 
+// Atomically claims an interactionId so only one concurrent delivery of the
+// same webhook event proceeds. Backed by Postgres (sofia_interaction_dedup,
+// interaction_id primary key) instead of Workers KV — KV's get/put has no
+// compare-and-swap, so two racing deliveries could both see "not claimed"
+// before either wrote (see the 2026-08-20 fix note in processInboundMessage
+// for the real duplicate-processing incidents this caused). A 409 here means
+// another concurrent delivery already won the race for this interactionId.
+// Any other failure (network/timeout/5xx) fails OPEN — process anyway — same
+// direction as the rest of this file: losing a patient message to an
+// over-eager dedup check is worse than an occasional duplicate.
+async function claimInteraction(env, interactionId) {
+  try {
+    const res = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_interaction_dedup`, {
+      method: "POST",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({ interaction_id: interactionId }),
+    });
+    if (res.ok) return true;
+    if (res.status === 409) return false;
+    console.error(`claimInteraction: unexpected status ${res.status} for ${interactionId}, processing anyway`);
+    return true;
+  } catch (err) {
+    console.error(`claimInteraction: request failed for ${interactionId}, processing anyway`, err);
+    return true;
+  }
+}
+
 async function processInboundMessage({ text, phone, prospectId, agentId, interactionId, channel, attachment }, env) {
   // Deduplicate redelivered webhook events. Zenvia (or an upstream retry)
   // can redeliver the same interaction more than once — without this, each
@@ -365,17 +397,21 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // fresh attempt to claim/reply on a conversation that may have since been
   // escalated to a human (see README "Sofía repite despedidas / responde
   // tras reasignación a Angie"). Checked before anything else, including
-  // the kill switch, so a duplicate never does any work at all. TTL is
-  // generous (24h) since a retry storm could plausibly span hours, and the
-  // KV entry itself is tiny and not sensitive.
-  if (interactionId) {
-    const dedupKey = `interaction:${interactionId}`;
-    const alreadyProcessed = await env.SOFIA_DEDUP.get(dedupKey);
-    if (alreadyProcessed) {
-      console.log(`Skipping duplicate delivery of interaction ${interactionId} for prospect ${prospectId}`);
-      return;
-    }
-    await env.SOFIA_DEDUP.put(dedupKey, "1", { expirationTtl: 86400 });
+  // the kill switch, so a duplicate never does any work at all.
+  //
+  // Bug found 2026-08-20 (cecmarketing dashboard audit): this used to be a
+  // get/put against SOFIA_DEDUP (Workers KV). KV has no compare-and-swap —
+  // two concurrent deliveries of the same interactionId could both read
+  // "not yet processed" before either had written, and both would run the
+  // full pipeline. Confirmed live in sofia_conversations: 13 pairs of rows
+  // with the same phone_hash/prospect_id, created 19-90ms apart, each with
+  // a different Claude-generated reply — i.e. real duplicate processing,
+  // not just a duplicate row. claimInteraction() below uses a Postgres
+  // primary key instead, which Postgres does guarantee atomically: only one
+  // concurrent INSERT for a given interaction_id can ever succeed.
+  if (interactionId && !(await claimInteraction(env, interactionId))) {
+    console.log(`Skipping duplicate delivery of interaction ${interactionId} for prospect ${prospectId}`);
+    return;
   }
 
   // Emergency kill switch: sofia_config.whatsapp_enabled, toggled from the
@@ -1349,8 +1385,17 @@ async function upsertConversation(env, {
       // Re-read on every attempt (not just the first) so a retry after a
       // write failure still rebases the sticky escalated/message_count
       // fields on the freshest row instead of stale data from attempt 1.
+      // order=created_at.asc makes this deterministic even for the rare
+      // phone_hash with more than one row (old duplicate-delivery races —
+      // see claimInteraction — or a genuine repeat patient sharing a
+      // phone_hash across conversations). Without an explicit order,
+      // Postgres can return either matching row from one call to the next,
+      // so different turns of the same conversation could patch different
+      // rows and silently split escalated/message_count/sentiment between
+      // them. Always picking the earliest keeps every turn landing on the
+      // same row.
       const existingRes = await fetchWithTimeout(
-        `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=id,message_count,escalated,escalation_reason&limit=1`,
+        `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=id,message_count,escalated,escalation_reason&order=created_at.asc&limit=1`,
         { headers }
       );
       if (!existingRes.ok) {

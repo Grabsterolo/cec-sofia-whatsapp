@@ -17,8 +17,12 @@ compatibility_date = "2026-07-01"
 [triggers]
 crons = ["*/20 * * * *"]
 
-# Deduplicación de entregas repetidas de webhook (mismo interactionId) — ver
-# processInboundMessage(). TTL corto, no es un dato que necesite persistir.
+# Ya no se usa en el código (2026-08-20): la deduplicación de entregas
+# repetidas de webhook se movió a Postgres (tabla sofia_interaction_dedup,
+# ver claimInteraction() en src/index.js) porque KV no ofrece
+# compare-and-swap y dos entregas concurrentes del mismo interactionId
+# podían colarse ambas. Se deja el binding declarado (no hace daño) por si
+# se decide borrar el namespace de Cloudflare más adelante.
 [[kv_namespaces]]
 binding = "SOFIA_DEDUP"
 id = "94958807d92548389718c4036ea1b178"
