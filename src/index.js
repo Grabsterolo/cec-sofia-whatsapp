@@ -37,6 +37,23 @@ const HUMAN_AGENT_IDS = new Set(HUMAN_AGENTS.map((a) => a.id));
 const MAX_HISTORY_MESSAGES = 20; // ~10 user/assistant turns
 const MAX_CONVERSATION_TURNS = 10; // sofia_conversations.message_count ceiling before forcing escalation
 
+// Bug found 2026-08-20 (JP, número +50661130913): once escalated=true, the
+// only reset path was "the CURRENT prospectId's Zenvia status is literally
+// archived" — but Zenvia hands out a brand-new prospectId each time a
+// conversation is closed and the patient writes again, so that fresh
+// prospect can never have inherited the old one's "archived" status. Net
+// effect: any phone number ever escalated once stayed permanently stuck —
+// Sofía silently ignored every future message from that number forever,
+// with zero trace anywhere (no reply, no Supabase write). Live-confirmed:
+// JP's own number sat escalated since 2026-07-27 and three fresh messages
+// today produced no reply and no DB activity at all.
+// ESCALATION_COOLDOWN_HOURS is the fallback: if nobody has touched this
+// conversation (no message processed either way) in this many hours, treat
+// the next inbound message as a new conversation regardless of what Zenvia
+// says — someone writing back after two silent days is a new conversation
+// in every practical sense, whether or not Zenvia ever reports "archived".
+const ESCALATION_COOLDOWN_HOURS = 48;
+
 // Images/audio: cap at 8MB (Claude's per-image limit is smaller, but this
 // keeps memory/latency sane; oversized files just fail gracefully). Links:
 // cap page size read at 1.5MB before stripping HTML down to plain text.
@@ -387,6 +404,11 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
 
   const conversationState = await getConversationState(env, phoneHash);
 
+  // Fetched here (not further down where it's also used for `history`) so
+  // session.updatedAt is available to the escalation-cooldown check below —
+  // see ESCALATION_COOLDOWN_HOURS.
+  const session = await getOrCreateSession(env, phoneHash);
+
   // Hard stop once this conversation has been escalated — by Sofía's own
   // [ESCALAR] decision or by hitting the message limit below — UNLESS
   // Zenvia's own prospect.status says the conversation was genuinely wrapped
@@ -399,12 +421,29 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // followUp) — or if the status lookup itself fails — stay silent, same as
   // before: silence-by-default over risking another Sofía-overrides-a-human
   // incident.
+  //
+  // EXCEPT: relying only on "this exact prospectId reached archived" turned
+  // out to be a dead end for a real class of conversations. Zenvia hands
+  // out a fresh prospectId each time a conversation is closed and the
+  // patient later writes again — that new prospect can never have inherited
+  // the old one's "archived" status, so this check could never pass again
+  // for that phone number, ever (bug found 2026-08-20 via JP's own number,
+  // stuck since 2026-07-27 — see ESCALATION_COOLDOWN_HOURS). The cooldown
+  // below is the escape hatch: if nobody — not Sofía, not a human — has
+  // touched this conversation in ESCALATION_COOLDOWN_HOURS, treat the next
+  // message as a new conversation regardless of what Zenvia's status says.
   let resetCounters = false;
   if (conversationState.escalated) {
     const prospectStatus = await getProspectStatus(env, prospectId);
-    if (prospectStatus !== "archived") {
+    const lastActivityMs = session.updatedAt ? Date.parse(session.updatedAt) : NaN;
+    const hoursSinceLastActivity = Number.isNaN(lastActivityMs)
+      ? Infinity
+      : (Date.now() - lastActivityMs) / 3_600_000;
+    const cooldownExpired = hoursSinceLastActivity >= ESCALATION_COOLDOWN_HOURS;
+
+    if (prospectStatus !== "archived" && !cooldownExpired) {
       console.log(
-        `Skipping inbound message: conversation for prospect ${prospectId} is already escalated (Zenvia status=${prospectStatus})`
+        `Skipping inbound message: conversation for prospect ${prospectId} is already escalated (Zenvia status=${prospectStatus}, ${hoursSinceLastActivity.toFixed(1)}h since last activity, cooldown at ${ESCALATION_COOLDOWN_HOURS}h)`
       );
       if (prospectStatus === null) {
         await logReliabilityEvent(env, {
@@ -427,7 +466,14 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       await transferToNextAgentInPool(env, prospectId, { phoneHash });
       return;
     }
-    console.log(`Conversation for prospect ${prospectId} was archived in Zenvia — resuming Sofía.`);
+
+    if (prospectStatus === "archived") {
+      console.log(`Conversation for prospect ${prospectId} was archived in Zenvia — resuming Sofía.`);
+    } else {
+      console.log(
+        `Conversation for prospect ${prospectId} escalated ${hoursSinceLastActivity.toFixed(1)}h ago with no activity since (Zenvia status=${prospectStatus}, never reached "archived") — cooldown expired, resuming Sofía.`
+      );
+    }
     conversationState.escalated = false;
     conversationState.messageCount = 0;
     resetCounters = true;
@@ -456,7 +502,8 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // for the Claude call below, never persisted.
   const { contentForClaude, contentForHistory } = await resolveInboundContent(env, { text, attachment });
 
-  const session = await getOrCreateSession(env, phoneHash);
+  // session was already fetched above (before the escalation check, for
+  // session.updatedAt) — reused here rather than fetched twice.
   const history = [...session.messages, { role: "user", content: contentForHistory }].slice(
     -MAX_HISTORY_MESSAGES
   );
@@ -1078,7 +1125,7 @@ async function sha256Hex(input) {
 // conditional update) — see there for why.
 async function getOrCreateSession(env, phoneHash) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?phone_hash=eq.${phoneHash}&select=messages,version&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?phone_hash=eq.${phoneHash}&select=messages,version,updated_at&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1086,10 +1133,10 @@ async function getOrCreateSession(env, phoneHash) {
       },
     }
   );
-  if (!res.ok) return { messages: [], version: null };
+  if (!res.ok) return { messages: [], version: null, updatedAt: null };
   const rows = await res.json();
-  if (!rows[0]) return { messages: [], version: null };
-  return { messages: rows[0].messages ?? [], version: rows[0].version ?? 0 };
+  if (!rows[0]) return { messages: [], version: null, updatedAt: null };
+  return { messages: rows[0].messages ?? [], version: rows[0].version ?? 0, updatedAt: rows[0].updated_at ?? null };
 }
 
 // Fixes the lost-message race: two inbound messages from the same patient
@@ -1122,6 +1169,12 @@ async function saveSessionWithRetry(env, phoneHash, channel, baseMessages, baseV
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     const combined = [...baseMessages, ...newTurns].slice(-MAX_HISTORY_MESSAGES);
+    // updated_at only defaults on INSERT — Postgres never refreshes it on
+    // its own for an UPDATE/PATCH, so every write here has to set it
+    // explicitly or it silently stays frozen at the row's creation time
+    // (confirmed live: an 11-turn conversation still had created_at ===
+    // updated_at). This is what the ESCALATION_COOLDOWN_HOURS check reads.
+    const nowIso = new Date().toISOString();
     let succeeded = false;
 
     try {
@@ -1129,7 +1182,7 @@ async function saveSessionWithRetry(env, phoneHash, channel, baseMessages, baseV
         const res = await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions`, {
           method: "POST",
           headers,
-          body: JSON.stringify({ phone_hash: phoneHash, messages: combined, channel, version: 1 }),
+          body: JSON.stringify({ phone_hash: phoneHash, messages: combined, channel, version: 1, updated_at: nowIso }),
         });
         succeeded = res.ok;
       } else {
@@ -1138,7 +1191,7 @@ async function saveSessionWithRetry(env, phoneHash, channel, baseMessages, baseV
           {
             method: "PATCH",
             headers,
-            body: JSON.stringify({ messages: combined, channel, version: baseVersion + 1 }),
+            body: JSON.stringify({ messages: combined, channel, version: baseVersion + 1, updated_at: nowIso }),
           }
         );
         if (res.ok) {
@@ -1175,7 +1228,7 @@ async function saveSessionWithRetry(env, phoneHash, channel, baseMessages, baseV
       "Content-Type": "application/json",
       Prefer: "resolution=merge-duplicates,return=minimal",
     },
-    body: JSON.stringify({ phone_hash: phoneHash, messages: combined, channel }),
+    body: JSON.stringify({ phone_hash: phoneHash, messages: combined, channel, updated_at: new Date().toISOString() }),
   });
   console.error("saveSessionWithRetry exhausted retries, force-wrote", phoneHash);
   return combined;
