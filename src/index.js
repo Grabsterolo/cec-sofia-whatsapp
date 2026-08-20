@@ -121,6 +121,17 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_FETCH_TIM
 const INACTIVITY_WARNING_HOURS = 24;
 const INACTIVITY_ARCHIVE_REASON = "inactive";
 
+// POST /cleanup/retry-pending (2026-08-20, JP: conversaciones "Interacción
+// pendiente" que Sofía nunca vuelve a tocar). Same WhatsApp free-form
+// session window as everywhere else in this file (24h from the patient's
+// last message) — outside it, Zenvia will reject a normal reply and only a
+// pre-approved template could reopen the conversation (CEC only has the
+// birthday template, see handleSendBirthday), so retrying older stuck
+// conversations isn't attempted here on purpose. Manual-trigger-only, dry
+// run by default — same convention as scanAndWarn below.
+const PENDING_RETRY_WINDOW_HOURS = 24;
+const MAX_PENDING_RETRIES_PER_RUN = 20;
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -135,6 +146,10 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/cleanup/scan-and-warn") {
       return handleScanAndWarn(request, env, ctx);
+    }
+
+    if (request.method === "POST" && url.pathname === "/cleanup/retry-pending") {
+      return handleRetryPending(request, env, ctx);
     }
 
     if (request.method === "POST" && url.pathname === "/send/birthday") {
@@ -1205,6 +1220,23 @@ async function getConversationState(env, phoneHash) {
 // supposed to already be with a human. Once true, escalated now stays true
 // until resetCounters (Zenvia confirmed the prospect archived) explicitly
 // starts the conversation over.
+// Bug found 2026-08-20 (JP: Sofía deja conversaciones "Interacción pendiente"
+// sin volver a tocarlas — caso real "Vivi Hidalgo") — this used to fire raw
+// fetch() calls with no try/catch, no .ok check, no retry and no logging,
+// unlike every other Supabase/Zenvia write in this file. Cross-referencing
+// sofia_whatsapp_sessions against sofia_conversations showed 89 of 1942
+// sessions (~4.6%) in the prior 7 days had a fully-saved conversation history
+// with zero corresponding sofia_conversations row — the escalated/sticky
+// state this function is responsible for was silently lost every time the
+// write failed, with no trace anywhere. Vivi Hidalgo's conversation matched
+// this exactly: 3 turns saved cleanly to sofia_whatsapp_sessions, including a
+// final reply that should have triggered mentionsHandoffPromise() escalation,
+// but no sofia_conversations row and no sofia_reliability_events entry at
+// all. Now retries transient failures (same RETRY_DELAYS_MS pattern as
+// sendChannelMessage/callClaude) and logs conversation_upsert_failed on
+// exhaustion — never throws, so a persistent failure here still can't abort
+// processInboundMessage() before the caller's own reply/escalation work
+// (which all happens before this is called) has already run.
 async function upsertConversation(env, {
   phoneHash,
   prospectId,
@@ -1223,60 +1255,88 @@ async function upsertConversation(env, {
     "Content-Type": "application/json",
   };
 
-  const existingRes = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=id,message_count,escalated,escalation_reason&limit=1`,
-    { headers }
-  );
-  const existing = existingRes.ok ? await existingRes.json() : [];
-  const baselineMessageCount = resetCounters ? 0 : existing[0]?.message_count ?? 0;
-  const previousEscalated = existing[0]?.escalated ?? false;
-  const previousEscalationReason = existing[0]?.escalation_reason ?? null;
-  const stickyEscalated = resetCounters ? escalated : previousEscalated || escalated;
-  const stickyEscalationReason = resetCounters
-    ? escalationReason
-    : escalated
-      ? escalationReason
-      : previousEscalated
-        ? previousEscalationReason
-        : escalationReason;
+  let lastFailure = null;
 
-  if (existing[0]) {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_conversations?id=eq.${existing[0].id}`, {
-      method: "PATCH",
-      headers: { ...headers, Prefer: "return=minimal" },
-      body: JSON.stringify({
-        last_message: lastMessage,
-        escalated: stickyEscalated,
-        escalation_reason: stickyEscalationReason,
-        message_count: baselineMessageCount + 1,
-        last_interaction_id: interactionId,
-        procedure_interest: procedureInterest ?? null,
-        sentiment: sentiment ?? null,
-        // prospectId doesn't change across turns for the same phone_hash,
-        // but writing it every time (instead of only on insert) means any
-        // row created before this column existed still gets backfilled the
-        // next time that conversation continues.
-        prospect_id: prospectId ?? null,
-      }),
-    });
-  } else {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_conversations`, {
-      method: "POST",
-      headers: { ...headers, Prefer: "return=minimal" },
-      body: JSON.stringify({
-        phone_hash: phoneHash,
-        prospect_id: prospectId ?? null,
-        channel,
-        last_message: lastMessage,
-        escalated,
-        escalation_reason: escalationReason,
-        message_count: 1,
-        last_interaction_id: interactionId,
-        procedure_interest: procedureInterest ?? null,
-        sentiment: sentiment ?? null,
-      }),
-    });
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      // Re-read on every attempt (not just the first) so a retry after a
+      // write failure still rebases the sticky escalated/message_count
+      // fields on the freshest row instead of stale data from attempt 1.
+      const existingRes = await fetchWithTimeout(
+        `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=id,message_count,escalated,escalation_reason&limit=1`,
+        { headers }
+      );
+      if (!existingRes.ok) {
+        lastFailure = `read failed: http ${existingRes.status}`;
+      } else {
+        const existing = await existingRes.json();
+        const baselineMessageCount = resetCounters ? 0 : existing[0]?.message_count ?? 0;
+        const previousEscalated = existing[0]?.escalated ?? false;
+        const previousEscalationReason = existing[0]?.escalation_reason ?? null;
+        const stickyEscalated = resetCounters ? escalated : previousEscalated || escalated;
+        const stickyEscalationReason = resetCounters
+          ? escalationReason
+          : escalated
+            ? escalationReason
+            : previousEscalated
+              ? previousEscalationReason
+              : escalationReason;
+
+        let writeRes;
+        if (existing[0]) {
+          writeRes = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_conversations?id=eq.${existing[0].id}`, {
+            method: "PATCH",
+            headers: { ...headers, Prefer: "return=minimal" },
+            body: JSON.stringify({
+              last_message: lastMessage,
+              escalated: stickyEscalated,
+              escalation_reason: stickyEscalationReason,
+              message_count: baselineMessageCount + 1,
+              last_interaction_id: interactionId,
+              procedure_interest: procedureInterest ?? null,
+              sentiment: sentiment ?? null,
+              // prospectId doesn't change across turns for the same phone_hash,
+              // but writing it every time (instead of only on insert) means any
+              // row created before this column existed still gets backfilled the
+              // next time that conversation continues.
+              prospect_id: prospectId ?? null,
+            }),
+          });
+        } else {
+          writeRes = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_conversations`, {
+            method: "POST",
+            headers: { ...headers, Prefer: "return=minimal" },
+            body: JSON.stringify({
+              phone_hash: phoneHash,
+              prospect_id: prospectId ?? null,
+              channel,
+              last_message: lastMessage,
+              escalated,
+              escalation_reason: escalationReason,
+              message_count: 1,
+              last_interaction_id: interactionId,
+              procedure_interest: procedureInterest ?? null,
+              sentiment: sentiment ?? null,
+            }),
+          });
+        }
+
+        if (writeRes.ok) return;
+        lastFailure = `write failed: http ${writeRes.status}`;
+      }
+    } catch (err) {
+      lastFailure = err?.message || "network error";
+    }
+    if (attempt < 3) await sleep(RETRY_DELAYS_MS[attempt - 1]);
   }
+
+  console.error("upsertConversation exhausted 3 attempts", phoneHash, lastFailure);
+  await logReliabilityEvent(env, {
+    eventType: "conversation_upsert_failed",
+    prospectId,
+    phoneHash,
+    detail: `upsertConversation failed after retries: ${lastFailure}`,
+  });
 }
 
 // Records a transient Claude/Zenvia failure (after retries were already
@@ -2174,6 +2234,168 @@ async function scanAndWarn(env, ctx, { dryRun }) {
     batchRemaining, // > 0 significa que hay que volver a correr el scan para terminar
     sampleProspectIds: batch.slice(0, 10).map((p) => p.id),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Retry pending replies — POST /cleanup/retry-pending (2026-08-20)
+// ---------------------------------------------------------------------------
+//
+// JP found real conversations tagged "Interacción pendiente" in Zenvia that
+// Sofía never comes back to (case: "Vivi Hidalgo") — the investigation into
+// upsertConversation() (see README 5h) found 91/1942 sessions in the last 7
+// days with a saved reply in sofia_whatsapp_sessions but no
+// sofia_conversations row, which explains the escalation state getting lost
+// silently. But sofia_whatsapp_sessions only ever stores phone_hash (a
+// one-way SHA-256, see sha256Hex) — never the raw phone number — so those 91
+// rows can't be turned back into a phone number or a Zenvia prospectId from
+// Supabase alone. Zenvia itself is the only real source of truth for "which
+// conversations are actually stuck": this scans prospects Zenvia already
+// shows as open (followUp/unclaimed) and assigned to Sofía, finds the ones
+// whose last interaction is still an unanswered patient message, and — for
+// only the ones inside the WhatsApp 24h free-form window — replays that
+// message through processInboundMessage(), the exact same pipeline the live
+// webhook uses. That's deliberate reuse, not a parallel send path: it
+// inherits the human-owned check (re-verified fresh at call time, not from
+// this scan), the dedup, the escalation logic, and the upsertConversation
+// fix above, instead of duplicating any of that logic here and risking it
+// drifting out of sync.
+//
+// Manual-trigger-only (same CLEANUP_TRIGGER_SECRET as scan-and-warn) and dry
+// run by default (body.dryRun !== false) — same convention as
+// handleScanAndWarn, for the same reason: this can message real patients,
+// so a real run must be an explicit opt-in, never the default of an empty
+// POST body.
+async function handleRetryPending(request, env, ctx) {
+  if (!env.CLEANUP_TRIGGER_SECRET || request.headers.get("x-cleanup-secret") !== env.CLEANUP_TRIGGER_SECRET) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {
+    // no body / invalid JSON -> treat as a real run with no options, same as an empty {}
+  }
+  const dryRun = body.dryRun !== false;
+
+  const result = await retryPendingConversations(env, ctx, { dryRun });
+  return new Response(JSON.stringify(result), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+// Reuses getOpenProspects/getRecentlyActiveProspectIds (already paginated,
+// already respects Zenvia's 5000-result cap — see scanAndWarn above) instead
+// of a fresh account-wide sweep. toCheck = open prospects with SOME activity
+// in the last 24h; each of those gets one extra call to its own (always
+// small) interaction history to find what the *last* interaction actually
+// was, same pattern hasRecentActivityForProspect already uses for the
+// cleanup path.
+async function retryPendingConversations(env, ctx, { dryRun }) {
+  const sinceIso = new Date(Date.now() - PENDING_RETRY_WINDOW_HOURS * 60 * 60 * 1000).toISOString();
+
+  const [openProspects, recentlyActiveIds] = await Promise.all([
+    getOpenProspects(env, CEC_GROUP_ID),
+    getRecentlyActiveProspectIds(env, sinceIso),
+  ]);
+
+  if (recentlyActiveIds === null) {
+    return {
+      dryRun,
+      error: "Could not determine recent activity — aborted without retrying anything.",
+    };
+  }
+
+  const toCheck = openProspects.filter((p) => recentlyActiveIds.has(p.id));
+
+  const candidates = [];
+  for (const prospect of toCheck) {
+    const res = await fetchWithTimeout(
+      `${ZENVIA_API_BASE}/prospect/${prospect.id}/interactions?api-key=${env.ZENVIA_API_KEY}`
+    );
+    if (!res.ok) continue;
+    const interactions = await res.json();
+    if (!interactions.length) continue;
+
+    // Defensive sort instead of trusting response order — see the
+    // getRecentlyActiveProspectIds comment on Zenvia's documented descending
+    // sort; this endpoint's order isn't separately confirmed.
+    const last = [...interactions].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
+    const message = last.output?.message;
+    // Last event wasn't the patient waiting on a reply — either we (or a
+    // human) already answered, or it's a non-message event. Nothing to retry.
+    if (!message || message.performer !== "integration") continue;
+    if (!last.via || !(last.via in SUPPORTED_CHANNELS)) continue;
+
+    // Fail-closed the same way processInboundMessage() does — but this is
+    // only a first pass to size the candidate list; processInboundMessage()
+    // below re-checks this live, right before actually replying, since time
+    // passes between this scan and the batch actually running.
+    const { agentId: liveAgentId, failed } = await getCurrentProspectAgentId(env, prospect.id);
+    if (failed || (liveAgentId && HUMAN_AGENT_IDS.has(liveAgentId))) continue;
+
+    candidates.push({ prospect, last, message });
+  }
+
+  // Oldest-stuck-first — same priority reasoning as scanAndWarn's sort.
+  candidates.sort((a, b) => new Date(a.last.createdAt) - new Date(b.last.createdAt));
+
+  const batch = candidates.slice(0, MAX_PENDING_RETRIES_PER_RUN);
+  const batchRemaining = candidates.length - batch.length;
+
+  if (!dryRun && batch.length > 0) {
+    ctx.waitUntil(processRetryBatch(env, batch));
+  }
+
+  return {
+    dryRun,
+    openProspectsInGroup: openProspects.length,
+    recentlyActive: toCheck.length,
+    stuckAwaitingReply: candidates.length,
+    retried: dryRun ? 0 : batch.length, // queued in the background, not yet confirmed done
+    wouldRetry: dryRun ? candidates.length : 0,
+    batchRemaining, // > 0 significa que hay que volver a correr el retry para terminar
+    sampleProspectIds: batch.slice(0, 10).map((c) => c.prospect.id),
+  };
+}
+
+// Deliberately thin: processInboundMessage() already re-verifies the
+// human-owned gate, dedup, whatsapp_enabled kill switch, and everything else
+// a real inbound webhook would get — replaying through it means this batch
+// gets those checks fresh at send time for free, not just from the earlier
+// scan. `retry:${last.id}` keeps this out of the way of the dedup key the
+// original webhook delivery already used (which stays marked processed even
+// though it never got a reply), while still deduping two retry-batch runs
+// against each other if this endpoint is called twice in a row.
+async function processRetryBatch(env, batch) {
+  for (const { prospect, last, message } of batch) {
+    try {
+      const phone = message.sender ?? null;
+      if (!phone) continue;
+      const text = (message.content || message.body || "").trim();
+      const attachment = message.attachment ?? null;
+      const channel = SUPPORTED_CHANNELS[last.via];
+
+      await processInboundMessage(
+        {
+          text,
+          phone,
+          prospectId: prospect.id,
+          agentId: null,
+          interactionId: `retry:${last.id}`,
+          channel,
+          attachment,
+        },
+        env
+      );
+    } catch (err) {
+      console.error("processRetryBatch: failed for", prospect.id, err);
+    }
+  }
 }
 
 // Archives stale conversations right away, no WhatsApp message sent — only

@@ -1295,6 +1295,110 @@ el chequeo de `whatsapp_enabled`.
 
 ---
 
+## 5h. `upsertConversation()` sin reintentos ni logging — conversaciones que perdían su estado de escalación en silencio
+
+Bug reportado por JP (2026-08-20): conversaciones marcadas "Interacción
+pendiente" en Zenvia que Sofía nunca vuelve a tocar (caso real: "Vivi
+Hidalgo"). Investigación cruzando `sofia_whatsapp_sessions` contra
+`sofia_conversations` en Supabase: **91 de 1942 sesiones de WhatsApp de los
+últimos 7 días (~4.7%) tenían el historial completo guardado mediante
+`saveSessionWithRetry()` pero ninguna fila correspondiente en
+`sofia_conversations`.**
+
+Causa raíz: a diferencia de toda otra escritura de este archivo
+(`saveSessionWithRetry()`, `sendChannelMessage()`, `transferProspectToAgent()`,
+`getCurrentProspectAgentId()`, `getProspectStatus()` — todas con reintento y
+logging, ver 5g), `upsertConversation()` hacía un `fetch()` de lectura y otro
+de escritura sin `try/catch`, sin revisar `.ok`, y sin ningún registro si
+fallaban. Cuando la escritura fallaba (red, PostgREST, lo que sea), la
+conversación perdía su estado de `escalated`/`message_count` sin dejar
+ningún rastro — ni en `wrangler tail`, ni en `sofia_reliability_events`.
+
+**Importante — esto explica la pérdida de estado, no necesariamente por qué
+el mensaje no llegó al paciente.** En la rama de escalación,
+`sendChannelMessageOrEscalate()` corre *antes* que `upsertConversation()` —
+si el envío ya tuvo éxito, una falla posterior en `upsertConversation()` no
+puede hacer que el mensaje "no llegara". El caso específico de por qué el
+mensaje final de Vivi nunca apareció en el panel de Zenvia sigue bajo
+investigación por separado (ver sección de envío/escalación, no esta).
+
+**Cambios:**
+- `upsertConversation()` ahora reintenta hasta 3 intentos totales (mismo
+  `RETRY_DELAYS_MS` que el resto del archivo), releyendo el estado existente
+  en cada intento (no solo el primero) para no pisar `escalated`/
+  `message_count` con datos obsoletos si un reintento ocurre después de que
+  otro request ya escribió.
+- Si los 3 intentos fallan, se loguea `conversation_upsert_failed` en
+  `sofia_reliability_events` (mismo patrón best-effort que el resto de
+  `logReliabilityEvent()` — nunca bloquea ni puede ser la causa de que el
+  paciente se quede sin respuesta, porque esta función se llama al final de
+  `processInboundMessage()`, después de que ya se intentó responder).
+
+**Nota sobre `event_type` en `sofia_reliability_events`:** la lista en 5g
+(`claude_call_failed` | `zenvia_lookup_failed`) quedó desactualizada — hoy
+también existen `send_failed`, `transfer_failed`, `inbound_message_dropped` y
+`conversation_upsert_failed`. Ver cada sitio de `logReliabilityEvent(...)` en
+`src/index.js` para la lista real y vigente en vez de confiar en el listado
+de este README.
+
+---
+
+## 5i. `POST /cleanup/retry-pending` — reintentar conversaciones "Interacción pendiente" (2026-08-20, NO probado en vivo)
+
+Complemento del fix de 5h: arregla la escritura hacia adelante, pero no hace
+nada por las conversaciones que *ya* quedaron atascadas. Este endpoint es
+para esas — JP pidió explícitamente limitarlo a las que siguen dentro de la
+ventana de 24h de WhatsApp y sin agente humano asignado (no todas las 91).
+
+**Por qué no se puede hacer solo con Supabase:** `sofia_whatsapp_sessions`
+únicamente guarda `phone_hash` (SHA-256, irreversible) — nunca el número de
+teléfono real. Para las conversaciones huérfanas (sin fila en
+`sofia_conversations`, que es donde vive `phone_number`/`prospect_id`) no
+hay forma de saber a quién le pertenecen usando solo datos de Supabase.
+Zenvia sí lo sabe: este endpoint escanea ahí directamente en vez de intentar
+reconstruir la lista desde Supabase.
+
+**Cómo funciona (`retryPendingConversations`):**
+1. `getOpenProspects()` (prospectos con status `followUp`/`unclaimed` en el
+   grupo CEC) ∩ `getRecentlyActiveProspectIds()` (actividad en las últimas 24h)
+   — mismo patrón que ya usa `scanAndWarn()`, sin sweep nuevo.
+2. Para cada uno, trae su propia historia de interacciones (`GET
+   /prospect/{id}/interactions`, siempre chica, sin riesgo del cap de 5000) y
+   se queda solo con los que la *última* interacción sigue siendo del
+   paciente sin respuesta (`message.performer === "integration"`).
+3. Chequea en vivo si ya hay un agente humano asignado
+   (`getCurrentProspectAgentId`, fail-closed igual que en todo el resto del
+   archivo) — si sí, se descarta, no se toca.
+4. Los candidatos que sobreviven se reprocesan literalmente a través de
+   `processInboundMessage()` — el mismo pipeline del webhook real, con
+   `interactionId: "retry:" + <id original>` para no chocar con la
+   deduplicación de la entrega original (que ya quedó marcada como procesada
+   aunque nunca haya recibido respuesta) pero sí deduplicar dos corridas de
+   este mismo endpoint entre sí. Esto es a propósito: hereda el chequeo de
+   "humano ya la tiene" (re-verificado en el momento, no el del escaneo), el
+   kill switch de `whatsapp_enabled`, y el fix de `upsertConversation` de
+   5h — nada de esa lógica se duplica acá.
+
+**Seguridad:** protegido con el mismo `CLEANUP_TRIGGER_SECRET` que
+`scan-and-warn` (header `x-cleanup-secret`), y `dryRun` por defecto (`true`
+salvo `{"dryRun": false}` explícito) — mismo motivo que `scanAndWarn`: esto
+manda mensajes reales a pacientes reales, así que una corrida real tiene que
+ser un opt-in explícito, nunca el default de un POST vacío. Tope de 20 por
+corrida (`MAX_PENDING_RETRIES_PER_RUN`), igual que el resto de los batches de
+este archivo.
+
+**⚠️ No probado en vivo.** Escrito por Claude Code a pedido de JP
+(2026-08-20) para atender el backlog de conversaciones huérfanas encontradas
+en 5h, pero nunca se llamó — ni siquiera con `dryRun:true` — porque esta
+sesión no tiene la `ZENVIA_API_KEY` ni acceso a `wrangler` para desplegarlo o
+probarlo. **Antes de correrlo con `dryRun:false`:**
+1. Desplegar y llamarlo primero con `dryRun:true` (o sin body, es el
+   default) y revisar `stuckAwaitingReply`/`sampleProspectIds` a mano contra
+   Zenvia — confirmar que la lista tiene sentido antes de mandar nada real.
+2. Si el número parece razonable, recién ahí `{"dryRun": false}`.
+
+---
+
 ## 6. Cosas a tener en cuenta / próximos pasos
 
 - **El group ID, los IDs de agentes y el channel de WhatsApp están
