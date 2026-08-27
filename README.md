@@ -1236,13 +1236,42 @@ Zenvia si ese prospecto terminó en venta.
   "Convertido" = `archivingReason` en `converted` ("Venta") o
   `campaignConversion` ("Venta de campaña") — confirmado en vivo vía
   `GET /as-user/archiving-reasons`.
-- El dashboard (`cecmarketing`) lo muestra en Inicio, tarjeta "Conversión
-  de Sofía" — `functions/api/conversion-stats.js` hace de proxy (mismo
-  patrón que `send-birthday.js`, secret nunca llega al navegador).
+- El dashboard (`cecmarketing`) lo muestra en **Métricas Sofía**, tarjeta
+  "Conversión a paciente" — `functions/api/conversion-stats.js` hace de
+  proxy (mismo patrón que `send-birthday.js`, secret nunca llega al
+  navegador). *(Al implementarse vivía en Inicio, pero esa tarjeta se
+  reemplazó por sentimiento en `1171471` del repo del dashboard y el
+  endpoint se quedó meses sin ningún consumidor.)*
 
-**Limitación real:** el número solo va a tener sentido después de que se
-acumulen suficientes conversaciones nuevas — el día que se implementó
-esto arrancó en `0/0`. No es retroactivo.
+**Limitación 1 — no es retroactivo:** el número solo tiene sentido después
+de que se acumulen suficientes conversaciones nuevas; el día que se
+implementó arrancó en `0/0`. Las filas anteriores a 2026-08-05 no tienen
+`prospect_id` y nunca lo van a tener.
+
+**Limitación 2 — tope de 5000, subcuenta silenciosa (2026-08-27):**
+`fetchProspectsByStatus(..., "archived")` hereda el tope duro de 5000 de
+`GET /prospects`, que **no soporta** `offset`/`page`/`cursor` (ver la
+sección de límites de la API de Zenvia más abajo). Para `getOpenProspects()`
+eso no importa —filtra por estados abiertos y se mantiene en ~925— pero el
+conjunto de **archivados solo crece**, así que este tope se alcanza tarde o
+temprano.
+
+Cuando se alcanza, los prospectos que no vinieron en la respuesta se cuentan
+como `sinArchivar` y **la conversión sale más baja de lo real**. La respuesta
+ahora incluye `truncated: true` en ese caso para que el dashboard lo advierta
+en pantalla en vez de presentar un número incompleto como si fuera exacto.
+
+Paginar no es una opción con esta API. El arreglo de fondo sería **persistir
+el `archivingReason` en Supabase** a medida que se observa (una columna en
+`sofia_conversations`), de modo que el histórico se acumule donde no hay tope
+y deje de depender de una consulta capada en cada llamada. No está hecho.
+
+**`detail` (2026-08-27):** la respuesta también trae `detail`, un mapa
+`{ prospect_id: archivingReason }`, para que el dashboard pueda filtrar leads
+individuales por resultado y no solo mostrar el agregado. Ojo: cuando
+`truncated` es `true`, ese mapa marca como `sinArchivar` a prospectos que sí
+podrían haber convertido — no es base confiable para filtrar hasta que se
+resuelva la Limitación 2.
 
 ---
 

@@ -2205,12 +2205,34 @@ async function handleConversionStats(request, env) {
   const archivedProspects = await fetchProspectsByStatus(env, CEC_GROUP_ID, "archived");
   const reasonById = new Map(archivedProspects.map((p) => [p.id, p.archivingReason]));
 
+  // `GET /prospects` tiene un tope duro de 5000 y **no** soporta
+  // offset/page/cursor (ver la sección de límites de la API de Zenvia en el
+  // README), así que acá no se puede paginar como sí se hace en
+  // getRecentlyActiveProspectIds(). Y a diferencia de getOpenProspects() —que
+  // filtra por estados abiertos y se mantiene en ~925— el conjunto de
+  // archivados solo crece, así que este tope se alcanza tarde o temprano.
+  //
+  // Cuando se alcanza, los prospectos que no vinieron en la respuesta se
+  // cuentan como "sinArchivar" y la conversión sale MÁS BAJA de lo real. Se
+  // devuelve el flag para que el dashboard lo advierta, en vez de presentar
+  // un número incompleto como si fuera exacto.
+  const truncated = archivedProspects.length === 5000;
+  if (truncated) {
+    console.error(
+      "handleConversionStats: la lista de archivados llegó al tope de 5000 de Zenvia — la conversión está subcontada"
+    );
+  }
+
   const CONVERTED_REASONS = new Set(["converted", "campaignConversion"]);
   let converted = 0;
   const breakdown = {};
+  // Detalle por prospecto, para que el dashboard pueda filtrar leads
+  // individuales por resultado y no solo mostrar el agregado.
+  const detail = {};
   for (const id of prospectIds) {
     const reason = reasonById.get(id) ?? "sinArchivar";
     breakdown[reason] = (breakdown[reason] || 0) + 1;
+    detail[id] = reason;
     if (CONVERTED_REASONS.has(reason)) converted++;
   }
 
@@ -2219,6 +2241,8 @@ async function handleConversionStats(request, env) {
     converted,
     conversionRate: converted / prospectIds.length,
     breakdown,
+    truncated,
+    detail,
   }), { status: 200, headers: { "content-type": "application/json" } });
 }
 
