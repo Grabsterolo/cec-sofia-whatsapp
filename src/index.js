@@ -2307,28 +2307,55 @@ async function handleProspectPhones(request, env) {
   // porque la estructura no está documentada; el modo shape=1 sirve para
   // confirmar cuál es el real y afinar esta lista si hiciera falta.
   const telefonoDe = (p) =>
+    // Confirmado con ?shape=1: el teléfono vive en el array `phones`, cuyos
+    // elementos son strings, no objetos. Los demás nombres quedan como
+    // respaldo por si algún prospecto viejo tiene otra forma.
+    (Array.isArray(p.phones) ? p.phones.find((x) => typeof x === "string" && x.trim()) : null) ||
     p.phoneNumber || p.phone || p.mobile || p.msisdn ||
     p.contact?.phoneNumber || p.contact?.phone ||
-    (Array.isArray(p.contacts) ? p.contacts.find((c) => c?.phoneNumber || c?.phone)?.phoneNumber : null) ||
     null;
 
+  // `leads` trae el origen publicitario del prospecto — source, utmSource y
+  // providerLeadId. Es la atribución real que no se estaba capturando en
+  // ningún lado: permite ligar una conversación con la campaña que la trajo,
+  // en vez de solo compararlas por tema.
+  const origenDe = (p) => {
+    const l = Array.isArray(p.leads) ? p.leads[0] : null;
+    if (!l) return null;
+    return {
+      source: l.source ?? null,
+      utmSource: l.utmSource ?? null,
+      providerKey: l.providerKey ?? null,
+      providerLeadId: l.providerLeadId ?? null,
+      type: l.type ?? null,
+    };
+  };
+
   const lista = (limite ? prospects.slice(0, limite) : prospects);
-  const conTelefono = {};
+  const filas = [];
   let sinTelefono = 0;
+  // Resumen de orígenes, para ver de un vistazo qué trae Zenvia sin tener
+  // que revisar miles de filas a mano.
+  const porOrigen = {};
   for (const p of lista) {
     const tel = telefonoDe(p);
-    if (tel) conTelefono[p.id] = tel;
-    else sinTelefono++;
+    const origen = origenDe(p);
+    if (!tel) sinTelefono++;
+    const clave = origen ? `${origen.source || "?"} / ${origen.utmSource || "?"}` : "sin lead";
+    porOrigen[clave] = (porOrigen[clave] || 0) + 1;
+    filas.push({ id: p.id, telefono: tel, archivingReason: p.archivingReason ?? null, origen });
   }
 
   return new Response(JSON.stringify({
     status,
+    // Zenvia corta en 5000 y no admite paginación en /prospects: si esto da
+    // exactamente 5000, faltan prospectos por ver.
+    truncado: prospects.length === 5000,
     prospectosRevisados: lista.length,
-    conTelefono: Object.keys(conTelefono).length,
+    conTelefono: filas.length - sinTelefono,
     sinTelefono,
-    // Si esto viene en 0, el teléfono está en un campo con otro nombre:
-    // llamar con ?shape=1 para verlo.
-    telefonos: conTelefono,
+    porOrigen,
+    prospectos: filas,
   }), { status: 200, headers: { "content-type": "application/json" } });
 }
 
