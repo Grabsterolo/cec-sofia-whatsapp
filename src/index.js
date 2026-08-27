@@ -181,6 +181,10 @@ export default {
       return handleProspectPhones(request, env);
     }
 
+    if (request.method === "POST" && url.pathname === "/sync/phones") {
+      return handleSyncPhones(request, env);
+    }
+
     return new Response("Not found", { status: 404 });
   },
 
@@ -2356,6 +2360,70 @@ async function handleProspectPhones(request, env) {
     sinTelefono,
     porOrigen,
     prospectos: filas,
+  }), { status: 200, headers: { "content-type": "application/json" } });
+}
+
+// POST /sync/phones — rellena sofia_conversations.phone_number con los
+// teléfonos que Zenvia sí conoce, cruzando por prospect_id.
+//
+// Supabase solo guardaba phone_hash (SHA-256, irreversible), así que el
+// dashboard no podía mostrar ni buscar por teléfono. Esto lo cambia a
+// propósito: el listado de pacientes lo necesita en claro.
+//
+// Recorre los tres estados en los que puede estar un prospecto. Ojo con el
+// tope: /prospects corta en 5000 por estado y no admite paginación, así que
+// si `archived` viene lleno hay prospectos viejos que no se alcanzan a ver.
+// Por eso la respuesta reporta el conteo por estado y si alguno llegó al tope.
+async function handleSyncPhones(request, env) {
+  const enviado = request.headers.get("x-stats-secret");
+  if (!env.STATS_TRIGGER_SECRET || enviado !== env.STATS_TRIGGER_SECRET) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401, headers: { "content-type": "application/json" },
+    });
+  }
+
+  const estados = ["followUp", "unclaimed", "archived"];
+  const mapa = {};
+  const porEstado = {};
+  const topeAlcanzado = [];
+
+  for (const estado of estados) {
+    const prospects = await fetchProspectsByStatus(env, CEC_GROUP_ID, estado);
+    porEstado[estado] = prospects.length;
+    if (prospects.length === 5000) topeAlcanzado.push(estado);
+    for (const p of prospects) {
+      const tel = Array.isArray(p.phones)
+        ? p.phones.find((x) => typeof x === "string" && x.trim())
+        : null;
+      if (tel && p.id) mapa[p.id] = tel.trim();
+    }
+  }
+
+  const res = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/rpc/sofia_set_phones`, {
+    method: "POST",
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ mapa }),
+  }, 30000);
+
+  if (!res.ok) {
+    return new Response(JSON.stringify({
+      error: `Supabase rechazó la escritura: ${res.status}`,
+      detalle: await res.text(),
+    }), { status: 502, headers: { "content-type": "application/json" } });
+  }
+
+  const resultado = await res.json();
+  return new Response(JSON.stringify({
+    prospectosConTelefono: Object.keys(mapa).length,
+    porEstado,
+    // Si esto trae algún estado, faltaron prospectos por revisar y algunas
+    // conversaciones se quedarán sin teléfono aunque Zenvia lo tenga.
+    topeAlcanzado,
+    supabase: resultado,
   }), { status: 200, headers: { "content-type": "application/json" } });
 }
 
