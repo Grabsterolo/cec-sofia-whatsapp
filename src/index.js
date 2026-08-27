@@ -177,6 +177,10 @@ export default {
       return handleConversionStats(request, env);
     }
 
+    if (request.method === "GET" && url.pathname === "/stats/prospect-phones") {
+      return handleProspectPhones(request, env);
+    }
+
     return new Response("Not found", { status: 404 });
   },
 
@@ -2243,6 +2247,88 @@ async function handleConversionStats(request, env) {
     breakdown,
     truncated,
     detail,
+  }), { status: 200, headers: { "content-type": "application/json" } });
+}
+
+// GET /stats/prospect-phones — de dónde sacar los teléfonos.
+//
+// Contexto: sofia_conversations.phone_number está vacío en todas las filas y
+// solo se guarda phone_hash (SHA-256, irreversible), así que las listas de
+// exclusión para Meta no se pueden armar desde Supabase. Zenvia sí conoce el
+// teléfono — indexa prospectos por número (GET /prospect-by?phoneNumber=) —
+// pero no estaba documentado qué campos trae el objeto Prospect.
+//
+// Dos modos, ambos de SOLO LECTURA:
+//   ?shape=1  -> devuelve únicamente los NOMBRES de campo del primer
+//                prospecto (y de sus objetos anidados un nivel), sin valores.
+//                Sirve para descubrir dónde vive el teléfono sin volcar datos
+//                personales.
+//   (default) -> devuelve el mapa { prospectId: telefono } de los prospectos
+//                que sí lo traen.
+//
+// Devuelve datos personales, así que exige el mismo secreto que
+// /stats/conversion y nunca se expone sin él.
+async function handleProspectPhones(request, env) {
+  if (!env.STATS_TRIGGER_SECRET || request.headers.get("x-stats-secret") !== env.STATS_TRIGGER_SECRET) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const url = new URL(request.url);
+  const status = url.searchParams.get("status") || "archived";
+  const soloEstructura = url.searchParams.get("shape") === "1";
+  const limite = Math.min(parseInt(url.searchParams.get("limit") || "0", 10) || 0, 5000);
+
+  const prospects = await fetchProspectsByStatus(env, CEC_GROUP_ID, status);
+  if (prospects.length === 0) {
+    return new Response(JSON.stringify({ status, total: 0, nota: "Zenvia no devolvió prospectos para ese status." }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  }
+
+  if (soloEstructura) {
+    // Solo nombres de campo — nunca valores. Se baja un nivel en los objetos
+    // anidados porque el teléfono podría estar en algo como contact.phone.
+    const p = prospects[0];
+    const campos = {};
+    for (const [k, v] of Object.entries(p)) {
+      if (v && typeof v === "object" && !Array.isArray(v)) campos[k] = Object.keys(v);
+      else if (Array.isArray(v)) campos[k] = `array[${v.length}]${v[0] && typeof v[0] === "object" ? " de {" + Object.keys(v[0]).join(",") + "}" : ""}`;
+      else campos[k] = typeof v;
+    }
+    return new Response(JSON.stringify({ status, total: prospects.length, campos }, null, 2), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+  }
+
+  // Busca el teléfono donde Zenvia lo pueda tener. Se prueban varios nombres
+  // porque la estructura no está documentada; el modo shape=1 sirve para
+  // confirmar cuál es el real y afinar esta lista si hiciera falta.
+  const telefonoDe = (p) =>
+    p.phoneNumber || p.phone || p.mobile || p.msisdn ||
+    p.contact?.phoneNumber || p.contact?.phone ||
+    (Array.isArray(p.contacts) ? p.contacts.find((c) => c?.phoneNumber || c?.phone)?.phoneNumber : null) ||
+    null;
+
+  const lista = (limite ? prospects.slice(0, limite) : prospects);
+  const conTelefono = {};
+  let sinTelefono = 0;
+  for (const p of lista) {
+    const tel = telefonoDe(p);
+    if (tel) conTelefono[p.id] = tel;
+    else sinTelefono++;
+  }
+
+  return new Response(JSON.stringify({
+    status,
+    prospectosRevisados: lista.length,
+    conTelefono: Object.keys(conTelefono).length,
+    sinTelefono,
+    // Si esto viene en 0, el teléfono está en un campo con otro nombre:
+    // llamar con ?shape=1 para verlo.
+    telefonos: conTelefono,
   }), { status: 200, headers: { "content-type": "application/json" } });
 }
 
