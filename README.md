@@ -8,6 +8,29 @@ Repo de referencia para el patrón de RAG + prompt caching:
 [Grabsterolo/cecmarketing](https://github.com/Grabsterolo/cecmarketing),
 en particular `functions/api/chat.js`.
 
+## 🚨 ESTE WORKER NO SE DESPLIEGA DESDE GIT (confirmado 2026-08-27)
+
+**Un `git push` NO publica nada.** Hay que correr, desde este repo:
+
+```bash
+npx wrangler deploy
+```
+
+El 2026-08-27 dos commits (`afa1f0e` y `86d7e4c`) llevaban horas subidos sin
+estar vivos, y se le reportaron al usuario como desplegados. Se detectó
+llamando a `/stats/conversion` y viendo que no traía los campos nuevos.
+
+**Para verificar qué versión corre en producción**, no mirar `git log`:
+llamar a un endpoint y comprobar si devuelve lo que el código dice. El
+Worker vivo puede estar meses atrás del repo.
+
+Se puede automatizar conectando el repo en Cloudflare → el Worker →
+Settings → Builds. **No se hizo a propósito:** dejaría pasar a producción
+sin revisión, y acá corre la conversación real con pacientes.
+
+El dashboard (`cecmarketing`) sí despliega solo con cada push — no confundir
+un repo con el otro.
+
 ## ⚠️ Estado: EN PRODUCCIÓN — desplegado y con el webhook registrado
 
 Fue "listo para revisión, no desplegado" hasta el 2026-08-19. Ya no —
@@ -1374,6 +1397,59 @@ también existen `send_failed`, `transfer_failed`, `inbound_message_dropped` y
 `conversation_upsert_failed`. Ver cada sitio de `logReliabilityEvent(...)` en
 `src/index.js` para la lista real y vigente en vez de confiar en el listado
 de este README.
+
+---
+
+## 5j. Endpoints agregados el 2026-08-27 (teléfonos y atribución)
+
+### `GET /stats/prospect-phones`
+
+Exploratorio, de solo lectura. Sirvió para descubrir la estructura del objeto
+Prospect de Zenvia, que no estaba documentada.
+
+- `?shape=1` — devuelve solo los NOMBRES de campo del primer prospecto, sin
+  valores. Es el modo seguro para explorar sin volcar datos personales.
+- `?status=archived|followUp|unclaimed`, `?limit=N`
+- Auth: `x-stats-secret` == `STATS_TRIGGER_SECRET`.
+
+**Hallazgos de esa exploración:**
+
+1. **El teléfono vive en `phones`**, un array de *strings* — no en
+   `phoneNumber` ni ninguno de los nombres que se probaron a ciegas. Buscarlo
+   mal devolvía cero teléfonos sin dar ningún error.
+2. **`leads` NO trae atribución publicitaria útil.** Sus campos se llaman
+   `source`, `utmSource`, `providerKey`, `providerLeadId` — pero los valores
+   reales son `source: "WHATSAPP"`, `utmSource: "WHATSAPP"`,
+   `providerKey: "wasp"`, y `providerLeadId` es el teléfono. **No hay campaña
+   ni anuncio.** Meta manda ese dato en sus anuncios click-to-WhatsApp, pero
+   no llega a través de Zenvia. Conviene revisar los estados abiertos por si
+   difieren, pero en `archived` no está.
+3. **El tope de 5.000 se está alcanzando hoy**: la primera llamada a
+   `archived` devolvió exactamente 5000.
+
+### `POST /sync/phones`
+
+Rellena `sofia_conversations.phone_number` con los teléfonos de Zenvia,
+cruzando por `prospect_id`. Recorre los tres estados, arma el mapa y lo
+escribe con la función `sofia_set_phones` de Supabase — un solo UPDATE en vez
+de miles de PATCH.
+
+Resultado del primer corrido: **4.428 prospectos con teléfono en Zenvia,
+3.376 conversaciones actualizadas** (el resto son prospectos de la clínica
+que nunca hablaron con Sofía). Cobertura sobre personas: **36%**.
+
+Devuelve `topeAlcanzado`, que dice qué estados llegaron al límite de 5.000 y
+por lo tanto dejaron prospectos sin ver.
+
+**Ya no es la vía principal:** desde el 2026-08-27 `upsertConversation` guarda
+`phone_number` en cada turno (el Worker ya tenía el número en la mano — lo usa
+para el hash y lo descartaba). Toda conversación nueva queda con su teléfono
+sin depender de Zenvia ni del tope. Este endpoint queda solo para histórico.
+
+**Nota de privacidad:** esto revierte, a pedido explícito del cliente, la
+decisión original de guardar únicamente `phone_hash`. Ahora el teléfono de
+cada paciente se almacena en claro. Protección del lado de Supabase: RLS con
+lectura solo para autenticados, y escritura restringida vía SECURITY DEFINER.
 
 ---
 
