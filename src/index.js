@@ -613,6 +613,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       resetCounters,
       procedureInterest: limitAgility.procedureInterest,
       sentiment: limitAgility.sentiment,
+      phone,
     });
     return;
   }
@@ -675,6 +676,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       resetCounters,
       procedureInterest: failureAgility.procedureInterest,
       sentiment: failureAgility.sentiment,
+      phone,
     });
     return;
   }
@@ -773,6 +775,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     resetCounters,
     procedureInterest: agility.procedureInterest,
     sentiment: agility.sentiment,
+    phone,
   });
 }
 
@@ -1379,6 +1382,7 @@ async function upsertConversation(env, {
   resetCounters,
   procedureInterest,
   sentiment,
+  phone,
 }) {
   const headers = {
     apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1435,6 +1439,13 @@ async function upsertConversation(env, {
               last_interaction_id: interactionId,
               procedure_interest: procedureInterest ?? null,
               sentiment: sentiment ?? null,
+              // El teléfono en claro. El Worker ya lo tiene en la mano en cada
+              // mensaje (lo usa para calcular phone_hash) y hasta ahora lo
+              // descartaba, así que phone_number quedaba vacío y había que
+              // rellenarlo a mano desde Zenvia con /sync/phones — que además
+              // topa en 5000 prospectos. Guardándolo acá, toda conversación
+              // nueva queda con su número sin depender de Zenvia.
+              phone_number: phone ?? null,
               // prospectId doesn't change across turns for the same phone_hash,
               // but writing it every time (instead of only on insert) means any
               // row created before this column existed still gets backfilled the
@@ -1457,6 +1468,7 @@ async function upsertConversation(env, {
               last_interaction_id: interactionId,
               procedure_interest: procedureInterest ?? null,
               sentiment: sentiment ?? null,
+              phone_number: phone ?? null,
             }),
           });
         }
