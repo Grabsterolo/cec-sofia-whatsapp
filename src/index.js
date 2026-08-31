@@ -61,6 +61,19 @@ const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const MAX_LINK_FETCH_BYTES = 1.5 * 1024 * 1024;
 const URL_REGEX = /https?:\/\/[^\s]+/i;
 
+// Hosts fetchLinkTextSnippet() never even tries. Every one of these is
+// behind a login wall or renders client-side, so the fetch could only ever
+// return a JS shell we'd discard anyway (README 5b already documented that
+// outcome as expected) — but "never returns anything useful" turned out to
+// be the cheap half of the problem. See the 2026-08-29 incident on
+// fetchLinkTextSnippet below: these are exactly the links that hang.
+//
+// Meta ad leads (the common case here — a WhatsApp lead that comes in from
+// a Facebook/Instagram ad) already carry the full ad copy inline in the
+// message body, so there is nothing to gain from opening the ad's own URL.
+const SKIP_LINK_HOSTS =
+  /(^|\.)(instagram\.com|facebook\.com|fb\.me|fb\.com|fb\.watch|m\.me|wa\.me|threads\.net|tiktok\.com|x\.com|twitter\.com|linkedin\.com)$/i;
+
 const MESSAGE_LIMIT_REPLIES = [
   "Quiero asegurarme de que le den la mejor ayuda posible con esto, así que la voy a poner en contacto con nuestro equipo — en breve le escriben.",
   "Para que le puedan dar seguimiento como se merece, la voy a poner en contacto con nuestro equipo — en un momentito le contactan.",
@@ -260,7 +273,21 @@ async function handleWebhook(request, env, ctx) {
         try {
           await processInboundMessage(inbound, env);
         } catch (err) {
+          // Console-only until 2026-08-29: a thrown failure here left no
+          // trace in Supabase, so the only way to ever see it was to be
+          // watching `wrangler tail` at that exact moment. Since
+          // claimInteraction() has already marked the interaction processed
+          // by this point, whatever threw took the patient's message with
+          // it permanently — that deserves a row, not just a log line.
+          // Best-effort and awaited inside waitUntil, so it can't itself
+          // become the reason nothing gets recorded.
           console.error("Failed to process inbound message", inbound, err);
+          await logReliabilityEvent(env, {
+            eventType: "inbound_processing_threw",
+            prospectId: inbound?.prospectId ?? null,
+            phoneHash: inbound?.phone ? await sha256Hex(inbound.phone) : null,
+            detail: `processInboundMessage threw (interaction ${inbound?.interactionId ?? "?"}): ${err?.message || err}`,
+          });
         }
       }
     })()
@@ -924,19 +951,49 @@ async function transcribeAudio(env, url) {
 // media posts) will fail here and that's expected, see README. Whatever
 // comes back is untrusted page content, never instructions — callers must
 // wrap it clearly as reference material only.
+//
+// Bug found 2026-08-29 (JP: conversaciones que Sofía deja sin contestar —
+// casos reales "Isabela" y "Andrea", ambos leads de Meta). Two problems,
+// both fixed here:
+//
+// 1. The 6s abort timer was cleared in the inner `finally`, i.e. the moment
+//    the response HEADERS arrived — so `await res.text()` below read the
+//    body with NO timeout and no abort signal still armed. A host that
+//    sends headers fast and then trickles (or never finishes) the body hung
+//    the whole invocation until the platform killed it. Nothing downstream
+//    ran: no reply, no Supabase write, and — because the kill happens
+//    outside any try/catch — no sofia_reliability_events row either. Worse,
+//    claimInteraction() had already marked the interaction processed, so
+//    every Zenvia redelivery of it was deduped away forever. Verified end
+//    to end: Andrea's interaction 6a92eb32c5f28cbdd2c11a69 IS in
+//    sofia_interaction_dedup, her conversation shows "Asignado a Sofia CEC"
+//    in Zenvia (so the claim ran), and she has no row in
+//    sofia_conversations, no session, and no reliability event.
+//    The timer now spans the body read too — one deadline for the whole
+//    operation, which is what it was always meant to be.
+//
+// 2. Both incident links were social (instagram.com/p/..., fb.me/...) —
+//    see SKIP_LINK_HOSTS above. Those are now skipped outright instead of
+//    being fetched to produce a JS shell we'd discard anyway.
 async function fetchLinkTextSnippet(url) {
+  let hostname;
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6000);
-    let res;
-    try {
-      res = await fetch(url, {
-        signal: controller.signal,
-        headers: { "User-Agent": "Mozilla/5.0 (compatible; SofiaCEC/1.0; +https://cec.co.cr)" },
-      });
-    } finally {
-      clearTimeout(timeout);
-    }
+    hostname = new URL(url).hostname;
+  } catch {
+    return null; // not a URL we can reason about — don't try to open it
+  }
+  if (SKIP_LINK_HOSTS.test(hostname)) {
+    console.log("fetchLinkTextSnippet: skipping login-walled/JS-only host", hostname);
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6000);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; SofiaCEC/1.0; +https://cec.co.cr)" },
+    });
     if (!res.ok) return null;
 
     const contentType = res.headers.get("content-type") || "";
@@ -957,8 +1014,12 @@ async function fetchLinkTextSnippet(url) {
 
     return text.length > 30 ? text.slice(0, 3000) : null; // near-empty after stripping = likely a JS-only shell page
   } catch (err) {
+    // AbortError lands here too — i.e. the 6s deadline for the whole
+    // fetch+read now fails this function instead of hanging the invocation.
     console.error("fetchLinkTextSnippet failed", url, err?.message || err);
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 

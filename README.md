@@ -1804,6 +1804,71 @@ conservar.
 
 ---
 
+## 5l. Links de redes sociales colgaban la invocación entera y el mensaje se perdía para siempre (2026-08-29)
+
+JP reportó 15 conversaciones marcadas "Interacción pendiente" en Zenvia que
+Sofía nunca contestó. **Dos de ellas se rastrearon de punta a punta y
+confirman el mecanismo completo:**
+
+| | Isabela | Andrea |
+|---|---|---|
+| prospect | `640602d8212b1300085f54e9` | `6a92eb3275288614ad606feb` |
+| origen | lead de Meta | lead de Facebook |
+| link en el mensaje | `instagram.com/p/DW9IL4SjCwI/` | `fb.me/5Xx1OQPLo` |
+| en Zenvia se ve | "Asignado a Sofia CEC" y nada más | ídem |
+| en `sofia_interaction_dedup` | sí | sí (`6a92eb32c5f28cbdd2c11a69`) |
+| en `sofia_conversations` | **no existe** | **no existe** |
+| sesión / evento de confiabilidad | **ninguno** | **ninguno** |
+
+La fila en `sofia_interaction_dedup` prueba que el webhook **sí llegó** y que
+`claimInteraction()` lo marcó como procesado. El "Asignado a Sofia CEC" en
+Zenvia prueba que `transferProspectToAgent()` alcanzó a correr. Después,
+nada.
+
+**Causa:** en `fetchLinkTextSnippet()` el `clearTimeout` estaba en el
+`finally` **interno**, o sea que el temporizador de 6s se desarmaba apenas
+llegaban los *headers*. El `await res.text()` posterior leía el cuerpo sin
+ningún límite y sin señal de abort armada. Instagram y Facebook mandan
+headers al instante y después no cierran el cuerpo → la invocación quedaba
+colgada hasta que la plataforma la mataba, fuera de todo `try/catch`.
+
+**Por qué se perdía para siempre:** `claimInteraction()` marca *antes* de
+procesar, así que toda redistribución posterior de Zenvia para ese mismo
+`interactionId` choca contra el 409 y se descarta. Es la misma familia de
+falla que 5k documentó para las cancelaciones — `ctx.waitUntil()` arregló
+*esa* causa de muerte, pero no esta, que es un cuelgue real. Por eso los dos
+casos son del 29/08, posteriores al arreglo del 20/08.
+
+**Cambios:**
+- El `clearTimeout` pasó al `finally` externo: los 6s ahora cubren
+  fetch **y** lectura del cuerpo. Verificado contra un servidor local que
+  manda headers y nunca cierra el cuerpo: el patrón viejo se colgaba
+  indefinidamente, el nuevo aborta a los ~1.5s (probado con límite de 1.5s).
+- `SKIP_LINK_HOSTS` — instagram, facebook, fb.me, m.me, wa.me, threads,
+  tiktok, x/twitter, linkedin no se abren nunca. Todas están detrás de login
+  o renderizan por JS, así que sólo devolvían un cascarón que igual se
+  descartaba. Y en un lead de Meta el texto del anuncio ya viene íntegro en
+  el cuerpo del mensaje, así que abrir la URL del anuncio no aporta nada.
+- El `catch` de `handleWebhook` ahora registra `inbound_processing_threw` en
+  `sofia_reliability_events`. Antes era `console.error` solamente: si algo
+  lanzaba ahí, se llevaba el mensaje del paciente y no quedaba rastro salvo
+  que alguien estuviera mirando `wrangler tail` en ese instante.
+
+**Lo que NO cierra este arreglo (pendiente, ver sección 6):**
+`claimInteraction()` sigue marcando antes de procesar. Se tapó el cuelgue
+conocido, pero cualquier otra muerte inesperada de la invocación (límite de
+CPU, límite de subrequests) sigue produciendo pérdida permanente. El arreglo
+de fondo es marcar `completed_at` recién al terminar y permitir reprocesar
+las filas que quedaron sin completar — requiere migración y hay que cuidar
+que no produzca respuestas duplicadas.
+
+**Sin explicar todavía:** los casos donde Sofía sí venía contestando y se
+perdió un mensaje posterior sin link (ej. "Mily Huertas", "Abigail"). El
+gatillo ahí fue otro; hace falta `wrangler tail` en el momento o el arreglo
+de fondo de `claimInteraction()` para descartarlo.
+
+---
+
 ## 6. Cosas a tener en cuenta / próximos pasos
 
 - **El group ID, los IDs de agentes y el channel de WhatsApp están
