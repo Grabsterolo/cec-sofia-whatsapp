@@ -2004,21 +2004,33 @@ Qué mirar en `wrangler tail`:
 correcto, pero deja rastro — si la llave de OpenAI vence, antes el RAG
 quedaba apagado indefinidamente y nadie se enteraba.
 
-### ⚠️ Pendiente de confirmar: el TTL de una hora puede no estar aplicando
+### El TTL de una hora SÍ aplica — confirmado en producción, no cambiar el header
 
-`callClaude()` manda el header beta `prompt-caching-2024-07-31` pero pide
-`ttl: "1h"` en `cache_control`. El endpoint equivalente del dashboard usa
-`extended-cache-ttl-2025-04-11` para lo mismo.
+Al desplegar quedó la sospecha de que el TTL de una hora no estuviera
+surtiendo efecto: `callClaude()` manda el header beta
+`prompt-caching-2024-07-31`, mientras que el endpoint equivalente del
+dashboard usa `extended-cache-ttl-2025-04-11` para pedir lo mismo. Si las
+entradas estuvieran venciendo a los 5 minutos, serían ~$101/mes.
 
-**Si el TTL de una hora no está surtiendo efecto acá, las entradas vencen a
-los 5 minutos.** Medido sobre los huecos reales entre conversaciones (66%
-por debajo de 5 min, 34% entre 5 min y 1 h), la diferencia entre ambos TTL
-es de **~$101/mes**.
+**La sospecha era infundada.** Primeros tres mensajes reales después del
+deploy del 2026-09-03, leídos con `wrangler tail`:
 
-`SOFIA_USAGE` lo resuelve sin adivinar: si se ve `cache_escritura` frecuente
-en vez de `cache_lectura`, el TTL no está aplicando y hay que cambiar el
-header. No se tocó en el mismo cambio para no mezclar una corrección a
-ciegas con tres que sí están medidas.
+```
+cache_lectura  11484 | cache_escritura 0 | sin_cachear 1430 | rag_chunks 6 | mejor_sim 0.661
+cache_lectura  46099 | cache_escritura 0 | sin_cachear  655 | rag_chunks 0 | mejor_sim —
+cache_lectura  46099 | cache_escritura 0 | sin_cachear   51 | rag_chunks 0 | mejor_sim —
+```
+
+103.682 tokens leídos del caché y **cero escrituras**. El caché está
+acertando en todos los mensajes: el TTL de una hora funciona con el header
+que ya está. **No cambiar `prompt-caching-2024-07-31` por
+`extended-cache-ttl-2025-04-11` "por consistencia" con el otro repo** — no
+haría falta, y tocar el header es tocar el caching, que es lo que está bien.
+
+De paso, esas tres líneas confirman lo otro: el deploy está vivo
+(`SOFIA_USAGE` no existía antes) y el umbral se comporta como se diseñó —
+la consulta con `mejor_sim 0.661` usó fragmentos, y las dos sin coincidencia
+clara cayeron al `knowledge_base` completo.
 
 ### Qué vigilar
 
