@@ -657,6 +657,33 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
 
   const claudeData = await callClaude(env, systemBlocks, historyForClaude);
 
+  // Lo único que demuestra que el caching y el RAG están funcionando. Es el
+  // modo de falla más caro que existe porque es silencioso: si alguien mete un
+  // campo dinámico en el system_prompt, el caché deja de acertar, Sofía sigue
+  // respondiendo bien y la factura sube 10× sin que nada avise. Qué mirar:
+  //
+  //   cache_lectura en 0 de forma sostenida → el caché dejó de acertar.
+  //   rag_chunks en 0 de forma sostenida    → el RAG está caído (ver RAG_FAILED).
+  //   rag_mejor_similitud                   → para vigilar el umbral de 0.45
+  //                                           con tráfico real.
+  //
+  // Ojo con cache_escritura: este Worker manda el header beta
+  // `prompt-caching-2024-07-31` pero pide `ttl: "1h"` en cache_control. Si el
+  // TTL de una hora no estuviera surtiendo efecto, las entradas vencerían a
+  // los 5 minutos y se vería como escrituras frecuentes en vez de lecturas.
+  {
+    const uso = claudeData?.usage || {};
+    console.log("SOFIA_USAGE", JSON.stringify({
+      prospectId,
+      cache_lectura: uso.cache_read_input_tokens ?? 0,
+      cache_escritura: uso.cache_creation_input_tokens ?? 0,
+      entrada_sin_cachear: uso.input_tokens ?? 0,
+      salida: uso.output_tokens ?? 0,
+      rag_chunks: chunks.length,
+      rag_mejor_similitud: chunks[0]?.similarity ?? null,
+    }));
+  }
+
   // Make sure the claim call (kicked off above) has actually finished before
   // this invocation ends — Workers don't guarantee in-flight fetches
   // complete once the handler returns without an explicit await.
@@ -1076,7 +1103,7 @@ async function resolveInboundContent(env, { text, attachment }) {
     );
   }
 
-  const contentForHistory = resolvedText || "[mensaje sin texto]";
+  const contentForHistory = resolvedText || PLACEHOLDER_SIN_TEXTO;
   const contentForClaude = imageBlock
     ? [imageBlock, { type: "text", text: resolvedText || "El paciente envió esta imagen sin ningún mensaje de texto." }]
     : contentForHistory;
@@ -1084,12 +1111,25 @@ async function resolveInboundContent(env, { text, attachment }) {
   return { contentForClaude, contentForHistory };
 }
 
+// Lo que se guarda como contenido del turno cuando el paciente mandó una nota
+// de voz, un sticker o una reacción: no hay texto que guardar. Es constante y
+// no literal porque ragSearch() tiene que reconocerlo para NO buscarlo.
+const PLACEHOLDER_SIN_TEXTO = "[mensaje sin texto]";
+
 async function ragSearch(env, history) {
+  // Buscar un "[mensaje sin texto]" no puede dar nada: no hay nada que buscar.
+  // Medido: 49 de 2.937 mensajes de paciente (1,7%) sobre 1.000 sesiones. Hoy
+  // igual se embeben en OpenAI y recuperan seis chunks al azar que terminan en
+  // el prompt de Claude, unos 290 viajes completos al mes para nada.
   const searchQuery = history
-    .filter((m) => m.role === "user")
+    .filter((m) => m.role === "user" && contentToText(m.content).trim() !== PLACEHOLDER_SIN_TEXTO)
     .slice(-2)
     .map((m) => contentToText(m.content))
     .join(" ");
+
+  // Sin texto que buscar, Sofía responde con el knowledge_base completo — que
+  // es la rama cacheada y la más barata por token.
+  if (!searchQuery.trim()) return [];
 
   try {
     const embedRes = await fetchWithTimeout("https://api.openai.com/v1/embeddings", {
@@ -1117,19 +1157,35 @@ async function ragSearch(env, history) {
       body: JSON.stringify({
         query_embedding: queryEmbedding,
         match_count: 6,
-        // 0.5 estaba por debajo del "piso de ruido" real de este corpus:
-        // pares de chunks NO relacionados ya promedian ~0.507 de similitud
-        // coseno entre sí (medido sobre los 79 chunks reales), así que el
-        // umbral casi nunca filtraba nada — match_sofia_chunks devolvía
-        // resultados aunque no hubiera nada realmente relevante, lo cual
-        // apagaba el fallback de mandar el knowledge_base completo.
-        match_threshold: 0.3,
+        // Medido sobre 180 consultas reconstruidas de conversaciones reales de
+        // ESTE Worker (auditoría 2026-09-03), no sobre consultas inventadas.
+        //
+        // El 0.3 se calibró contra la distribución equivocada: la similitud
+        // entre PARES DE CHUNKS (media 0.507), que son textos largos del mismo
+        // dominio y por eso se parecen mucho entre sí. La que importa es
+        // consulta↔chunk, y una consulta de paciente son cuatro palabras mal
+        // escritas: no pasa de 0.74 ni en el mejor caso. Con 0.3 el RAG se
+        // llevaba el 95% de los mensajes y el 27% del contexto inyectado eran
+        // chunks sin relación con la pregunta.
+        //
+        // La distribución real tiene un valle entre 0.40 y 0.45: 70 consultas
+        // por debajo de 0.40, 99 por encima de 0.45, solo 10 en el medio.
+        //
+        // Lo que no llega cae al knowledge_base completo, que contiene todo lo
+        // que contenían los chunks (nunca menos) y es la rama CACHEADA. Es
+        // además la red que atrapa aquello en lo que la búsqueda semántica es
+        // peor: los nombres de marca del CEC. "Preservé™" no supera 0.45 ni
+        // escrito perfecto, pese a tener su propio chunk de 2.543 caracteres.
+        match_threshold: 0.45,
       }),
     });
     if (!ragRes.ok) return [];
     return await ragRes.json();
-  } catch {
-    // RAG falla silenciosamente — Sofía responde igual sin chunks
+  } catch (err) {
+    // Falla en silencio de cara al paciente a propósito: Sofía responde igual
+    // con el knowledge_base completo. Pero SIN rastro, si la llave de OpenAI
+    // vence el RAG queda apagado indefinidamente y nadie se entera.
+    console.error("RAG_FAILED", err?.message || String(err));
     return [];
   }
 }
