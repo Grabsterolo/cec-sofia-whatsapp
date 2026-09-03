@@ -873,7 +873,7 @@ El mensaje de aviso (`INACTIVITY_WARNING_MESSAGE` en `src/index.js`) es un
 copy propio, cálido y formal ("usted"), sin emojis — mismo tono que
 `sofia_config.system_prompt`, aunque este flujo no pasa por Claude.
 
-### `scheduled()` — cron de cierre (cada 30 min, ver `wrangler.toml`)
+### `scheduled()` — cron de reintento de escalaciones (cada 20 min, ver `wrangler.toml`)
 
 1. Lee `sofia_inactivity_cleanup` con `closed_at IS NULL` y
    `warned_at <= now() - 2h`.
@@ -990,16 +990,25 @@ wrangler secret put CLEANUP_TRIGGER_SECRET
 
 ---
 
-## 4. Deploy (manual, pendiente)
+## 4. Deploy (manual — el Worker YA está en producción)
 
 ```bash
 npm install
-wrangler deploy
+npx wrangler deploy
 ```
+
+Decía "pendiente" hasta el 2026-09-03; llevaba meses desplegado. Un push a
+git no publica nada: ver el aviso al inicio de este archivo.
 
 Después de desplegar, `wrangler tail` es la forma más rápida de ver qué
 está pasando en vivo (incluyendo el payload crudo del primer webhook real,
 crítico para confirmar 1.7).
+
+**Ojo al leer `wrangler tail`:** la mayoría de los eventos de `/webhook` son
+acuses de estado de Zenvia y salen con `outcome=ok` y CERO logs. Ver un
+webhook pasar NO prueba que el código nuevo esté vivo. Lo que sí lo prueba
+es una línea `SOFIA_USAGE` (ver 5s), que solo existe desde el 2026-09-03 y
+solo se emite cuando entra un mensaje real de paciente.
 
 ---
 
@@ -1512,7 +1521,7 @@ probarlo. **Antes de correrlo con `dryRun:false`:**
 
 ---
 
-## 5j. `fetch()` sin try/catch en 4 funciones del camino de escalación — podían abortar antes de guardar `escalated=true`
+## 5q. `fetch()` sin try/catch en 4 funciones del camino de escalación — podían abortar antes de guardar `escalated=true`
 
 Bug real: caso de microcirugía reconstructiva post-tumor (2026-08-19).
 Sofía le dijo al paciente "le voy a pasar esta información al equipo" y
@@ -1804,7 +1813,7 @@ conservar.
 
 ---
 
-## 5l. Links de redes sociales colgaban la invocación entera y el mensaje se perdía para siempre (2026-08-29)
+## 5r. Links de redes sociales colgaban la invocación entera y el mensaje se perdía para siempre (2026-08-29)
 
 JP reportó 15 conversaciones marcadas "Interacción pendiente" en Zenvia que
 Sofía nunca contestó. **Dos de ellas se rastrearon de punta a punta y
@@ -1887,3 +1896,134 @@ de fondo de `claimInteraction()` para descartarlo.
   registrar el webhook de verdad.
 - Reevaluar el modelo `claude-sonnet-5` antes del 2026-08-31 (fin del precio
   promocional mencionado).
+
+---
+
+## 5s. El RAG mandaba 27% de contexto sin relación con la pregunta, y no había forma de saber si el caching funcionaba (2026-09-03)
+
+Auditoría del RAG y el prompt caching, medida contra el índice y el tráfico
+reales. El informe completo vive en el otro repo:
+`cecmarketing/docs/AUDITORIA_RAG_CACHING_2026-09-03.html`.
+
+### Lo que estaba mal: el umbral se calibró contra la distribución equivocada
+
+El comentario que acompañaba a `match_threshold: 0.3` decía que "pares de
+chunks NO relacionados ya promedian ~0.507 de similitud". Eso es cierto —se
+verificó, da 0.5073 sobre los 5.356 pares posibles— pero **no viene al
+caso**: los chunks son textos largos del mismo dominio, escritos por la
+misma persona, sobre la misma clínica. Se parecen entre sí por
+construcción.
+
+La distribución que importa es **consulta↔chunk**, y una consulta de
+paciente son cuatro palabras mal escritas. Nunca llega ni a 0.75.
+
+Además, el commit que introdujo el 0.3 (`7d6ef04`) dice buscar que el
+fallback del `knowledge_base` completo se active más seguido — y para eso
+BAJA el umbral, que lo activa menos. La acción iba en contra del objetivo
+declarado.
+
+### Cómo se midió
+
+Se reconstruyó la consulta de búsqueda **exactamente como la arma
+`ragSearch()`** (últimos 2 mensajes del usuario concatenados), turno por
+turno, sobre 400 sesiones reales de `sofia_whatsapp_sessions`: 1.148 turnos,
+894 consultas únicas, de las que se muestrearon 180 estratificadas entre
+primeros turnos y posteriores.
+
+| umbral | usan RAG | sim. media de lo inyectado | del contexto inyectado, cuánto es ruido |
+|---|---|---|---|
+| 0.30 (antes) | 171 (95%) | 0.460 | **27%** |
+| 0.45 (ahora) | 99 (55%) | 0.552 | 0% |
+
+La distribución tiene un **valle real entre 0.40 y 0.45**: 70 consultas por
+debajo de 0.40, 99 por encima de 0.45, y solo 10 en el medio. El corte
+separa dos poblaciones en vez de partir una.
+
+### Por qué el fallback no es un modo degradado
+
+El `knowledge_base` completo contiene todo lo que contenían los chunks
+—nunca menos información— y además es la rama **cacheada**: 22.700 tokens a
+$0.20/MTok cuestan menos del doble que 1.400 tokens sin cachear a
+$2.00/MTok. El RAG entero ahorra unos $30/mes, no es la palanca de costo
+que parece: es una palanca de precisión.
+
+Y es la red que atrapa aquello en lo que la búsqueda semántica es peor,
+que son **las marcas propias del CEC**:
+
+| consulta | similitud del chunk correcto |
+|---|---|
+| `Cual es el costo aprox de preserve?` (como lo escribe el paciente) | 0.352 |
+| `Cuál es el costo aproximado de Preservé™?` (perfecto) | 0.446 |
+| `lipopapada cuanto cuesta` | 0.390 |
+| `cuánto cuesta la lipo de papada` | 0.648 |
+
+Preservé™ tiene su propio chunk de 2.543 caracteres y **no llega a 0.45 ni
+escrito perfecto**. No es problema de tildes: un embedding no tiene con qué
+relacionar un nombre inventado, porque no significa nada en español. Con
+0.45 esas consultas caen al `knowledge_base`, que sí lo contiene. Antes
+funcionaban por accidente, porque el umbral laxo dejaba pasar el chunk en
+segunda posición.
+
+**Consecuencia práctica para quien edite la base de conocimiento:** agregar
+variantes de escritura ("lipopapada" junto a "lipo de papada", los nombres
+de marca con y sin tilde) es la única forma de mejorar la recuperación de
+nombres propios sin cambiar de tecnología.
+
+### Los otros dos cambios
+
+**No se buscan los mensajes sin texto.** El literal `[mensaje sin texto]`
+se origina en este archivo y ahora es la constante `PLACEHOLDER_SIN_TEXTO`,
+que `ragSearch()` reusa para no buscarlo. Son 49 de 2.937 mensajes de
+paciente (1,7%) sobre 1.000 sesiones. Ojo: `[transcripción de nota de
+voz]: ...` SÍ trae contenido y sigue buscándose.
+
+**`SOFIA_USAGE`.** Una línea por mensaje. Sin esto no había forma de saber
+si el caching funciona, que es el modo de falla más caro que existe porque
+es silencioso: basta un campo dinámico de más en el `system_prompt` para
+que el caché deje de acertar, Sofía siga respondiendo bien y la factura
+suba 10× sin que nada avise.
+
+```
+SOFIA_USAGE {"prospectId":"...","cache_lectura":7700,"cache_escritura":0,
+             "entrada_sin_cachear":1350,"salida":180,
+             "rag_chunks":4,"rag_mejor_similitud":0.58}
+```
+
+Qué mirar en `wrangler tail`:
+
+| señal | qué significa |
+|---|---|
+| `cache_lectura` en 0 de forma sostenida | el caché dejó de acertar — alguien tocó el prefijo del prompt |
+| `cache_escritura` alto y repetido | las entradas están venciendo antes de tiempo (ver abajo) |
+| `rag_chunks: 0` de forma sostenida | el RAG está caído — buscar `RAG_FAILED` |
+| `rag_chunks: 0` en ~45% de los mensajes | **esperado** con el umbral en 0.45 |
+| `rag_mejor_similitud` | para revisar el umbral con tráfico real |
+
+`ragSearch()` además dejó de tener el `catch` vacío: ahora emite
+`RAG_FAILED`. Sigue fallando en silencio de cara al paciente, que es lo
+correcto, pero deja rastro — si la llave de OpenAI vence, antes el RAG
+quedaba apagado indefinidamente y nadie se enteraba.
+
+### ⚠️ Pendiente de confirmar: el TTL de una hora puede no estar aplicando
+
+`callClaude()` manda el header beta `prompt-caching-2024-07-31` pero pide
+`ttl: "1h"` en `cache_control`. El endpoint equivalente del dashboard usa
+`extended-cache-ttl-2025-04-11` para lo mismo.
+
+**Si el TTL de una hora no está surtiendo efecto acá, las entradas vencen a
+los 5 minutos.** Medido sobre los huecos reales entre conversaciones (66%
+por debajo de 5 min, 34% entre 5 min y 1 h), la diferencia entre ambos TTL
+es de **~$101/mes**.
+
+`SOFIA_USAGE` lo resuelve sin adivinar: si se ve `cache_escritura` frecuente
+en vez de `cache_lectura`, el TTL no está aplicando y hay que cambiar el
+header. No se tocó en el mismo cambio para no mezclar una corrección a
+ciegas con tres que sí están medidas.
+
+### Qué vigilar
+
+**El fallback pasó del 5% al 45% del tráfico.** Con 22.700 tokens el modelo
+tiene que encontrar la respuesta ahí dentro. El riesgo de dilución es bajo
+con Sonnet 5 y la rama ya estaba probada en producción, pero conviene leer
+conversaciones reales los primeros días. `rag_chunks: 0` marca exactamente
+cuáles tomaron esa rama.
