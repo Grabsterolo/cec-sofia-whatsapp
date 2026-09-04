@@ -2032,6 +2032,58 @@ De paso, esas tres líneas confirman lo otro: el deploy está vivo
 la consulta con `mejor_sim 0.661` usó fragmentos, y las dos sin coincidencia
 clara cayeron al `knowledge_base` completo.
 
+### La trampa del caché: NO cachear los fragmentos del RAG
+
+Revisado el 2026-09-04, con los tokens que reporta la propia API en vez de
+estimados. Primero, la corrección: el ratio real de este corpus es **2,31
+caracteres por token**, no 3,6 — el español con markdown y marcas como
+"Preservé™" o "HArmonyCA™" se fragmenta mucho más. Las cifras de tokens de la
+sección anterior estaban un 38% por debajo. Las reales:
+
+| bloque | caracteres | tokens reales |
+|---|---:|---:|
+| `system_prompt` | 27.842 | 11.484 |
+| knowledge_base completo | 81.676 | 34.615 |
+| sección 6 (promociones) | 4.463 | 2.085 |
+
+**A dónde se va la factura (~$166/mes):**
+
+| | |
+|---|---:|
+| fragmentos del RAG (sin cachear) | $50,5 — 30% |
+| `system_prompt` (cacheado, todos los mensajes) | $39,8 — 24% |
+| knowledge_base completo (cacheado, 31% del tráfico) | $37,2 — 22% |
+| salida | $20,8 — 13% |
+| historial + hora (sin cachear) | $12,5 — 8% |
+| bloque de promociones | $5,0 — 3% |
+
+**El prompt caching ahorra $738/mes (84%)** — sin él la factura sería $883.
+**El RAG ahorra $27/mes (16%).** Son dos escalas distintas: si alguien
+propone quitar el RAG para ahorrar, el número es $27; si alguien toca el
+caching sin querer, son $738.
+
+**La trampa.** El bloque de fragmentos es el único grande sin `cache_control`,
+y es tentador "unificarlo" con los otros, que llevan `ttl: "1h"`. Sobre 12.519
+consultas reales solo el 26% se repite, así que el 74% pagaría escritura:
+
+```
+hoy, sin cachear ........ 1.00x   <- lo correcto
+con ttl "1h" ............ 1.50x   <- +$25/mes
+con ttl 5min ............ 0.95x   <- 5% mejor, no vale la complejidad
+```
+
+Copiar el `"1h"` de los bloques de arriba parece consistencia y es un 50% más
+caro sobre la línea más cara de la factura.
+
+**Y no bajar `match_count` de 6 a 4** para ahorrar: los fragmentos 5 y 6 no
+son ruido. La similitud cae de 0,602 en el #1 a 0,529 en el #6 — apenas
+0,094. Se perdería contexto bueno en el 81% de las consultas por $17/mes. Lo
+seguro es el corte relativo (descartar lo que esté >0,12 bajo el mejor), que
+solo se activa en el 19% de los casos.
+
+**El umbral tampoco es palanca de costo.** Moverlo de 0,45 a 0,42 ahorraría
+$1,80/mes. Ese número se fija solo por calidad.
+
 ### Qué vigilar
 
 **El fallback pasó del 5% al 45% del tráfico.** Con 22.700 tokens el modelo
