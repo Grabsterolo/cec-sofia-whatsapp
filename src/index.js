@@ -1190,6 +1190,39 @@ async function ragSearch(env, history) {
   }
 }
 
+// La sección 6 del knowledge_base (promociones del mes) es la única que Sofía
+// DEBE tener siempre delante, aunque el RAG no la traiga.
+//
+// El motivo, medido el 2026-09-04 sobre conversaciones de este Worker: el
+// system_prompt le ordena mencionar el precio promocional "de forma proactiva,
+// aunque no te lo pidan", para los tratamientos "que tienen promoción vigente
+// en la sección 6" — y le da un ejemplo textual ("Este mes tenemos Botox full
+// face en $400, antes $550"). Pero el RAG casi nunca le entrega la sección 6:
+// ante "flacidez abdominal" le llegan Trilipo, BodyFX y Abdominoplastia, y
+// ningún fragmento de promociones. Se le pide comprobar si un tratamiento está
+// en una lista que no puede ver. Sin poder verificar, la instrucción proactiva
+// gana y emite el molde del ejemplo con los números borrados: "Este mes
+// tenemos una promoción especial en el tratamiento, con precio preferencial
+// frente al valor regular". Trilipo NO tiene promoción. 26 mensajes en 11 días
+// lo hicieron, y varios escalaron a un asesor con el paciente ya comprometido
+// ("paciente solicita precio de paquete promocional de Trilipo, no confirmado
+// en base de conocimiento").
+//
+// El RAG, al enfocar el contexto, le quita justamente la evidencia NEGATIVA:
+// con el knowledge_base completo vería la lista entera y notaría que su
+// tratamiento no está en ella. Por eso la sección va aparte y siempre.
+function extraerPromociones(knowledgeBase) {
+  if (!knowledgeBase) return null;
+  const inicio = knowledgeBase.search(/^## 6\.\s/m);
+  if (inicio === -1) return null;
+  const resto = knowledgeBase.slice(inicio);
+  const finPrimeraLinea = resto.indexOf("\n");
+  if (finPrimeraLinea === -1) return resto.trim() || null;
+  const siguiente = resto.slice(finPrimeraLinea).search(/^## /m);
+  const seccion = siguiente === -1 ? resto : resto.slice(0, finPrimeraLinea + siguiente);
+  return seccion.trim() || null;
+}
+
 function buildSystemBlocks(system, knowledge_base, chunks) {
   const systemBlocks = [
     {
@@ -1207,6 +1240,28 @@ function buildSystemBlocks(system, knowledge_base, chunks) {
   ];
 
   if (chunks.length > 0) {
+    // Va ANTES de los fragmentos y con su propio cache_control: es estático
+    // entre mensajes (cambia una vez al mes), así que se lee a 0,1x en vez de
+    // pagarse como entrada nueva. Sin cachear costaría 10 veces más
+    // (~$30/mes en vez de ~$3). Solo en esta rama: en la del respaldo el
+    // knowledge_base completo ya la contiene y duplicarla no aporta nada.
+    const promociones = extraerPromociones(knowledge_base);
+    if (promociones) {
+      systemBlocks.push({
+        type: "text",
+        text:
+          "PROMOCIONES VIGENTES — ESTA ES LA LISTA COMPLETA.\n" +
+          "Si el tratamiento por el que pregunta el paciente NO aparece acá, no tiene promoción este mes: " +
+          "no le ofrezcas precio promocional ni le digas que hay una promoción para él.\n\n" +
+          promociones,
+        cache_control: { type: "ephemeral", ttl: "1h" },
+      });
+    } else {
+      // Si alguien renombra el encabezado "## 6." desde el dashboard, esta
+      // protección desaparece en silencio y Sofía vuelve a inventar promos.
+      console.error("PROMOCIONES_NO_EXTRAIDAS", "no se encontró la sección 6 en knowledge_base");
+    }
+
     systemBlocks.push({
       type: "text",
       text:
