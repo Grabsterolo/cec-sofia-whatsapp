@@ -208,21 +208,88 @@ const FOLLOWUP_HOUR_END_CR = 19;
 // scanAndWarn ya demostró que 20 elementos a 3 subrequests es seguro (ver
 // CLEANUP_BATCH_LIMIT: por encima, el lote se cortaba en silencio al pasarse
 // del límite por invocación de Cloudflare). A 5 por elemento, el equivalente
-// es 12. Con el cron cada 20 min son ~360 al día de capacidad contra ~87
-// necesarios: sigue sobrando de largo.
-const FOLLOWUP_MAX_PER_RUN = 12;
+// era 12. Con la redacción contextual son 6 por candidato (se suma la llamada
+// a Haiku; el historial se trae en UNA consulta para todo el lote, no una por
+// candidato), así que baja a 10. Con dos corridas por hora en horario hábil
+// son ~200 al día de capacidad contra ~87 necesarios.
+const FOLLOWUP_MAX_PER_RUN = 10;
 
-// ⚠️ COPY PENDIENTE DE APROBACIÓN DEL CEC.
-// Deliberadamente NO promete nada: ni precio, ni descuento, ni promoción, ni
-// disponibilidad. Sofía ya prometió una promoción de Trilipo que no existía
-// (commit f60755d); un mensaje proactivo con una oferta adentro es esa misma
-// trampa servida en bandeja. Qué ofrecer acá es la decisión comercial que de
-// verdad mueve el 53% de abandono del guion de precio — cuando el CEC la tome,
-// se cambia este texto y se mide contra derived_to_appointment.
-const FOLLOWUP_MESSAGE =
-  "Hola 😊 Le escribo del Centro Europeo de Cirugía. Vi que quedó abierta " +
-  "nuestra conversación y quería saber si le puedo ayudar con algo más o " +
-  "aclararle alguna duda. Quedo atenta.";
+// Respaldo determinista. Se usa cuando la redacción contextual falla o cuando
+// lo que devuelve no pasa el validador de abajo. Sin emojis, y no promete nada.
+const FOLLOWUP_MESSAGE_FALLBACK =
+  "Buen día, le escribo del Centro Europeo de Cirugía. Quedó abierta nuestra " +
+  "conversación y quería saber si le puedo ayudar con algo más o aclararle " +
+  "alguna duda.";
+
+// Palabras que NUNCA pueden aparecer en un mensaje que sale solo, sin que
+// nadie lo lea antes. Sofía ya prometió una promoción de Trilipo que no
+// existía (f60755d) teniendo a un paciente enfrente; un mensaje proactivo,
+// automático y sin supervisión es esa misma trampa con menos frenos. Si el
+// modelo mete cualquiera de estas, se descarta su redacción y sale el
+// respaldo. El costo de un falso positivo es un mensaje genérico; el de un
+// falso negativo es una promesa falsa de la clínica.
+const FOLLOWUP_PROHIBIDO =
+  /(promoci|descuent|oferta|gratis|precio|costo|cuesta|vale\s|₡|\$|disponib|cupo|garant|resultado asegurado)/i;
+
+// Redacta un seguimiento que retome lo que el paciente venía consultando.
+// Haiku y no Sonnet: es una sola frase sobre un historial corto, no hace falta
+// el modelo caro. Sin RAG y sin la base de conocimiento a propósito — no tiene
+// que informar de nada, solo retomar. Menos contexto es menos superficie para
+// inventar.
+async function redactarSeguimiento(env, messages) {
+  const historial = (messages || [])
+    .slice(-6)
+    .map((m) => `${m.role === "user" ? "Paciente" : "Sofía"}: ${m.content}`)
+    .join("\n");
+  if (!historial) return FOLLOWUP_MESSAGE_FALLBACK;
+
+  try {
+    const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 150,
+        system:
+          "Sos Sofía, del Centro Europeo de Cirugía. El paciente dejó de responder hace un par de " +
+          "horas. Escribí UN mensaje de WhatsApp para retomar la conversación.\n\n" +
+          "REGLAS ESTRICTAS:\n" +
+          "- Máximo 2 oraciones.\n" +
+          "- Mencioná concretamente el tema o procedimiento que el paciente venía consultando, " +
+          "para que se note que no es un mensaje automático.\n" +
+          "- NO des precios, costos, promociones, descuentos ni disponibilidad de agenda. " +
+          "NO prometas resultados. NO inventes nada que no esté en la conversación.\n" +
+          "- NO uses emojis.\n" +
+          "- Usted, no vos. Tono cálido y profesional, sin exagerar.\n" +
+          "- Respondé SOLO con el texto del mensaje, sin comillas ni explicación.",
+        messages: [{ role: "user", content: `Conversación:\n${historial}` }],
+      }),
+    });
+    if (!res.ok) {
+      console.error("redactarSeguimiento: Claude respondió", res.status);
+      return FOLLOWUP_MESSAGE_FALLBACK;
+    }
+    const data = await res.json();
+    const texto = (data?.content || []).find((b) => b.type === "text")?.text?.trim();
+
+    // Validación. Cualquier duda cae al respaldo, nunca al mensaje del modelo.
+    if (!texto) return FOLLOWUP_MESSAGE_FALLBACK;
+    if (texto.length > 320) return FOLLOWUP_MESSAGE_FALLBACK;
+    if (FOLLOWUP_PROHIBIDO.test(texto)) {
+      console.error("redactarSeguimiento: descartado por contenido prohibido");
+      return FOLLOWUP_MESSAGE_FALLBACK;
+    }
+    // Emojis: el prompt los prohíbe, pero el prompt no es un candado.
+    return texto.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, "").replace(/\s{2,}/g, " ").trim();
+  } catch (err) {
+    console.error("redactarSeguimiento falló", err);
+    return FOLLOWUP_MESSAGE_FALLBACK;
+  }
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -969,7 +1036,7 @@ function parseEscalation(rawText) {
 
 async function loadSofiaConfig(env) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_config?select=system_prompt,knowledge_base,whatsapp_enabled&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_config?select=system_prompt,knowledge_base,whatsapp_enabled,followup_enabled&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -977,12 +1044,16 @@ async function loadSofiaConfig(env) {
       },
     }
   );
-  if (!res.ok) return { system: "", knowledge_base: "", whatsapp_enabled: true };
+  if (!res.ok) return { system: "", knowledge_base: "", whatsapp_enabled: true, followup_enabled: false };
   const data = await res.json();
   return {
     system: data[0]?.system_prompt || "",
     knowledge_base: data[0]?.knowledge_base || "",
     whatsapp_enabled: data[0]?.whatsapp_enabled ?? true,
+    // Default false y no true: si la columna todavía no existe o la lectura
+    // viene rara, lo seguro es NO escribirle a nadie. Al revés que
+    // whatsapp_enabled, donde lo seguro es seguir contestando.
+    followup_enabled: data[0]?.followup_enabled ?? false,
   };
 }
 
@@ -3267,7 +3338,7 @@ async function findFollowupCandidates(env) {
 // "alguien se queda sin un mensaje" y "alguien que consultó por cirugía
 // estética recibe dos", la segunda es mucho peor. El 409 de la PK es la
 // defensa real contra dos corridas concurrentes del barrido.
-async function reservarCupoDeSeguimiento(env, cand) {
+async function reservarCupoDeSeguimiento(env, cand, mensaje) {
   const res = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_followup_messages`, {
     method: "POST",
     headers: {
@@ -3281,7 +3352,7 @@ async function reservarCupoDeSeguimiento(env, cand) {
       prospect_id: cand.prospect_id,
       conversation_id: cand.id,
       channel: cand.channel,
-      message: FOLLOWUP_MESSAGE,
+      message: mensaje,
       trigger_reason: `silencio ${FOLLOWUP_MIN_SILENCE_HOURS}h+ · ${cand.procedure_code ?? "sin_codigo"} · ${cand.message_count} msgs`,
       dry_run: false,
     }),
@@ -3306,6 +3377,14 @@ async function runFollowupSweep(env, { dryRun }) {
     return { dryRun, skipped: "Sofía está pausada (whatsapp_enabled=false)", enviados: 0 };
   }
 
+  // Interruptor propio del seguimiento, aparte del de Sofía. Son dos decisiones
+  // distintas: "que Sofía conteste" y "que Sofía escriba primero". El CEC puede
+  // querer lo primero sin lo segundo, y apagar el seguimiento no debería
+  // obligar a apagar la atención.
+  if (!cfg.followup_enabled) {
+    return { dryRun, skipped: "seguimiento desactivado (followup_enabled=false)", enviados: 0 };
+  }
+
   if (!estaEnHorarioDeSeguimiento()) {
     return { dryRun, skipped: "fuera de horario (9-19 hora CR)", enviados: 0 };
   }
@@ -3316,6 +3395,30 @@ async function runFollowupSweep(env, { dryRun }) {
   }
 
   const lote = candidatos.slice(0, FOLLOWUP_MAX_PER_RUN);
+
+  // Historial de todo el lote en una sola consulta. Traerlo por candidato
+  // gastaría un subrequest más por cada uno y el presupuesto por invocación es
+  // justo lo que hay que cuidar acá (ver FOLLOWUP_MAX_PER_RUN).
+  const sesiones = new Map();
+  if (lote.length) {
+    const hs = lote.map((c) => `"${c.phone_hash}"`).join(",");
+    const sesRes = await fetchWithTimeout(
+      `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?select=phone_hash,messages&phone_hash=in.(${hs})`,
+      {
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        },
+      }
+    );
+    if (sesRes.ok) {
+      for (const row of await sesRes.json()) sesiones.set(row.phone_hash, row.messages);
+    } else {
+      // Sin historial no se puede personalizar, pero sí mandar el respaldo:
+      // se registra y se sigue, no se aborta el barrido entero.
+      console.error("runFollowupSweep: no se pudo traer el historial del lote", sesRes.status);
+    }
+  }
   const resultado = {
     dryRun,
     elegibles: candidatos.length,
@@ -3365,17 +3468,22 @@ async function runFollowupSweep(env, { dryRun }) {
       resultado.detalle.push({
         prospectId: cand.prospect_id,
         accion: "se_enviaria",
+        // Se redacta también en seco: el punto de una corrida de prueba es
+        // poder leer el mensaje real antes de que salga, no solo la lista.
+        mensaje: await redactarSeguimiento(env, sesiones.get(cand.phone_hash)),
         procedure_code: cand.procedure_code,
         callado_desde: cand.updated_at,
       });
       continue;
     }
 
-    const cupo = await reservarCupoDeSeguimiento(env, cand);
+    const mensaje = await redactarSeguimiento(env, sesiones.get(cand.phone_hash));
+
+    const cupo = await reservarCupoDeSeguimiento(env, cand, mensaje);
     if (cupo === "ya_existia") { resultado.saltadosPorDuplicado++; continue; }
     if (cupo === "error")      { resultado.fallidos++; continue; }
 
-    const enviado = await sendChannelMessage(env, cand.prospect_id, cand.channel, FOLLOWUP_MESSAGE);
+    const enviado = await sendChannelMessage(env, cand.prospect_id, cand.channel, mensaje);
     if (enviado?.ok) {
       resultado.enviados++;
       resultado.detalle.push({ prospectId: cand.prospect_id, accion: "enviado" });
