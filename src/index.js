@@ -162,6 +162,135 @@ const INACTIVITY_ARCHIVE_REASON = "inactive";
 const PENDING_RETRY_WINDOW_HOURS = 24;
 const MAX_PENDING_RETRIES_PER_RUN = 20;
 
+// ---------------------------------------------------------------------------
+// Seguimiento proactivo — POST /followup/sweep (2026-09-07)
+// ---------------------------------------------------------------------------
+// Sofía le escribe UNA sola vez, y para siempre, a quien se quedó callado
+// después de hablar con ella.
+//
+// SOLO SOBRE SUS PROPIAS CONVERSACIONES, nunca sobre una escalada. No es
+// preferencia, es un impedimento real: Sofía no puede leer lo que escribe un
+// asesor humano. sofia_whatsapp_sessions solo guarda `user`/`assistant` (las
+// 12.099 sesiones tienen alternancia perfecta) porque el eco de cada mensaje
+// de agente se descarta arriba, en extractInboundFromInteraction. Mandar un
+// seguimiento sobre un hilo que no se puede leer es exactamente cómo se
+// contradice un precio que el asesor ya dio, o se re-ofrece una valoración ya
+// agendada. Misma regla de propiedad que ya rige todo este archivo: si hay un
+// humano, Sofía no toca. Los leads que un asesor abandonó son problema de la
+// sección Seguimiento del dashboard, no de un bot escribiéndole encima.
+//
+// SILENCIO MÍNIMO = 2 h. Medido contra las conversaciones reales el
+// 2026-09-07: el 84,4% se extiende menos de 5 minutos y el 91,4% menos de 2
+// horas. Son ráfagas de una sentada, no diálogos largos. A las 2 h la
+// conversación terminó de verdad y todavía es el mismo día para el paciente.
+// (No usar duration_minutes para reverificar esto: está en 0 en las 7.220
+// filas, nadie la escribe nunca.)
+const FOLLOWUP_MIN_SILENCE_HOURS = 2;
+// Tope con colchón. Fuera de las 24 h desde el último mensaje DEL PACIENTE,
+// Zenvia rechaza un mensaje normal y solo pasaría una plantilla aprobada — el
+// CEC solo tiene la de cumpleaños (ver handleSendBirthday). 20 h deja 4 h de
+// margen para que el barrido nunca llegue justo al filo de la ventana.
+const FOLLOWUP_MAX_SILENCE_HOURS = 20;
+// Hora de Costa Rica (UTC-6, sin horario de verano). Un seguimiento a las 3
+// a.m. no se lee como servicio, se lee como spam.
+const FOLLOWUP_HOUR_START_CR = 9;
+const FOLLOWUP_HOUR_END_CR = 19;
+// Cada candidato gasta hasta 5 subrequests: chequeo de agente, luego
+// findPendingCandidate (que trae las interacciones Y vuelve a pedir el agente
+// por su cuenta — redundante, pero se prefiere reusar esa función a mantener
+// una copia de su lógica), envío y registro.
+//
+// No se puede ahorrar el primer chequeo delegándolo en findPendingCandidate:
+// esa función devuelve null tanto cuando un humano tomó la conversación como
+// cuando no hay nada esperando respuesta, y confundir esos dos casos haría que
+// Sofía le escriba encima a un asesor.
+//
+// scanAndWarn ya demostró que 20 elementos a 3 subrequests es seguro (ver
+// CLEANUP_BATCH_LIMIT: por encima, el lote se cortaba en silencio al pasarse
+// del límite por invocación de Cloudflare). A 5 por elemento, el equivalente
+// era 12. Con la redacción contextual son 6 por candidato (se suma la llamada
+// a Haiku; el historial se trae en UNA consulta para todo el lote, no una por
+// candidato), así que baja a 10. Con dos corridas por hora en horario hábil
+// son ~200 al día de capacidad contra ~87 necesarios.
+const FOLLOWUP_MAX_PER_RUN = 10;
+
+// Respaldo determinista. Se usa cuando la redacción contextual falla o cuando
+// lo que devuelve no pasa el validador de abajo. Sin emojis, y no promete nada.
+const FOLLOWUP_MESSAGE_FALLBACK =
+  "Buen día, le escribo del Centro Europeo de Cirugía. Quedó abierta nuestra " +
+  "conversación y quería saber si le puedo ayudar con algo más o aclararle " +
+  "alguna duda.";
+
+// Palabras que NUNCA pueden aparecer en un mensaje que sale solo, sin que
+// nadie lo lea antes. Sofía ya prometió una promoción de Trilipo que no
+// existía (f60755d) teniendo a un paciente enfrente; un mensaje proactivo,
+// automático y sin supervisión es esa misma trampa con menos frenos. Si el
+// modelo mete cualquiera de estas, se descarta su redacción y sale el
+// respaldo. El costo de un falso positivo es un mensaje genérico; el de un
+// falso negativo es una promesa falsa de la clínica.
+const FOLLOWUP_PROHIBIDO =
+  /(promoci|descuent|oferta|gratis|precio|costo|cuesta|vale\s|₡|\$|disponib|cupo|garant|resultado asegurado)/i;
+
+// Redacta un seguimiento que retome lo que el paciente venía consultando.
+// Haiku y no Sonnet: es una sola frase sobre un historial corto, no hace falta
+// el modelo caro. Sin RAG y sin la base de conocimiento a propósito — no tiene
+// que informar de nada, solo retomar. Menos contexto es menos superficie para
+// inventar.
+async function redactarSeguimiento(env, messages) {
+  const historial = (messages || [])
+    .slice(-6)
+    .map((m) => `${m.role === "user" ? "Paciente" : "Sofía"}: ${m.content}`)
+    .join("\n");
+  if (!historial) return FOLLOWUP_MESSAGE_FALLBACK;
+
+  try {
+    const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 150,
+        system:
+          "Sos Sofía, del Centro Europeo de Cirugía. El paciente dejó de responder hace un par de " +
+          "horas. Escribí UN mensaje de WhatsApp para retomar la conversación.\n\n" +
+          "REGLAS ESTRICTAS:\n" +
+          "- Máximo 2 oraciones.\n" +
+          "- Mencioná concretamente el tema o procedimiento que el paciente venía consultando, " +
+          "para que se note que no es un mensaje automático.\n" +
+          "- NO des precios, costos, promociones, descuentos ni disponibilidad de agenda. " +
+          "NO prometas resultados. NO inventes nada que no esté en la conversación.\n" +
+          "- NO uses emojis.\n" +
+          "- Usted, no vos. Tono cálido y profesional, sin exagerar.\n" +
+          "- Respondé SOLO con el texto del mensaje, sin comillas ni explicación.",
+        messages: [{ role: "user", content: `Conversación:\n${historial}` }],
+      }),
+    });
+    if (!res.ok) {
+      console.error("redactarSeguimiento: Claude respondió", res.status);
+      return FOLLOWUP_MESSAGE_FALLBACK;
+    }
+    const data = await res.json();
+    const texto = (data?.content || []).find((b) => b.type === "text")?.text?.trim();
+
+    // Validación. Cualquier duda cae al respaldo, nunca al mensaje del modelo.
+    if (!texto) return FOLLOWUP_MESSAGE_FALLBACK;
+    if (texto.length > 320) return FOLLOWUP_MESSAGE_FALLBACK;
+    if (FOLLOWUP_PROHIBIDO.test(texto)) {
+      console.error("redactarSeguimiento: descartado por contenido prohibido");
+      return FOLLOWUP_MESSAGE_FALLBACK;
+    }
+    // Emojis: el prompt los prohíbe, pero el prompt no es un candado.
+    return texto.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, "").replace(/\s{2,}/g, " ").trim();
+  } catch (err) {
+    console.error("redactarSeguimiento falló", err);
+    return FOLLOWUP_MESSAGE_FALLBACK;
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -198,6 +327,10 @@ export default {
       return handleSyncPhones(request, env);
     }
 
+    if (request.method === "POST" && url.pathname === "/followup/sweep") {
+      return handleFollowupSweep(request, env);
+    }
+
     return new Response("Not found", { status: 404 });
   },
 
@@ -213,7 +346,38 @@ export default {
   // writes-again case that inline retry can't reach. Worst case on bad
   // data is a redundant transfer call to the same agent, not a lost or
   // wrongly-closed conversation.
+  // Dos disparos distintos, y a propósito no comparten invocación.
+  //
+  //   */20  -> retryStuckEscalations: no archiva, no cierra y NO le escribe a
+  //            nadie. Solo reintenta el traspaso de conversaciones que Supabase
+  //            ya tiene marcadas como escaladas y que Zenvia confirma que
+  //            ningún humano tomó todavía.
+  //   5,35  -> runFollowupSweep: este SÍ le escribe a pacientes reales.
+  //
+  // Van separados por dos razones. La primera es el presupuesto de subrequests,
+  // que es por invocación: el barrido gasta hasta 5 por candidato y meterlo en
+  // la misma corrida que el reintento cortaría alguno de los dos en silencio
+  // (es la trampa documentada en CLEANUP_BATCH_LIMIT). La segunda es que los
+  // minutos 5 y 35 nunca coinciden con los múltiplos de 20, así que jamás se
+  // solapan.
+  //
+  // El horario de envío NO se codifica en el cron: la expresión es UTC y la
+  // ventana útil es 9-19 hora de Costa Rica, que cruza la medianoche UTC.
+  // estaEnHorarioDeSeguimiento() lo resuelve dentro de la función, que además
+  // es donde se puede leer y cambiar sin pensar en husos.
+  //
+  // OJO — esto cambia una propiedad que este bloque tenía desde agosto: el cron
+  // ya no es inocuo. Antes ninguna tarea automática le escribía a un paciente.
+  // Lo que hace aceptable el cambio son las guardas de runFollowupSweep, no la
+  // frecuencia: kill switch global, nunca sobre conversación escalada, nunca
+  // sobre una que tomó un humano, nunca a quien está esperando respuesta, un
+  // solo mensaje por persona para siempre (PK de sofia_followup_messages) y
+  // horario diurno. Todas fallan cerrado.
   async scheduled(event, env, ctx) {
+    if (event.cron === "5,35 * * * *") {
+      ctx.waitUntil(runFollowupSweep(env, { dryRun: false }));
+      return;
+    }
     ctx.waitUntil(retryStuckEscalations(env));
   },
 };
@@ -872,7 +1036,7 @@ function parseEscalation(rawText) {
 
 async function loadSofiaConfig(env) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_config?select=system_prompt,knowledge_base,whatsapp_enabled&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_config?select=system_prompt,knowledge_base,whatsapp_enabled,followup_enabled&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -880,12 +1044,16 @@ async function loadSofiaConfig(env) {
       },
     }
   );
-  if (!res.ok) return { system: "", knowledge_base: "", whatsapp_enabled: true };
+  if (!res.ok) return { system: "", knowledge_base: "", whatsapp_enabled: true, followup_enabled: false };
   const data = await res.json();
   return {
     system: data[0]?.system_prompt || "",
     knowledge_base: data[0]?.knowledge_base || "",
     whatsapp_enabled: data[0]?.whatsapp_enabled ?? true,
+    // Default false y no true: si la columna todavía no existe o la lectura
+    // viene rara, lo seguro es NO escribirle a nadie. Al revés que
+    // whatsapp_enabled, donde lo seguro es seguir contestando.
+    followup_enabled: data[0]?.followup_enabled ?? false,
   };
 }
 
@@ -3092,5 +3260,272 @@ async function upsertCleanupRowClosed(env, { prospectId, groupId }) {
       warned_at: null,
       closed_at: new Date().toISOString(),
     }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Seguimiento proactivo (POST /followup/sweep)
+// ---------------------------------------------------------------------------
+// Ver el bloque de constantes FOLLOWUP_* arriba para el porqué de cada umbral
+// y, sobre todo, para por qué esto NUNCA toca una conversación escalada.
+
+// Costa Rica es UTC-6 todo el año (sin horario de verano), así que alcanza con
+// restar 6 a la hora UTC — no hace falta Intl ni una tabla de zonas.
+function estaEnHorarioDeSeguimiento(ahora = new Date()) {
+  const horaCR = (ahora.getUTCHours() - 6 + 24) % 24;
+  return horaCR >= FOLLOWUP_HOUR_START_CR && horaCR < FOLLOWUP_HOUR_END_CR;
+}
+
+// Conversaciones de Sofía que quedaron calladas dentro de la ventana útil.
+//
+// No hace falta comprobar "el último mensaje es de Sofía": si la conversación
+// no está escalada, siempre lo es. Sofía contesta todos los mensajes que
+// recibe, y eso está confirmado en los datos — las 12.099 sesiones tienen
+// exactamente la misma cantidad de mensajes `user` y `assistant`, cero
+// desbalanceadas.
+async function findFollowupCandidates(env) {
+  const ahora = Date.now();
+  const desde = new Date(ahora - FOLLOWUP_MAX_SILENCE_HOURS * 3600_000).toISOString();
+  const hasta = new Date(ahora - FOLLOWUP_MIN_SILENCE_HOURS * 3600_000).toISOString();
+
+  const url =
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations` +
+    `?select=id,phone_hash,prospect_id,channel,procedure_code,message_count,updated_at` +
+    `&escalated=eq.false` +
+    `&message_count=gte.2` +
+    `&prospect_id=not.is.null` +
+    `&phone_hash=not.is.null` +
+    `&or=(derived_to_appointment.is.null,derived_to_appointment.eq.false)` +
+    `&updated_at=gte.${desde}&updated_at=lte.${hasta}` +
+    `&order=updated_at.asc&limit=200`;
+
+  const res = await fetchWithTimeout(url, {
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    },
+  });
+  if (!res.ok) {
+    console.error("findFollowupCandidates failed", res.status, await res.text());
+    return null; // falla cerrado: sin lista, no se manda nada
+  }
+  const candidatos = await res.json();
+  if (!candidatos.length) return [];
+
+  // Descartar a quien ya recibió su único seguimiento. La PK de
+  // sofia_followup_messages lo garantiza igual en el momento de escribir;
+  // esto solo evita gastar subrequests (y hace honesto el dry run).
+  const hashes = candidatos.map((c) => `"${c.phone_hash}"`).join(",");
+  const yaRes = await fetchWithTimeout(
+    `${env.SUPABASE_URL}/rest/v1/sofia_followup_messages?select=phone_hash&phone_hash=in.(${hashes})`,
+    {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+  if (!yaRes.ok) {
+    console.error("findFollowupCandidates: no se pudo leer followup_messages", yaRes.status);
+    return null; // falla cerrado otra vez: sin poder confirmar, no se manda
+  }
+  const yaEscritos = new Set((await yaRes.json()).map((r) => r.phone_hash));
+  return candidatos.filter((c) => !yaEscritos.has(c.phone_hash));
+}
+
+// Reserva el cupo ANTES de enviar. Si el envío falla después, el cupo queda
+// quemado y esa persona no recibe seguimiento nunca — es a propósito. Entre
+// "alguien se queda sin un mensaje" y "alguien que consultó por cirugía
+// estética recibe dos", la segunda es mucho peor. El 409 de la PK es la
+// defensa real contra dos corridas concurrentes del barrido.
+async function reservarCupoDeSeguimiento(env, cand, mensaje) {
+  const res = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_followup_messages`, {
+    method: "POST",
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify({
+      phone_hash: cand.phone_hash,
+      prospect_id: cand.prospect_id,
+      conversation_id: cand.id,
+      channel: cand.channel,
+      message: mensaje,
+      trigger_reason: `silencio ${FOLLOWUP_MIN_SILENCE_HOURS}h+ · ${cand.procedure_code ?? "sin_codigo"} · ${cand.message_count} msgs`,
+      dry_run: false,
+    }),
+  });
+  if (res.status === 409) return "ya_existia"; // otra corrida ganó la carrera
+  if (!res.ok) {
+    console.error("reservarCupoDeSeguimiento falló", res.status, await res.text());
+    return "error";
+  }
+  return "reservado";
+}
+
+async function runFollowupSweep(env, { dryRun }) {
+  // El mismo kill switch de emergencia que corta las respuestas entrantes
+  // (sofia_config.whatsapp_enabled, ver processInboundMessage). Va PRIMERO y no
+  // es negociable: sin esto, apretar el freno desde el dashboard haría que
+  // Sofía dejara de contestar pero siguiera iniciando conversaciones sola, que
+  // es exactamente lo contrario de lo que espera quien aprieta un botón de
+  // pánico. Un bot que no puede responder tampoco debe poder escribir primero.
+  const cfg = await loadSofiaConfig(env);
+  if (!cfg.whatsapp_enabled) {
+    return { dryRun, skipped: "Sofía está pausada (whatsapp_enabled=false)", enviados: 0 };
+  }
+
+  // Interruptor propio del seguimiento, aparte del de Sofía. Son dos decisiones
+  // distintas: "que Sofía conteste" y "que Sofía escriba primero". El CEC puede
+  // querer lo primero sin lo segundo, y apagar el seguimiento no debería
+  // obligar a apagar la atención.
+  if (!cfg.followup_enabled) {
+    return { dryRun, skipped: "seguimiento desactivado (followup_enabled=false)", enviados: 0 };
+  }
+
+  if (!estaEnHorarioDeSeguimiento()) {
+    return { dryRun, skipped: "fuera de horario (9-19 hora CR)", enviados: 0 };
+  }
+
+  const candidatos = await findFollowupCandidates(env);
+  if (candidatos === null) {
+    return { dryRun, error: "No se pudo construir la lista — no se envió nada.", enviados: 0 };
+  }
+
+  const lote = candidatos.slice(0, FOLLOWUP_MAX_PER_RUN);
+
+  // Historial de todo el lote en una sola consulta. Traerlo por candidato
+  // gastaría un subrequest más por cada uno y el presupuesto por invocación es
+  // justo lo que hay que cuidar acá (ver FOLLOWUP_MAX_PER_RUN).
+  const sesiones = new Map();
+  if (lote.length) {
+    const hs = lote.map((c) => `"${c.phone_hash}"`).join(",");
+    const sesRes = await fetchWithTimeout(
+      `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?select=phone_hash,messages&phone_hash=in.(${hs})`,
+      {
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        },
+      }
+    );
+    if (sesRes.ok) {
+      for (const row of await sesRes.json()) sesiones.set(row.phone_hash, row.messages);
+    } else {
+      // Sin historial no se puede personalizar, pero sí mandar el respaldo:
+      // se registra y se sigue, no se aborta el barrido entero.
+      console.error("runFollowupSweep: no se pudo traer el historial del lote", sesRes.status);
+    }
+  }
+  const resultado = {
+    dryRun,
+    elegibles: candidatos.length,
+    enLote: lote.length,
+    pendientesParaLaProximaCorrida: Math.max(candidatos.length - lote.length, 0),
+    enviados: 0,
+    saltadosPorHumano: 0,
+    saltadosPorEsperarRespuesta: 0,
+    saltadosPorDuplicado: 0,
+    fallidos: 0,
+    detalle: [],
+  };
+
+  for (const cand of lote) {
+    // Regla de propiedad, verificada en vivo contra Zenvia y no contra
+    // Supabase: si un humano tomó la conversación, Sofía no escribe. Falla
+    // cerrado — mismo criterio que processInboundMessage.
+    const { agentId, failed } = await getCurrentProspectAgentId(env, cand.prospect_id);
+    if (failed || (agentId && HUMAN_AGENT_IDS.has(agentId))) {
+      resultado.saltadosPorHumano++;
+      resultado.detalle.push({ prospectId: cand.prospect_id, accion: "saltado_humano", agentId, failed });
+      continue;
+    }
+
+    // El paciente puede haber escrito DESPUÉS del último intercambio sin que
+    // quede rastro en Supabase: si ese mensaje se cayó (inbound_message_dropped,
+    // claude_call_failed, send_failed), la fila nunca se actualizó y para el
+    // barrido la conversación parece "callada hace 2 horas". Mandarle entonces
+    // "vi que quedó abierta nuestra conversación" a alguien que está esperando
+    // una respuesta es el peor mensaje en el peor momento.
+    //
+    // findPendingCandidate() ya resuelve exactamente esta pregunta contra
+    // Zenvia —que es la única fuente de verdad acá, porque la sesión solo se
+    // escribe DESPUÉS de que Claude contesta y por eso ninguna de las 12.124
+    // termina con un mensaje de paciente— y devuelve algo solo si el último
+    // mensaje real es del paciente y sigue sin contestar. Si devuelve algo,
+    // esta conversación le toca a /cleanup/retry-pending, que le da lo que de
+    // verdad falta (una respuesta), no un recordatorio.
+    const esperandoRespuesta = await findPendingCandidate(env, cand.prospect_id);
+    if (esperandoRespuesta) {
+      resultado.saltadosPorEsperarRespuesta++;
+      resultado.detalle.push({ prospectId: cand.prospect_id, accion: "saltado_espera_respuesta" });
+      continue;
+    }
+
+    if (dryRun) {
+      resultado.detalle.push({
+        prospectId: cand.prospect_id,
+        accion: "se_enviaria",
+        // Se redacta también en seco: el punto de una corrida de prueba es
+        // poder leer el mensaje real antes de que salga, no solo la lista.
+        mensaje: await redactarSeguimiento(env, sesiones.get(cand.phone_hash)),
+        procedure_code: cand.procedure_code,
+        callado_desde: cand.updated_at,
+      });
+      continue;
+    }
+
+    const mensaje = await redactarSeguimiento(env, sesiones.get(cand.phone_hash));
+
+    const cupo = await reservarCupoDeSeguimiento(env, cand, mensaje);
+    if (cupo === "ya_existia") { resultado.saltadosPorDuplicado++; continue; }
+    if (cupo === "error")      { resultado.fallidos++; continue; }
+
+    const enviado = await sendChannelMessage(env, cand.prospect_id, cand.channel, mensaje);
+    if (enviado?.ok) {
+      resultado.enviados++;
+      resultado.detalle.push({ prospectId: cand.prospect_id, accion: "enviado" });
+    } else {
+      // El cupo ya quedó reservado (ver el comentario de la función): esta
+      // persona no vuelve a entrar al barrido. Se registra para poder verlo.
+      resultado.fallidos++;
+      await logReliabilityEvent(env, {
+        eventType: "send_failed",
+        prospectId: cand.prospect_id,
+        phoneHash: cand.phone_hash,
+        detail: "followup sweep: envío falló tras reintentos, cupo ya consumido",
+      });
+    }
+  }
+
+  return resultado;
+}
+
+// Disparo manual y en seco por defecto — misma convención que scanAndWarn y
+// retry-pending, por la misma razón: esto le escribe a pacientes reales, así
+// que una corrida real tiene que ser una decisión explícita y nunca el
+// resultado de un POST con el cuerpo vacío.
+async function handleFollowupSweep(request, env) {
+  if (!env.CLEANUP_TRIGGER_SECRET || request.headers.get("x-cleanup-secret") !== env.CLEANUP_TRIGGER_SECRET) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {
+    // sin cuerpo o JSON inválido -> dry run, que es el default seguro
+  }
+  const dryRun = body.dryRun !== false;
+
+  const resultado = await runFollowupSweep(env, { dryRun });
+  return new Response(JSON.stringify(resultado), {
+    status: 200,
+    headers: { "content-type": "application/json" },
   });
 }
