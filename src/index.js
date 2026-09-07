@@ -279,7 +279,38 @@ export default {
   // writes-again case that inline retry can't reach. Worst case on bad
   // data is a redundant transfer call to the same agent, not a lost or
   // wrongly-closed conversation.
+  // Dos disparos distintos, y a propósito no comparten invocación.
+  //
+  //   */20  -> retryStuckEscalations: no archiva, no cierra y NO le escribe a
+  //            nadie. Solo reintenta el traspaso de conversaciones que Supabase
+  //            ya tiene marcadas como escaladas y que Zenvia confirma que
+  //            ningún humano tomó todavía.
+  //   5,35  -> runFollowupSweep: este SÍ le escribe a pacientes reales.
+  //
+  // Van separados por dos razones. La primera es el presupuesto de subrequests,
+  // que es por invocación: el barrido gasta hasta 5 por candidato y meterlo en
+  // la misma corrida que el reintento cortaría alguno de los dos en silencio
+  // (es la trampa documentada en CLEANUP_BATCH_LIMIT). La segunda es que los
+  // minutos 5 y 35 nunca coinciden con los múltiplos de 20, así que jamás se
+  // solapan.
+  //
+  // El horario de envío NO se codifica en el cron: la expresión es UTC y la
+  // ventana útil es 9-19 hora de Costa Rica, que cruza la medianoche UTC.
+  // estaEnHorarioDeSeguimiento() lo resuelve dentro de la función, que además
+  // es donde se puede leer y cambiar sin pensar en husos.
+  //
+  // OJO — esto cambia una propiedad que este bloque tenía desde agosto: el cron
+  // ya no es inocuo. Antes ninguna tarea automática le escribía a un paciente.
+  // Lo que hace aceptable el cambio son las guardas de runFollowupSweep, no la
+  // frecuencia: kill switch global, nunca sobre conversación escalada, nunca
+  // sobre una que tomó un humano, nunca a quien está esperando respuesta, un
+  // solo mensaje por persona para siempre (PK de sofia_followup_messages) y
+  // horario diurno. Todas fallan cerrado.
   async scheduled(event, env, ctx) {
+    if (event.cron === "5,35 * * * *") {
+      ctx.waitUntil(runFollowupSweep(env, { dryRun: false }));
+      return;
+    }
     ctx.waitUntil(retryStuckEscalations(env));
   },
 };
@@ -3264,6 +3295,17 @@ async function reservarCupoDeSeguimiento(env, cand) {
 }
 
 async function runFollowupSweep(env, { dryRun }) {
+  // El mismo kill switch de emergencia que corta las respuestas entrantes
+  // (sofia_config.whatsapp_enabled, ver processInboundMessage). Va PRIMERO y no
+  // es negociable: sin esto, apretar el freno desde el dashboard haría que
+  // Sofía dejara de contestar pero siguiera iniciando conversaciones sola, que
+  // es exactamente lo contrario de lo que espera quien aprieta un botón de
+  // pánico. Un bot que no puede responder tampoco debe poder escribir primero.
+  const cfg = await loadSofiaConfig(env);
+  if (!cfg.whatsapp_enabled) {
+    return { dryRun, skipped: "Sofía está pausada (whatsapp_enabled=false)", enviados: 0 };
+  }
+
   if (!estaEnHorarioDeSeguimiento()) {
     return { dryRun, skipped: "fuera de horario (9-19 hora CR)", enviados: 0 };
   }
