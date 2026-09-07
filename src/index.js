@@ -162,6 +162,68 @@ const INACTIVITY_ARCHIVE_REASON = "inactive";
 const PENDING_RETRY_WINDOW_HOURS = 24;
 const MAX_PENDING_RETRIES_PER_RUN = 20;
 
+// ---------------------------------------------------------------------------
+// Seguimiento proactivo — POST /followup/sweep (2026-09-07)
+// ---------------------------------------------------------------------------
+// Sofía le escribe UNA sola vez, y para siempre, a quien se quedó callado
+// después de hablar con ella.
+//
+// SOLO SOBRE SUS PROPIAS CONVERSACIONES, nunca sobre una escalada. No es
+// preferencia, es un impedimento real: Sofía no puede leer lo que escribe un
+// asesor humano. sofia_whatsapp_sessions solo guarda `user`/`assistant` (las
+// 12.099 sesiones tienen alternancia perfecta) porque el eco de cada mensaje
+// de agente se descarta arriba, en extractInboundFromInteraction. Mandar un
+// seguimiento sobre un hilo que no se puede leer es exactamente cómo se
+// contradice un precio que el asesor ya dio, o se re-ofrece una valoración ya
+// agendada. Misma regla de propiedad que ya rige todo este archivo: si hay un
+// humano, Sofía no toca. Los leads que un asesor abandonó son problema de la
+// sección Seguimiento del dashboard, no de un bot escribiéndole encima.
+//
+// SILENCIO MÍNIMO = 2 h. Medido contra las conversaciones reales el
+// 2026-09-07: el 84,4% se extiende menos de 5 minutos y el 91,4% menos de 2
+// horas. Son ráfagas de una sentada, no diálogos largos. A las 2 h la
+// conversación terminó de verdad y todavía es el mismo día para el paciente.
+// (No usar duration_minutes para reverificar esto: está en 0 en las 7.220
+// filas, nadie la escribe nunca.)
+const FOLLOWUP_MIN_SILENCE_HOURS = 2;
+// Tope con colchón. Fuera de las 24 h desde el último mensaje DEL PACIENTE,
+// Zenvia rechaza un mensaje normal y solo pasaría una plantilla aprobada — el
+// CEC solo tiene la de cumpleaños (ver handleSendBirthday). 20 h deja 4 h de
+// margen para que el barrido nunca llegue justo al filo de la ventana.
+const FOLLOWUP_MAX_SILENCE_HOURS = 20;
+// Hora de Costa Rica (UTC-6, sin horario de verano). Un seguimiento a las 3
+// a.m. no se lee como servicio, se lee como spam.
+const FOLLOWUP_HOUR_START_CR = 9;
+const FOLLOWUP_HOUR_END_CR = 19;
+// Cada candidato gasta hasta 5 subrequests: chequeo de agente, luego
+// findPendingCandidate (que trae las interacciones Y vuelve a pedir el agente
+// por su cuenta — redundante, pero se prefiere reusar esa función a mantener
+// una copia de su lógica), envío y registro.
+//
+// No se puede ahorrar el primer chequeo delegándolo en findPendingCandidate:
+// esa función devuelve null tanto cuando un humano tomó la conversación como
+// cuando no hay nada esperando respuesta, y confundir esos dos casos haría que
+// Sofía le escriba encima a un asesor.
+//
+// scanAndWarn ya demostró que 20 elementos a 3 subrequests es seguro (ver
+// CLEANUP_BATCH_LIMIT: por encima, el lote se cortaba en silencio al pasarse
+// del límite por invocación de Cloudflare). A 5 por elemento, el equivalente
+// es 12. Con el cron cada 20 min son ~360 al día de capacidad contra ~87
+// necesarios: sigue sobrando de largo.
+const FOLLOWUP_MAX_PER_RUN = 12;
+
+// ⚠️ COPY PENDIENTE DE APROBACIÓN DEL CEC.
+// Deliberadamente NO promete nada: ni precio, ni descuento, ni promoción, ni
+// disponibilidad. Sofía ya prometió una promoción de Trilipo que no existía
+// (commit f60755d); un mensaje proactivo con una oferta adentro es esa misma
+// trampa servida en bandeja. Qué ofrecer acá es la decisión comercial que de
+// verdad mueve el 53% de abandono del guion de precio — cuando el CEC la tome,
+// se cambia este texto y se mide contra derived_to_appointment.
+const FOLLOWUP_MESSAGE =
+  "Hola 😊 Le escribo del Centro Europeo de Cirugía. Vi que quedó abierta " +
+  "nuestra conversación y quería saber si le puedo ayudar con algo más o " +
+  "aclararle alguna duda. Quedo atenta.";
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -196,6 +258,10 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/sync/phones") {
       return handleSyncPhones(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/followup/sweep") {
+      return handleFollowupSweep(request, env);
     }
 
     return new Response("Not found", { status: 404 });
@@ -3092,5 +3158,224 @@ async function upsertCleanupRowClosed(env, { prospectId, groupId }) {
       warned_at: null,
       closed_at: new Date().toISOString(),
     }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Seguimiento proactivo (POST /followup/sweep)
+// ---------------------------------------------------------------------------
+// Ver el bloque de constantes FOLLOWUP_* arriba para el porqué de cada umbral
+// y, sobre todo, para por qué esto NUNCA toca una conversación escalada.
+
+// Costa Rica es UTC-6 todo el año (sin horario de verano), así que alcanza con
+// restar 6 a la hora UTC — no hace falta Intl ni una tabla de zonas.
+function estaEnHorarioDeSeguimiento(ahora = new Date()) {
+  const horaCR = (ahora.getUTCHours() - 6 + 24) % 24;
+  return horaCR >= FOLLOWUP_HOUR_START_CR && horaCR < FOLLOWUP_HOUR_END_CR;
+}
+
+// Conversaciones de Sofía que quedaron calladas dentro de la ventana útil.
+//
+// No hace falta comprobar "el último mensaje es de Sofía": si la conversación
+// no está escalada, siempre lo es. Sofía contesta todos los mensajes que
+// recibe, y eso está confirmado en los datos — las 12.099 sesiones tienen
+// exactamente la misma cantidad de mensajes `user` y `assistant`, cero
+// desbalanceadas.
+async function findFollowupCandidates(env) {
+  const ahora = Date.now();
+  const desde = new Date(ahora - FOLLOWUP_MAX_SILENCE_HOURS * 3600_000).toISOString();
+  const hasta = new Date(ahora - FOLLOWUP_MIN_SILENCE_HOURS * 3600_000).toISOString();
+
+  const url =
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations` +
+    `?select=id,phone_hash,prospect_id,channel,procedure_code,message_count,updated_at` +
+    `&escalated=eq.false` +
+    `&message_count=gte.2` +
+    `&prospect_id=not.is.null` +
+    `&phone_hash=not.is.null` +
+    `&or=(derived_to_appointment.is.null,derived_to_appointment.eq.false)` +
+    `&updated_at=gte.${desde}&updated_at=lte.${hasta}` +
+    `&order=updated_at.asc&limit=200`;
+
+  const res = await fetchWithTimeout(url, {
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    },
+  });
+  if (!res.ok) {
+    console.error("findFollowupCandidates failed", res.status, await res.text());
+    return null; // falla cerrado: sin lista, no se manda nada
+  }
+  const candidatos = await res.json();
+  if (!candidatos.length) return [];
+
+  // Descartar a quien ya recibió su único seguimiento. La PK de
+  // sofia_followup_messages lo garantiza igual en el momento de escribir;
+  // esto solo evita gastar subrequests (y hace honesto el dry run).
+  const hashes = candidatos.map((c) => `"${c.phone_hash}"`).join(",");
+  const yaRes = await fetchWithTimeout(
+    `${env.SUPABASE_URL}/rest/v1/sofia_followup_messages?select=phone_hash&phone_hash=in.(${hashes})`,
+    {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
+    }
+  );
+  if (!yaRes.ok) {
+    console.error("findFollowupCandidates: no se pudo leer followup_messages", yaRes.status);
+    return null; // falla cerrado otra vez: sin poder confirmar, no se manda
+  }
+  const yaEscritos = new Set((await yaRes.json()).map((r) => r.phone_hash));
+  return candidatos.filter((c) => !yaEscritos.has(c.phone_hash));
+}
+
+// Reserva el cupo ANTES de enviar. Si el envío falla después, el cupo queda
+// quemado y esa persona no recibe seguimiento nunca — es a propósito. Entre
+// "alguien se queda sin un mensaje" y "alguien que consultó por cirugía
+// estética recibe dos", la segunda es mucho peor. El 409 de la PK es la
+// defensa real contra dos corridas concurrentes del barrido.
+async function reservarCupoDeSeguimiento(env, cand) {
+  const res = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_followup_messages`, {
+    method: "POST",
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify({
+      phone_hash: cand.phone_hash,
+      prospect_id: cand.prospect_id,
+      conversation_id: cand.id,
+      channel: cand.channel,
+      message: FOLLOWUP_MESSAGE,
+      trigger_reason: `silencio ${FOLLOWUP_MIN_SILENCE_HOURS}h+ · ${cand.procedure_code ?? "sin_codigo"} · ${cand.message_count} msgs`,
+      dry_run: false,
+    }),
+  });
+  if (res.status === 409) return "ya_existia"; // otra corrida ganó la carrera
+  if (!res.ok) {
+    console.error("reservarCupoDeSeguimiento falló", res.status, await res.text());
+    return "error";
+  }
+  return "reservado";
+}
+
+async function runFollowupSweep(env, { dryRun }) {
+  if (!estaEnHorarioDeSeguimiento()) {
+    return { dryRun, skipped: "fuera de horario (9-19 hora CR)", enviados: 0 };
+  }
+
+  const candidatos = await findFollowupCandidates(env);
+  if (candidatos === null) {
+    return { dryRun, error: "No se pudo construir la lista — no se envió nada.", enviados: 0 };
+  }
+
+  const lote = candidatos.slice(0, FOLLOWUP_MAX_PER_RUN);
+  const resultado = {
+    dryRun,
+    elegibles: candidatos.length,
+    enLote: lote.length,
+    pendientesParaLaProximaCorrida: Math.max(candidatos.length - lote.length, 0),
+    enviados: 0,
+    saltadosPorHumano: 0,
+    saltadosPorEsperarRespuesta: 0,
+    saltadosPorDuplicado: 0,
+    fallidos: 0,
+    detalle: [],
+  };
+
+  for (const cand of lote) {
+    // Regla de propiedad, verificada en vivo contra Zenvia y no contra
+    // Supabase: si un humano tomó la conversación, Sofía no escribe. Falla
+    // cerrado — mismo criterio que processInboundMessage.
+    const { agentId, failed } = await getCurrentProspectAgentId(env, cand.prospect_id);
+    if (failed || (agentId && HUMAN_AGENT_IDS.has(agentId))) {
+      resultado.saltadosPorHumano++;
+      resultado.detalle.push({ prospectId: cand.prospect_id, accion: "saltado_humano", agentId, failed });
+      continue;
+    }
+
+    // El paciente puede haber escrito DESPUÉS del último intercambio sin que
+    // quede rastro en Supabase: si ese mensaje se cayó (inbound_message_dropped,
+    // claude_call_failed, send_failed), la fila nunca se actualizó y para el
+    // barrido la conversación parece "callada hace 2 horas". Mandarle entonces
+    // "vi que quedó abierta nuestra conversación" a alguien que está esperando
+    // una respuesta es el peor mensaje en el peor momento.
+    //
+    // findPendingCandidate() ya resuelve exactamente esta pregunta contra
+    // Zenvia —que es la única fuente de verdad acá, porque la sesión solo se
+    // escribe DESPUÉS de que Claude contesta y por eso ninguna de las 12.124
+    // termina con un mensaje de paciente— y devuelve algo solo si el último
+    // mensaje real es del paciente y sigue sin contestar. Si devuelve algo,
+    // esta conversación le toca a /cleanup/retry-pending, que le da lo que de
+    // verdad falta (una respuesta), no un recordatorio.
+    const esperandoRespuesta = await findPendingCandidate(env, cand.prospect_id);
+    if (esperandoRespuesta) {
+      resultado.saltadosPorEsperarRespuesta++;
+      resultado.detalle.push({ prospectId: cand.prospect_id, accion: "saltado_espera_respuesta" });
+      continue;
+    }
+
+    if (dryRun) {
+      resultado.detalle.push({
+        prospectId: cand.prospect_id,
+        accion: "se_enviaria",
+        procedure_code: cand.procedure_code,
+        callado_desde: cand.updated_at,
+      });
+      continue;
+    }
+
+    const cupo = await reservarCupoDeSeguimiento(env, cand);
+    if (cupo === "ya_existia") { resultado.saltadosPorDuplicado++; continue; }
+    if (cupo === "error")      { resultado.fallidos++; continue; }
+
+    const enviado = await sendChannelMessage(env, cand.prospect_id, cand.channel, FOLLOWUP_MESSAGE);
+    if (enviado?.ok) {
+      resultado.enviados++;
+      resultado.detalle.push({ prospectId: cand.prospect_id, accion: "enviado" });
+    } else {
+      // El cupo ya quedó reservado (ver el comentario de la función): esta
+      // persona no vuelve a entrar al barrido. Se registra para poder verlo.
+      resultado.fallidos++;
+      await logReliabilityEvent(env, {
+        eventType: "send_failed",
+        prospectId: cand.prospect_id,
+        phoneHash: cand.phone_hash,
+        detail: "followup sweep: envío falló tras reintentos, cupo ya consumido",
+      });
+    }
+  }
+
+  return resultado;
+}
+
+// Disparo manual y en seco por defecto — misma convención que scanAndWarn y
+// retry-pending, por la misma razón: esto le escribe a pacientes reales, así
+// que una corrida real tiene que ser una decisión explícita y nunca el
+// resultado de un POST con el cuerpo vacío.
+async function handleFollowupSweep(request, env) {
+  if (!env.CLEANUP_TRIGGER_SECRET || request.headers.get("x-cleanup-secret") !== env.CLEANUP_TRIGGER_SECRET) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {
+    // sin cuerpo o JSON inválido -> dry run, que es el default seguro
+  }
+  const dryRun = body.dryRun !== false;
+
+  const resultado = await runFollowupSweep(env, { dryRun });
+  return new Response(JSON.stringify(resultado), {
+    status: 200,
+    headers: { "content-type": "application/json" },
   });
 }
