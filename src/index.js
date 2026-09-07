@@ -375,7 +375,18 @@ export default {
   // horario diurno. Todas fallan cerrado.
   async scheduled(event, env, ctx) {
     if (event.cron === "5,35 * * * *") {
-      ctx.waitUntil(runFollowupSweep(env, { dryRun: false }));
+      // Se loguea el resultado y no solo se dispara. Un job automático que le
+      // escribe a pacientes tiene que dejar rastro de qué hizo en cada corrida
+      // —incluido cuando no hizo nada y por qué—, o la única forma de saberlo
+      // es mirar filas en la base. También es lo que permite confirmar en
+      // `wrangler tail` que este branch del cron dispara: sin el log, una
+      // corrida que sale por el interruptor apagado es indistinguible de un
+      // cron que nunca se ejecutó.
+      ctx.waitUntil(
+        runFollowupSweep(env, { dryRun: false })
+          .then((r) => console.log("FOLLOWUP_SWEEP", JSON.stringify(r)))
+          .catch((err) => console.error("FOLLOWUP_SWEEP falló", err))
+      );
       return;
     }
     ctx.waitUntil(retryStuckEscalations(env));
