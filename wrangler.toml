@@ -24,7 +24,7 @@ compatibility_date = "2026-07-01"
 #         cruza la medianoche UTC. Ver el comentario de scheduled() en
 #         src/index.js.
 [triggers]
-crons = ["*/20 * * * *", "5,35 * * * *"]
+crons = ["*/20 * * * *", "5,20,35,50 * * * *"]
 
 # Ya no se usa en el código (2026-08-20): la deduplicación de entregas
 # repetidas de webhook se movió a Postgres (tabla sofia_interaction_dedup,

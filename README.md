@@ -958,6 +958,137 @@ detenerse entre sí.
 
 ---
 
+## 2b. Seguimiento proactivo — `POST /followup/sweep` y cron `5,20,35,50`
+
+Sofía le escribe **una sola vez, y para siempre**, a quien se quedó callado
+después de hablar con ella. En producción desde el 2026-09-07 18:05 CR.
+
+### Solo sus propias conversaciones — nunca una escalada
+
+No es preferencia, es un impedimento: **Sofía no puede leer lo que escribe un
+asesor humano.** `sofia_whatsapp_sessions` solo guarda `user`/`assistant`
+porque el eco de cada mensaje de agente se descarta en
+`extractInboundFromInteraction` (`performer !== "integration"`). Mandar un
+seguimiento sobre un hilo que no se puede leer es cómo se contradice un precio
+que el asesor ya dio, o se re-ofrece una valoración ya agendada.
+
+Los leads que un asesor abandonó son problema de la sección Seguimiento del
+dashboard, no de un bot escribiéndoles encima.
+
+### Los umbrales, y de dónde salen
+
+| Constante | Valor | Por qué |
+|---|---|---|
+| `FOLLOWUP_MIN_SILENCE_HOURS` | 2 | El 84,4% de las conversaciones se extiende menos de 5 min y el 91,4% menos de 2 h. Son ráfagas de una sentada. **No usar `duration_minutes` para reverificar esto: está en 0 en las 7.220 filas, nadie la escribe nunca.** |
+| `FOLLOWUP_MAX_SILENCE_HOURS` | 20 | Deja 4 h de colchón antes de las 24 h de la ventana libre de WhatsApp. Fuera de ella solo pasaría una plantilla aprobada, y el CEC solo tiene la de cumpleaños. |
+| `FOLLOWUP_HOUR_START/END_CR` | 9 / 19 | Un seguimiento a las 3 a.m. no se lee como servicio. Va en la función y no en el cron: la expresión cron es UTC y esa ventana cruza la medianoche UTC. |
+| `FOLLOWUP_MAX_PER_RUN` | 8 | 6 subrequests por candidato. `scanAndWarn` demostró que ~60 por invocación es el techo de Cloudflare (ver `CLEANUP_BATCH_LIMIT`). |
+
+**Frecuencia: 4 corridas/hora desde el 2026-09-08** (antes 2). El lote no sube
+—el techo por invocación es el mismo— pero la capacidad diaria pasa de ~160 a
+~320 contra una demanda de ~87. Importa porque **quien pasa de 20 h callado se
+cae de la lista para siempre**: con la cola atascada, la espera no era una
+demora, era un lead perdido.
+
+### Las seis guardas, todas fallan cerrado
+
+1. `sofia_config.whatsapp_enabled` — el mismo freno de emergencia que corta las
+   respuestas. Un bot que no puede responder tampoco debe escribir primero.
+2. `sofia_config.followup_enabled` — interruptor propio, **default false**.
+   Desplegar no debe empezar a mandar mensajes; encenderlo es un acto
+   deliberado desde el dashboard.
+3. Nunca sobre una conversación escalada.
+4. Nunca si un humano tomó el prospecto (`getCurrentProspectAgentId`, en vivo
+   contra Zenvia).
+5. **Nunca a quien está esperando respuesta.** Si a alguien se le cayó un
+   mensaje (`inbound_message_dropped`, `claude_call_failed`, `send_failed`),
+   `updated_at` no se actualizó y el barrido lo vería como "callado hace 2 h".
+   Escribirle *"quedó abierta nuestra conversación"* a alguien que espera sería
+   el peor mensaje en el peor momento. `findPendingCandidate()` lo resuelve
+   contra Zenvia.
+6. **Un mensaje por persona, para siempre.** La PK de
+   `sofia_followup_messages` es `phone_hash` y no `conversation_id` porque un
+   paciente que vuelve NO genera fila nueva. El cupo se reserva **antes** de
+   enviar: si el envío falla esa persona no recibe nada nunca — entre quedarse
+   sin un mensaje y recibir dos, lo segundo es mucho peor.
+
+También se excluye a quien no es paciente. El 2026-09-08 el barrido le escribió
+a un **proveedor de agua destilada**: Claude lo había clasificado bien
+(`procedure_interest` = "No aplica - proveedor") pero la taxonomía lo aplana a
+`generico_sin_procedimiento`. Por eso el filtro va sobre el texto libre y no
+sobre `procedure_code` — ahí es donde sobrevive la señal.
+
+### El mensaje se redacta, no es plantilla
+
+`redactarSeguimiento()` le pasa los últimos 6 turnos a Haiku y pide 1-2
+oraciones que mencionen lo que el paciente venía consultando. Sin RAG y sin
+base de conocimiento: no tiene que informar, solo retomar, y menos contexto es
+menos superficie para inventar. La hora de Costa Rica va en el prompt porque el
+modelo no la sabe — un mensaje de las 18:05 abrió con "Buenos días".
+
+**Y tiene red, porque sale solo y nadie lo lee antes.** Dos reglas:
+
+- `FOLLOWUP_CLAIM` — promociones, descuentos, gratis, cupos, garantías,
+  disponibilidad.
+- `FOLLOWUP_MONTO` — cualquier cifra con símbolo de moneda o seguida de
+  "mil/dólares/colones".
+
+**Ojo con la tentación de bloquear la palabra "precio".** La primera versión lo
+hacía y mandó al respaldo genérico el 14,7% de los mensajes (5 de 34, medidos):
+rechazaba frases sanas como *"quería retomar su consulta sobre el precio de la
+abdominoplastia"*, donde no hay cifra ni promesa. Lo peligroso no es nombrar el
+tema, es **afirmar** algo. Si el filtro dispara, `fallback_reason` guarda por
+qué — sin esa columna, un porcentaje de genéricos es un número sin explicación.
+
+### El mensaje SE GUARDA en el historial
+
+`guardarSeguimientoEnHistorial()` lo **pega al último mensaje de Sofía** en vez
+de agregarlo como turno nuevo: el historial tiene que alternar
+paciente/Sofía y dos turnos seguidos de ella romperían la siguiente llamada a
+Claude.
+
+Sin esto, Sofía no se acuerda de haber escrito. Medido sobre los 10 primeros
+envíos: **0 de 10** estaban en el historial. Si la paciente contesta "sí", no
+sabe a qué; si pregunta "¿cuál valoración?", no sabe de qué le hablan.
+
+Se escribe con la misma `version` que trajo el lote. Si la paciente contestó
+entre medias, el update no encuentra esa version, no pisa nada y se pierde solo
+el pegado — justo el caso donde ya no hace falta, porque el turno nuevo ya trae
+el contexto.
+
+### Costo real (medido, no estimado)
+
+Por seguimiento: ~1.090 tokens de entrada y ~97 de salida a Haiku 4.5
+($1/MTok in, $5/MTok out) = **$0,0016**. Sobre ~2.600/mes son **~$4/mes**, más
+~$6/mes de las conversaciones que se reabren. **Total ~$10/mes** contra una
+factura de entrada de ~$88/mes.
+
+Lo que **no** está medido es Zenvia: el diseño se queda dentro de la ventana de
+24 h justamente para usar la vía libre de Meta, pero ese contrato no está a la
+vista. Buscarlo en la factura antes de subir el volumen.
+
+### Cómo se prueba sin mandar nada
+
+```bash
+curl -s -X POST https://cec-sofia-whatsapp.jpgamboa1309.workers.dev/followup/sweep \
+  -H "x-cleanup-secret: $CLEANUP_TRIGGER_SECRET" \
+  -H "content-type: application/json" -d '{"dryRun":true}' | python3 -m json.tool
+```
+
+El dry run **también redacta** los mensajes y los devuelve en `detalle[].mensaje`
+— el punto de una corrida de prueba es poder leer lo que saldría, no solo la
+lista de a quién.
+
+### Resultados de los dos primeros días
+
+34 enviados, 4 respuestas (15,4%), 1 escaló a un asesor, 0 agendados. Una de las
+respuestas fue *"quiero saber un rango de precios para saber si sale o no de mi
+presupuesto"* — exactamente la objeción que hace abandonar al 62,7% de quienes
+chocan con el guion de precio.
+
+**Agendados es la única cifra que dice si esto sirve**, y depende de que el
+equipo marque el estado en Seguimiento. Volver a mirarla con 200-300 enviados.
+
 ## 3. Variables de entorno necesarias
 
 Ninguna está en el código ni en `wrangler.toml`. Configúralas manualmente:

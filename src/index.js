@@ -222,22 +222,40 @@ const FOLLOWUP_MESSAGE_FALLBACK =
   "conversación y quería saber si le puedo ayudar con algo más o aclararle " +
   "alguna duda.";
 
-// Palabras que NUNCA pueden aparecer en un mensaje que sale solo, sin que
-// nadie lo lea antes. Sofía ya prometió una promoción de Trilipo que no
-// existía (f60755d) teniendo a un paciente enfrente; un mensaje proactivo,
-// automático y sin supervisión es esa misma trampa con menos frenos. Si el
-// modelo mete cualquiera de estas, se descarta su redacción y sale el
-// respaldo. El costo de un falso positivo es un mensaje genérico; el de un
-// falso negativo es una promesa falsa de la clínica.
-const FOLLOWUP_PROHIBIDO =
-  /(promoci|descuent|oferta|gratis|precio|costo|cuesta|vale\s|₡|\$|disponib|cupo|garant|resultado asegurado)/i;
+// Lo que NUNCA puede salir en un mensaje automático que nadie lee antes de
+// enviarlo. Sofía ya prometió una promoción de Trilipo que no existía
+// (f60755d) teniendo a un paciente enfrente; sin supervisión es esa trampa con
+// menos frenos.
+//
+// Son DOS reglas y no una lista de palabras, porque la primera versión —que
+// bloqueaba "precio", "costo" y "cuesta" a secas— mandó al respaldo genérico
+// el 14,7% de los mensajes (5 de 34 medidos el 2026-09-08). Rechazaba frases
+// perfectamente sanas como "quería retomar su consulta sobre el precio de la
+// abdominoplastia", donde no hay ninguna cifra ni promesa: solo se nombra el
+// tema que el paciente ya había preguntado.
+//
+// Lo peligroso no es la palabra "precio", es AFIRMAR algo: una promoción, un
+// descuento, un monto, disponibilidad de agenda o un resultado garantizado.
+// Estas dos reglas cubren eso y dejan pasar las referencias.
+const FOLLOWUP_CLAIM =
+  /(promoci|descuent|oferta|gratis|sin costo|cupo|garant|resultado asegurado|disponibilidad|le aseguro)/i;
+const FOLLOWUP_MONTO =
+  /([$₡]\s*\d|\d[\d.,]*\s*(mil|d[oó]lares|colones|usd|crc))/i;
 
 // Redacta un seguimiento que retome lo que el paciente venía consultando.
 // Haiku y no Sonnet: es una sola frase sobre un historial corto, no hace falta
 // el modelo caro. Sin RAG y sin la base de conocimiento a propósito — no tiene
 // que informar de nada, solo retomar. Menos contexto es menos superficie para
 // inventar.
+// Devuelve { mensaje, motivo, tokensIn, tokensOut }. `motivo` es null cuando
+// la redacción salió bien; si no, dice por qué se cayó al respaldo — sin eso,
+// un porcentaje de mensajes genéricos es un número sin explicación.
 async function redactarSeguimiento(env, messages) {
+  const resp = (mensaje, motivo, u) => ({
+    mensaje, motivo,
+    tokensIn: u?.input_tokens ?? null,
+    tokensOut: u?.output_tokens ?? null,
+  });
   // Hora de Costa Rica (UTC-6 todo el año), para el saludo.
   const h = (new Date().getUTCHours() - 6 + 24) % 24;
   const horaCR = `${String(h).padStart(2, "0")}:00`;
@@ -246,7 +264,7 @@ async function redactarSeguimiento(env, messages) {
     .slice(-6)
     .map((m) => `${m.role === "user" ? "Paciente" : "Sofía"}: ${m.content}`)
     .join("\n");
-  if (!historial) return FOLLOWUP_MESSAGE_FALLBACK;
+  if (!historial) return resp(FOLLOWUP_MESSAGE_FALLBACK, "sin_historial");
 
   try {
     const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
@@ -283,23 +301,23 @@ async function redactarSeguimiento(env, messages) {
     });
     if (!res.ok) {
       console.error("redactarSeguimiento: Claude respondió", res.status);
-      return FOLLOWUP_MESSAGE_FALLBACK;
+      return resp(FOLLOWUP_MESSAGE_FALLBACK, `api_${res.status}`);
     }
     const data = await res.json();
     const texto = (data?.content || []).find((b) => b.type === "text")?.text?.trim();
 
     // Validación. Cualquier duda cae al respaldo, nunca al mensaje del modelo.
-    if (!texto) return FOLLOWUP_MESSAGE_FALLBACK;
-    if (texto.length > 320) return FOLLOWUP_MESSAGE_FALLBACK;
-    if (FOLLOWUP_PROHIBIDO.test(texto)) {
-      console.error("redactarSeguimiento: descartado por contenido prohibido");
-      return FOLLOWUP_MESSAGE_FALLBACK;
-    }
+    const u = data?.usage;
+    if (!texto)               return resp(FOLLOWUP_MESSAGE_FALLBACK, "vacio", u);
+    if (texto.length > 320)   return resp(FOLLOWUP_MESSAGE_FALLBACK, "muy_largo", u);
+    if (FOLLOWUP_CLAIM.test(texto)) return resp(FOLLOWUP_MESSAGE_FALLBACK, "afirmacion_prohibida", u);
+    if (FOLLOWUP_MONTO.test(texto)) return resp(FOLLOWUP_MESSAGE_FALLBACK, "monto_en_el_texto", u);
     // Emojis: el prompt los prohíbe, pero el prompt no es un candado.
-    return texto.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, "").replace(/\s{2,}/g, " ").trim();
+    const limpio = texto.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, "").replace(/\s{2,}/g, " ").trim();
+    return resp(limpio, null, u);
   } catch (err) {
     console.error("redactarSeguimiento falló", err);
-    return FOLLOWUP_MESSAGE_FALLBACK;
+    return resp(FOLLOWUP_MESSAGE_FALLBACK, "excepcion");
   }
 }
 
@@ -364,14 +382,20 @@ export default {
   //            nadie. Solo reintenta el traspaso de conversaciones que Supabase
   //            ya tiene marcadas como escaladas y que Zenvia confirma que
   //            ningún humano tomó todavía.
-  //   5,35  -> runFollowupSweep: este SÍ le escribe a pacientes reales.
+  //   5,20,35,50 -> runFollowupSweep: este SÍ le escribe a pacientes reales.
   //
   // Van separados por dos razones. La primera es el presupuesto de subrequests,
-  // que es por invocación: el barrido gasta hasta 5 por candidato y meterlo en
+  // que es por invocación: el barrido gasta hasta 6 por candidato y meterlo en
   // la misma corrida que el reintento cortaría alguno de los dos en silencio
   // (es la trampa documentada en CLEANUP_BATCH_LIMIT). La segunda es que los
-  // minutos 5 y 35 nunca coinciden con los múltiplos de 20, así que jamás se
-  // solapan.
+  // minutos 5, 20, 35 y 50 nunca coinciden con los múltiplos de 20, así que
+  // jamás se solapan.
+  //
+  // Pasó de 2 a 4 corridas por hora el 2026-09-08. El lote no sube (el techo de
+  // subrequests por invocación es el mismo), pero la capacidad diaria sí: de
+  // ~160 a ~320 contra una demanda de ~87. Importa porque quien pasa de 20h
+  // callado se cae de la lista para siempre — con la cola atascada, la espera
+  // no era una demora, era un lead perdido.
   //
   // El horario de envío NO se codifica en el cron: la expresión es UTC y la
   // ventana útil es 9-19 hora de Costa Rica, que cruza la medianoche UTC.
@@ -386,7 +410,7 @@ export default {
   // solo mensaje por persona para siempre (PK de sofia_followup_messages) y
   // horario diurno. Todas fallan cerrado.
   async scheduled(event, env, ctx) {
-    if (event.cron === "5,35 * * * *") {
+    if (event.cron === "5,20,35,50 * * * *") {
       // Se loguea el resultado y no solo se dispara. Un job automático que le
       // escribe a pacientes tiene que dejar rastro de qué hizo en cada corrida
       // —incluido cuando no hizo nada y por qué—, o la única forma de saberlo
@@ -3379,7 +3403,7 @@ async function findFollowupCandidates(env) {
 // "alguien se queda sin un mensaje" y "alguien que consultó por cirugía
 // estética recibe dos", la segunda es mucho peor. El 409 de la PK es la
 // defensa real contra dos corridas concurrentes del barrido.
-async function reservarCupoDeSeguimiento(env, cand, mensaje) {
+async function reservarCupoDeSeguimiento(env, cand, redaccion) {
   const res = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_followup_messages`, {
     method: "POST",
     headers: {
@@ -3393,7 +3417,10 @@ async function reservarCupoDeSeguimiento(env, cand, mensaje) {
       prospect_id: cand.prospect_id,
       conversation_id: cand.id,
       channel: cand.channel,
-      message: mensaje,
+      message: redaccion.mensaje,
+      fallback_reason: redaccion.motivo,
+      tokens_in: redaccion.tokensIn,
+      tokens_out: redaccion.tokensOut,
       trigger_reason: `silencio ${FOLLOWUP_MIN_SILENCE_HOURS}h+ · ${cand.procedure_code ?? "sin_codigo"} · ${cand.message_count} msgs`,
       dry_run: false,
     }),
@@ -3514,6 +3541,7 @@ async function runFollowupSweep(env, { dryRun }) {
     saltadosPorHumano: 0,
     saltadosPorEsperarRespuesta: 0,
     saltadosPorDuplicado: 0,
+    cayeronAlRespaldo: {},
     fallidos: 0,
     detalle: [],
   };
@@ -3556,16 +3584,19 @@ async function runFollowupSweep(env, { dryRun }) {
         accion: "se_enviaria",
         // Se redacta también en seco: el punto de una corrida de prueba es
         // poder leer el mensaje real antes de que salga, no solo la lista.
-        mensaje: await redactarSeguimiento(env, sesiones.get(cand.phone_hash)?.messages),
+        mensaje: (await redactarSeguimiento(env, sesiones.get(cand.phone_hash)?.messages)).mensaje,
         procedure_code: cand.procedure_code,
         callado_desde: cand.updated_at,
       });
       continue;
     }
 
-    const mensaje = await redactarSeguimiento(env, sesiones.get(cand.phone_hash)?.messages);
+    const redaccion = await redactarSeguimiento(env, sesiones.get(cand.phone_hash)?.messages);
+    const mensaje = redaccion.mensaje;
+    if (redaccion.motivo) resultado.cayeronAlRespaldo[redaccion.motivo] =
+      (resultado.cayeronAlRespaldo[redaccion.motivo] ?? 0) + 1;
 
-    const cupo = await reservarCupoDeSeguimiento(env, cand, mensaje);
+    const cupo = await reservarCupoDeSeguimiento(env, cand, redaccion);
     if (cupo === "ya_existia") { resultado.saltadosPorDuplicado++; continue; }
     if (cupo === "error")      { resultado.fallidos++; continue; }
 
