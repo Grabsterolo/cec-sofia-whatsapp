@@ -1180,6 +1180,38 @@ genérico es el que llega y el personalizado el que se salta. Si se decide que
 debe quedar el de Sofía, hay que apagar el otro; si debe quedar el otro, apagar
 `followup_enabled` y ahorrarse el gasto.
 
+### Verificar antes de reintentar (no reintentar a ciegas)
+
+Quedaba un último camino para que alguien reciba dos mensajes, y no deja rastro:
+**Zenvia entrega pero la confirmación HTTP se pierde** (timeout, o un 5xx después
+de haber procesado). Para el Worker eso se ve idéntico a "no se entregó", y el
+reintento manda un segundo mensaje real mientras la base registra uno solo.
+
+`enviarSeguimientoVerificado()` **no usa `sendChannelMessage()`**, aunque se le
+parezca. Esa función reintenta a ciegas, y hace bien: cuando un paciente espera
+respuesta, el riesgo de dejarlo sin contestar supera al de un duplicado. Acá la
+aritmética se invierte — **nadie está esperando este mensaje**, así que el
+duplicado molesta más de lo que cuesta el mensaje perdido.
+
+Antes de cada reintento consulta si ya salió algo nuestro:
+
+| Situación | Qué hace |
+|---|---|
+| Primer intento OK | Listo |
+| Falló, pero el mensaje SÍ había salido | **No reintenta** — se perdió la confirmación, no el mensaje |
+| Falló de verdad | Reintenta |
+| No se pudo verificar | **No reintenta** — reintentar a ciegas es el riesgo que esto cierra |
+
+**Por qué no se quitaron los reintentos a secas**, que era la opción obvia: el
+cupo se reserva ANTES de enviar, así que un tropiezo de red le costaría a esa
+persona su seguimiento **para siempre**. Cambiaba un problema raro por otro
+peor — un duplicado molesta, un mensaje perdido es un lead que nunca supo nada.
+
+Solo gasta la llamada extra cuando un envío parece fallar: **16 de 33.995
+mensajes agotaron reintentos en seis semanas (0,05%)**.
+
+Probado contra 6 casos (incluida la excepción con mensaje ya entregado): 0 fallos.
+
 ### El mensaje SE GUARDA en el historial
 
 `guardarSeguimientoEnHistorial()` lo **pega al último mensaje de Sofía** en vez
