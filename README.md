@@ -1197,10 +1197,29 @@ que pasaba. Faltaba la otra pregunta.
 
 `revisarActividadReciente()` ahora contesta las dos en **una sola llamada** (antes
 eran tres requests por paciente: findPendingCandidate volvía a pedir el agente
-por su cuenta). Salta ante cualquier mensaje saliente en las últimas 12 h, **sin
-mirar quién lo mandó**:
+por su cuenta).
 
-- si fue Sofía, el cupo ya está tomado y esto es redundante pero inocuo;
+⚠️ **EL CORTE NO PUEDE SER "LAS ÚLTIMAS 12 HORAS".** Esa fue la primera versión y
+dejó el seguimiento **sin enviar nada durante 2h30, en silencio**: la respuesta
+de la propia Sofía es un mensaje saliente, y por construcción ocurrió hace 2-20
+horas —que es exactamente la ventana de elegibilidad—, así que la guarda se
+disparaba contra ella misma y saltaba a todo el mundo. Cero envíos entre las
+12:51 y las 15:43 del 2026-09-08, con 27 personas en cola.
+
+Se detectó de casualidad, al ir a medir otra cosa. **Saltar no deja rastro
+visible**: un barrido que no envía nada se ve igual que uno sin candidatos. Si un
+cambio acá reduce los envíos, revisar los contadores del log `FOLLOWUP_SWEEP`
+antes de asumir que la cola está vacía.
+
+El corte correcto es **después del último intercambio**: la campaña ajena llega
+cuando la conversación ya estaba callada; la respuesta de Sofía es lo que *la
+dejó* callada. Un minuto de margen porque el timestamp de Zenvia y el
+`updated_at` de Supabase se escriben con segundos de diferencia.
+
+Salta ante cualquier mensaje saliente posterior a ese corte, **sin mirar quién lo
+mandó**:
+
+- si fue Sofía después del intercambio, el cupo ya está tomado;
 - si fue una campaña o automatización, es justo lo que hay que evitar;
 - si fue un asesor humano, tampoco corresponde escribirle encima.
 
