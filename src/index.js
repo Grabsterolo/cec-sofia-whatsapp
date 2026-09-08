@@ -2275,6 +2275,33 @@ async function sendEscalationNotification(env, escalationReason) {
 // Deliberately never throws and never blocks the caller for long on a
 // single failing step — the main flow (reply to patient, transfer to
 // group) must never depend on any of this working.
+// ¿El paciente ya se despidió?
+//
+// EL CASO (2026-09-08): una paciente escribió "No gracias" a las 14:49. Nada en
+// el barrido miraba lo que ella había dicho —revisaba nueve cosas y ninguna era
+// esa— así que dos horas después le habría llegado un "¿le gustaría agendar?".
+//
+// Insistirle a quien ya dijo que no es la peor forma de gastar un mensaje: no
+// convierte, molesta, y desde el lado de la paciente la clínica no la escuchó.
+//
+// Cubre las tres formas de decir que no que aparecen en las conversaciones
+// reales, medidas antes de escribir esto: el rechazo directo ("no gracias"), el
+// aplazamiento ("más adelante", "por ahora no") y el cortés de acá ("yo le
+// aviso", "cualquier cosa me comunico"). Marca el 1,55% (55 de 3.550), y los 14
+// primeros revisados a mano son despedidas reales, ninguna falsa.
+//
+// El aplazamiento entra a propósito aunque NO sea un no: quien dijo "más
+// adelante" tampoco quiere un recordatorio a las dos horas. Para volver a
+// buscarlo está el estado "En espera" del dashboard, que lo devuelve a la cola
+// con fecha y lo retoma una persona.
+const PACIENTE_SE_DESPIDIO =
+  /(^|\s)(no,? gracias|no me interesa|ya no me interesa|no por ahora|por ahora no|m[aá]s adelante|lo voy a pensar|lo pensar[eé]|d[eé]jeme pensar|yo (le|te) (aviso|escribo|comunico)|(me estoy|me) comunicando|cualquier cosa (le|te|me)|solo (estaba|andaba) (viendo|preguntando)|solo quer[ií]a saber)($|\s|\.|!)/i;
+
+function seDespidio(messages) {
+  const ultimoDelPaciente = [...(messages || [])].reverse().find((m) => m.role === "user");
+  return PACIENTE_SE_DESPIDIO.test(ultimoDelPaciente?.content ?? "");
+}
+
 // ¿El procedimiento que ya tenemos guardado es concreto, o todavía es genérico?
 // Mismo criterio que usa la vista sofia_followup_queue para decidir qué es un
 // interés real: si acá se afloja, se empieza a dar por bueno un "consulta de
@@ -3739,6 +3766,7 @@ async function runFollowupSweep(env, { dryRun }) {
     saltadosPorHumano: 0,
     saltadosPorEsperarRespuesta: 0,
     saltadosPorqueYaLeEscribieron: 0,
+    saltadosPorqueSeDespidieron: 0,
     entregadosSinConfirmar: 0,
     noSePudoVerificarElEnvio: 0,
     saltadosPorDuplicado: 0,
@@ -3772,6 +3800,14 @@ async function runFollowupSweep(env, { dryRun }) {
     // mensaje real es del paciente y sigue sin contestar. Si devuelve algo,
     // esta conversación le toca a /cleanup/retry-pending, que le da lo que de
     // verdad falta (una respuesta), no un recordatorio.
+    // Antes de gastar una llamada a Zenvia: ¿ya dijo que no? El historial del
+    // lote ya está en memoria, así que esto no cuesta ningún request.
+    if (seDespidio(sesiones.get(cand.phone_hash)?.messages)) {
+      resultado.saltadosPorqueSeDespidieron++;
+      resultado.detalle.push({ prospectId: cand.prospect_id, accion: "saltado_se_despidio" });
+      continue;
+    }
+
     const act = await revisarActividadReciente(env, cand.prospect_id);
     if (act.noSePudoRevisar) {
       resultado.saltadosPorEsperarRespuesta++;

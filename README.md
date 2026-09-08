@@ -1137,6 +1137,39 @@ select count(*) filter (
 from pares;
 ```
 
+### No insistirle a quien ya dijo que no
+
+**El caso (2026-09-08):** una paciente escribió *"No gracias"* a las 14:49 por
+Facebook. Nada en el barrido miraba lo que ella había dicho —revisaba nueve
+cosas y ninguna era esa— así que dos horas después le habría llegado un
+*"¿le gustaría agendar?"*.
+
+Insistirle a quien ya dijo que no es la peor forma de gastar un mensaje: no
+convierte, molesta, y desde el lado de la paciente **la clínica no la escuchó**.
+
+`seDespidio()` mira el último mensaje del paciente y cubre las tres formas de
+decir que no que aparecen en las conversaciones reales:
+
+| Forma | Ejemplos |
+|---|---|
+| Rechazo directo | *"No gracias"*, *"No me interesa"* |
+| Aplazamiento | *"Más adelante"*, *"Por ahora no"*, *"Lo voy a pensar"* |
+| El cortés tico | *"Yo le aviso"*, *"Cualquier cosa me comunico"* |
+
+**El aplazamiento entra a propósito aunque NO sea un no**: quien dijo "más
+adelante" tampoco quiere un recordatorio a las dos horas. Para volver a buscarlo
+está el estado **"En espera"** del dashboard, que lo devuelve a la cola con
+fecha y lo retoma una persona — no Sofía, porque a los días la ventana de 24 h
+ya está cerrada.
+
+Marca el **1,55%** (55 de 3.550). Los 14 primeros se revisaron a mano: todas
+despedidas reales, ninguna falsa. Probado además contra 12 casos, con los
+negativos que importan: *"Gracias"* a secas no dispara, *"No"* solo tampoco (es
+una respuesta del screening médico), ni *"No tengo hijos y no planeo tener"*.
+
+Se evalúa con el historial que el lote **ya tiene en memoria**, antes de gastar
+la llamada a Zenvia. Cero requests extra.
+
 ### No escribir si alguien ya le escribió
 
 **El 2026-09-08 dos pacientes recibieron dos seguimientos la misma mañana.** A
