@@ -1098,6 +1098,45 @@ abdominoplastia"*, donde no hay cifra ni promesa. Lo peligroso no es nombrar el
 tema, es **afirmar** algo. Si el filtro dispara, `fallback_reason` guarda por
 qué — sin esa columna, un porcentaje de genéricos es un número sin explicación.
 
+### No repetir la pregunta que Sofía ya hizo
+
+**Reportado el 2026-09-08 por JP como "envió dos veces el seguimiento".** No lo
+era: la base tenía 100 filas y 100 personas distintas, cero duplicados, y ese
+prospecto tenía exactamente una. La garantía de un mensaje por persona aguantó.
+
+Lo que pasó es peor de diagnosticar y más fácil de arreglar. Sofía había cerrado
+su último mensaje con *"¿Le gustaría que coordinemos una valoración?"*, y dos
+horas después el seguimiento preguntó *"¿desearía agendar esa valoración?"*.
+Dos mensajes distintos que dicen lo mismo: para la paciente, eso es que le
+escribieron dos veces.
+
+**Medido: 32 de 86 seguimientos (37%) repetían una pregunta de agendar que Sofía
+ya había hecho en su turno anterior.**
+
+Causa: el prompt pedía "retomá la conversación" y nunca dijo *no repitas lo que
+ya preguntaste*. El modelo tiene el último mensaje de Sofía en el historial —
+solo faltaba decírselo. Ahora hay una regla explícita: si en su último mensaje
+ya ofreció agendar, retomar una duda abierta o simplemente ofrecer resolver
+dudas, sin volver a pedir la cita.
+
+**Cómo revisar si sigue pasando** (comparar el seguimiento contra el turno de
+Sofía al que quedó pegado):
+
+```sql
+with pares as (
+  select f.message as seguimiento,
+         trim(replace(s.messages -> (jsonb_array_length(s.messages)-1) ->> 'content', f.message, '')) as ultimo_de_sofia
+  from sofia_followup_messages f
+  join sofia_whatsapp_sessions s on s.phone_hash = f.phone_hash
+  where position(f.message in (s.messages -> (jsonb_array_length(s.messages)-1) ->> 'content')) > 0
+)
+select count(*) filter (
+  where ultimo_de_sofia ~* '(valoraci|agendar|coordinar|cita)' and ultimo_de_sofia ~ '\?\s*$'
+    and seguimiento ~* '(valoraci|agendar|coordinar|cita)') as repite_la_misma_pregunta,
+  count(*) as total
+from pares;
+```
+
 ### El mensaje SE GUARDA en el historial
 
 `guardarSeguimientoEnHistorial()` lo **pega al último mensaje de Sofía** en vez

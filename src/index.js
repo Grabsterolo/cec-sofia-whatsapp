@@ -289,6 +289,11 @@ async function redactarSeguimiento(env, messages) {
           "- NO abras reprochando el silencio. Nada de \"veo que no me ha respondido\" ni " +
           "\"no hemos vuelto a conectar\": el paciente no le debe nada a la clínica. Retomá el " +
           "tema directamente.\n" +
+          "- MIRÁ TU ÚLTIMO MENSAJE EN LA CONVERSACIÓN. Si ahí ya ofreciste agendar, coordinar " +
+          "o una valoración, NO vuelvas a preguntar lo mismo: esa pregunta ya se hizo y no tuvo " +
+          "respuesta, así que repetirla se lee como insistencia, no como servicio. En su lugar " +
+          "retomá una duda concreta que haya quedado abierta, o simplemente ofrecé resolver " +
+          "dudas sin volver a pedir la cita.\n" +
           "- Mencioná concretamente el tema o procedimiento que el paciente venía consultando, " +
           "para que se note que no es un mensaje automático.\n" +
           "- NO des precios, costos, promociones, descuentos ni disponibilidad de agenda. " +
