@@ -1137,6 +1137,49 @@ select count(*) filter (
 from pares;
 ```
 
+### No escribir si alguien ya le escribió
+
+**El 2026-09-08 dos pacientes recibieron dos seguimientos la misma mañana.** A
+las 09:13 les llegó EXACTAMENTE el mismo texto —*"Queríamos darle seguimiento a
+la información que le compartimos anteriormente..."*— y el barrido mandó lo suyo
+dos horas y media después.
+
+Ese mensaje de las 09:13 **no sale de este Worker**, y está verificado:
+
+- 0 de 100 filas de `sofia_followup_messages` tienen ese texto.
+- El barrido corre en los minutos 5, 20, 35 y 50 — nunca :13.
+- Son 340 caracteres; el validador rechaza todo lo que pase de 320.
+- La única plantilla que el Worker puede mandar es la de cumpleaños, y
+  `BIRTHDAY_TEMPLATE_ID` ni siquiera está configurado.
+- Texto idéntico a dos personas distintas: imposible desde una redacción
+  generada.
+
+Sale a nombre de "Sofia CEC" —por eso se lee como ella— pero desde otra cosa
+dentro de Zenvia. **Sin la ZENVIA_API_KEY no se puede identificar al emisor**;
+cada interacción trae el `agentId` de quien la mandó.
+
+`findPendingCandidate()` no lo detectaba, y con razón: solo pregunta *"¿el último
+mensaje es del paciente esperando respuesta?"*. Acá el último era SALIENTE, así
+que pasaba. Faltaba la otra pregunta.
+
+`revisarActividadReciente()` ahora contesta las dos en **una sola llamada** (antes
+eran tres requests por paciente: findPendingCandidate volvía a pedir el agente
+por su cuenta). Salta ante cualquier mensaje saliente en las últimas 12 h, **sin
+mirar quién lo mandó**:
+
+- si fue Sofía, el cupo ya está tomado y esto es redundante pero inocuo;
+- si fue una campaña o automatización, es justo lo que hay que evitar;
+- si fue un asesor humano, tampoco corresponde escribirle encima.
+
+Las tres respuestas son la misma: no escribir. Falla cerrado — si Zenvia no
+responde, tampoco se escribe.
+
+⚠️ **Efecto secundario que hay que decidir, no dejar al azar:** con esta guarda,
+el mensaje de las 09:13 **siempre gana**, porque sale antes. O sea que el
+genérico es el que llega y el personalizado el que se salta. Si se decide que
+debe quedar el de Sofía, hay que apagar el otro; si debe quedar el otro, apagar
+`followup_enabled` y ahorrarse el gasto.
+
 ### El mensaje SE GUARDA en el historial
 
 `guardarSeguimientoEnHistorial()` lo **pega al último mensaje de Sofía** en vez

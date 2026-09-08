@@ -3538,6 +3538,66 @@ async function guardarSeguimientoEnHistorial(env, phoneHash, sesion, mensaje) {
   return res.ok;
 }
 
+// Ventana en la que se considera que "alguien ya le escribió". 12 h cubre una
+// campaña de la mañana contra un barrido de la tarde, que es el caso real.
+const FOLLOWUP_SILENCIO_AJENO_HORAS = 12;
+
+// ¿Alguien más ya le escribió a este paciente hace poco?
+//
+// EL CASO REAL (2026-09-08): dos pacientes recibieron a las 09:13 EXACTAMENTE el
+// mismo texto —"Queríamos darle seguimiento a la información que le compartimos
+// anteriormente..."— sin la marca "Realizado por Sofia CEC". Mismo texto, misma
+// hora, distintas personas: es un envío masivo desde otro lado (campaña de
+// Zenvia, otra herramienta, o plantillas a mano). El barrido mandó lo suyo dos
+// horas y media después y las pacientes recibieron dos seguimientos esa mañana.
+//
+// findPendingCandidate() no lo detectaba, y con razón: solo pregunta "¿el último
+// mensaje es del paciente esperando respuesta?". Acá el último mensaje era
+// SALIENTE, así que pasaba la revisión. Faltaba la otra pregunta.
+//
+// Se salta ante CUALQUIER mensaje saliente reciente, sin mirar quién lo mandó:
+//   * si lo mandó Sofía, el cupo ya está tomado y esto es redundante pero inocuo;
+//   * si lo mandó una campaña, es justo lo que hay que evitar;
+//   * si lo mandó un asesor humano, tampoco corresponde escribirle encima.
+// Las tres respuestas son la misma: no escribir.
+//
+// Reusa las interacciones que findPendingCandidate ya trae, en la MISMA llamada
+// — ver revisarActividadReciente. No cuesta un subrequest más.
+function huboMensajeSalienteReciente(interactions) {
+  const corte = Date.now() - FOLLOWUP_SILENCIO_AJENO_HORAS * 3600_000;
+  return interactions.some((i) => {
+    const m = i.output?.message;
+    if (!m || m.performer === "integration") return false;
+    const t = new Date(i.createdAt).getTime();
+    return Number.isFinite(t) && t >= corte;
+  });
+}
+
+// Una sola llamada a Zenvia que contesta las dos preguntas que importan antes de
+// escribir: ¿está esperando respuesta? y ¿alguien ya le escribió?
+//
+// Reemplaza al par findPendingCandidate() + getCurrentProspectAgentId() que se
+// hacía antes: aquella función volvía a pedir el agente por su cuenta, así que
+// eran 3 requests para lo que ahora son 2.
+async function revisarActividadReciente(env, prospectId) {
+  const res = await fetchWithTimeout(
+    `${ZENVIA_API_BASE}/prospect/${prospectId}/interactions?api-key=${env.ZENVIA_API_KEY}`
+  );
+  // Falla cerrado: sin poder mirar, no se escribe.
+  if (!res.ok) return { noSePudoRevisar: true };
+  const interactions = await res.json();
+  if (!Array.isArray(interactions)) return { noSePudoRevisar: true };
+
+  const sorted = [...interactions].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const ultimo = sorted.find((i) => i.output?.message);
+
+  return {
+    noSePudoRevisar: false,
+    esperandoRespuesta: ultimo?.output?.message?.performer === "integration",
+    yaLeEscribieron: huboMensajeSalienteReciente(sorted),
+  };
+}
+
 async function runFollowupSweep(env, { dryRun }) {
   // El mismo kill switch de emergencia que corta las respuestas entrantes
   // (sofia_config.whatsapp_enabled, ver processInboundMessage). Va PRIMERO y no
@@ -3600,6 +3660,7 @@ async function runFollowupSweep(env, { dryRun }) {
     enviados: 0,
     saltadosPorHumano: 0,
     saltadosPorEsperarRespuesta: 0,
+    saltadosPorqueYaLeEscribieron: 0,
     saltadosPorDuplicado: 0,
     cayeronAlRespaldo: {},
     fallidos: 0,
@@ -3631,10 +3692,20 @@ async function runFollowupSweep(env, { dryRun }) {
     // mensaje real es del paciente y sigue sin contestar. Si devuelve algo,
     // esta conversación le toca a /cleanup/retry-pending, que le da lo que de
     // verdad falta (una respuesta), no un recordatorio.
-    const esperandoRespuesta = await findPendingCandidate(env, cand.prospect_id);
-    if (esperandoRespuesta) {
+    const act = await revisarActividadReciente(env, cand.prospect_id);
+    if (act.noSePudoRevisar) {
+      resultado.saltadosPorEsperarRespuesta++;
+      resultado.detalle.push({ prospectId: cand.prospect_id, accion: "saltado_zenvia_no_responde" });
+      continue;
+    }
+    if (act.esperandoRespuesta) {
       resultado.saltadosPorEsperarRespuesta++;
       resultado.detalle.push({ prospectId: cand.prospect_id, accion: "saltado_espera_respuesta" });
+      continue;
+    }
+    if (act.yaLeEscribieron) {
+      resultado.saltadosPorqueYaLeEscribieron++;
+      resultado.detalle.push({ prospectId: cand.prospect_id, accion: "saltado_ya_le_escribieron" });
       continue;
     }
 
