@@ -208,11 +208,12 @@ const FOLLOWUP_HOUR_END_CR = 19;
 // scanAndWarn ya demostró que 20 elementos a 3 subrequests es seguro (ver
 // CLEANUP_BATCH_LIMIT: por encima, el lote se cortaba en silencio al pasarse
 // del límite por invocación de Cloudflare). A 5 por elemento, el equivalente
-// era 12. Con la redacción contextual son 6 por candidato (se suma la llamada
+// era 12. Con la redacción contextual y el guardado en historial son 7 por
+// candidato (se suma la llamada
 // a Haiku; el historial se trae en UNA consulta para todo el lote, no una por
 // candidato), así que baja a 10. Con dos corridas por hora en horario hábil
 // son ~200 al día de capacidad contra ~87 necesarios.
-const FOLLOWUP_MAX_PER_RUN = 10;
+const FOLLOWUP_MAX_PER_RUN = 8;
 
 // Respaldo determinista. Se usa cuando la redacción contextual falla o cuando
 // lo que devuelve no pasa el validador de abajo. Sin emojis, y no promete nada.
@@ -237,6 +238,10 @@ const FOLLOWUP_PROHIBIDO =
 // que informar de nada, solo retomar. Menos contexto es menos superficie para
 // inventar.
 async function redactarSeguimiento(env, messages) {
+  // Hora de Costa Rica (UTC-6 todo el año), para el saludo.
+  const h = (new Date().getUTCHours() - 6 + 24) % 24;
+  const horaCR = `${String(h).padStart(2, "0")}:00`;
+
   const historial = (messages || [])
     .slice(-6)
     .map((m) => `${m.role === "user" ? "Paciente" : "Sofía"}: ${m.content}`)
@@ -254,11 +259,18 @@ async function redactarSeguimiento(env, messages) {
       body: JSON.stringify({
         model: "claude-haiku-4-5",
         max_tokens: 150,
+        // La hora va en el prompt porque el modelo no la sabe: en la primera
+        // corrida real, un mensaje de las 6 de la tarde abrió con "Buenos
+        // días". El otro que acertó lo hizo por azar, no por criterio.
         system:
           "Sos Sofía, del Centro Europeo de Cirugía. El paciente dejó de responder hace un par de " +
           "horas. Escribí UN mensaje de WhatsApp para retomar la conversación.\n\n" +
+          `Hora actual en Costa Rica: ${horaCR}. Si saludás, que el saludo corresponda a esa hora.\n\n` +
           "REGLAS ESTRICTAS:\n" +
           "- Máximo 2 oraciones.\n" +
+          "- NO abras reprochando el silencio. Nada de \"veo que no me ha respondido\" ni " +
+          "\"no hemos vuelto a conectar\": el paciente no le debe nada a la clínica. Retomá el " +
+          "tema directamente.\n" +
           "- Mencioná concretamente el tema o procedimiento que el paciente venía consultando, " +
           "para que se note que no es un mensaje automático.\n" +
           "- NO des precios, costos, promociones, descuentos ni disponibilidad de agenda. " +
@@ -3376,6 +3388,51 @@ async function reservarCupoDeSeguimiento(env, cand, mensaje) {
   return "reservado";
 }
 
+// Deja el seguimiento en el historial de la conversación.
+//
+// POR QUÉ SE PEGA Y NO SE AGREGA COMO TURNO NUEVO: el historial tiene que ir
+// alternando paciente/Sofía. Dos turnos seguidos de Sofía romperían la
+// siguiente llamada a Claude. Pegarlo al final de su último mensaje además es
+// fiel a lo que pasó: ella dijo las dos cosas, con un rato en medio.
+//
+// SIN ESTO, Sofía no se acuerda de haber escrito. Medido el 2026-09-07 sobre
+// los 10 primeros envíos reales: 0 de 10 estaban en el historial. Si la
+// paciente contesta "sí", Sofía no sabe a qué; si contesta "¿cuál valoración?",
+// no sabe de qué le hablan; y lo más probable es que repita la misma pregunta
+// que acaba de hacer.
+//
+// Escribe con la misma version que trajo el lote: si alguien contestó entre
+// medias, el update no encuentra esa version, no pisa nada y se pierde solo el
+// pegado — que es justo el caso en que ya no hace falta, porque el turno nuevo
+// de la paciente ya trae el contexto.
+async function guardarSeguimientoEnHistorial(env, phoneHash, sesion, mensaje) {
+  if (!sesion?.messages?.length) return false;
+  const msgs = [...sesion.messages];
+  const ultimo = msgs[msgs.length - 1];
+  if (ultimo?.role !== "assistant") return false;
+  msgs[msgs.length - 1] = { ...ultimo, content: `${ultimo.content}\n\n${mensaje}` };
+
+  const res = await fetchWithTimeout(
+    `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?phone_hash=eq.${phoneHash}&version=eq.${sesion.version ?? 0}`,
+    {
+      method: "PATCH",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        messages: msgs,
+        version: (sesion.version ?? 0) + 1,
+        updated_at: new Date().toISOString(),
+      }),
+    }
+  );
+  if (!res.ok) console.error("guardarSeguimientoEnHistorial falló", phoneHash, res.status);
+  return res.ok;
+}
+
 async function runFollowupSweep(env, { dryRun }) {
   // El mismo kill switch de emergencia que corta las respuestas entrantes
   // (sofia_config.whatsapp_enabled, ver processInboundMessage). Va PRIMERO y no
@@ -3414,7 +3471,7 @@ async function runFollowupSweep(env, { dryRun }) {
   if (lote.length) {
     const hs = lote.map((c) => `"${c.phone_hash}"`).join(",");
     const sesRes = await fetchWithTimeout(
-      `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?select=phone_hash,messages&phone_hash=in.(${hs})`,
+      `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?select=phone_hash,messages,version&phone_hash=in.(${hs})`,
       {
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -3423,7 +3480,7 @@ async function runFollowupSweep(env, { dryRun }) {
       }
     );
     if (sesRes.ok) {
-      for (const row of await sesRes.json()) sesiones.set(row.phone_hash, row.messages);
+      for (const row of await sesRes.json()) sesiones.set(row.phone_hash, row);
     } else {
       // Sin historial no se puede personalizar, pero sí mandar el respaldo:
       // se registra y se sigue, no se aborta el barrido entero.
@@ -3481,14 +3538,14 @@ async function runFollowupSweep(env, { dryRun }) {
         accion: "se_enviaria",
         // Se redacta también en seco: el punto de una corrida de prueba es
         // poder leer el mensaje real antes de que salga, no solo la lista.
-        mensaje: await redactarSeguimiento(env, sesiones.get(cand.phone_hash)),
+        mensaje: await redactarSeguimiento(env, sesiones.get(cand.phone_hash)?.messages),
         procedure_code: cand.procedure_code,
         callado_desde: cand.updated_at,
       });
       continue;
     }
 
-    const mensaje = await redactarSeguimiento(env, sesiones.get(cand.phone_hash));
+    const mensaje = await redactarSeguimiento(env, sesiones.get(cand.phone_hash)?.messages);
 
     const cupo = await reservarCupoDeSeguimiento(env, cand, mensaje);
     if (cupo === "ya_existia") { resultado.saltadosPorDuplicado++; continue; }
@@ -3497,6 +3554,9 @@ async function runFollowupSweep(env, { dryRun }) {
     const enviado = await sendChannelMessage(env, cand.prospect_id, cand.channel, mensaje);
     if (enviado?.ok) {
       resultado.enviados++;
+      // Solo si el mensaje SALIÓ. Guardarlo antes dejaría a Sofía creyendo que
+      // dijo algo que la paciente nunca recibió.
+      await guardarSeguimientoEnHistorial(env, cand.phone_hash, sesiones.get(cand.phone_hash), mensaje);
       resultado.detalle.push({ prospectId: cand.prospect_id, accion: "enviado" });
     } else {
       // El cupo ya quedó reservado (ver el comentario de la función): esta
