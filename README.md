@@ -1084,6 +1084,15 @@ base de conocimiento: no tiene que informar, solo retomar, y menos contexto es
 menos superficie para inventar. La hora de Costa Rica va en el prompt porque el
 modelo no la sabe — un mensaje de las 18:05 abrió con "Buenos días".
 
+**El saludo se corrige por código, no por instrucción.** La hora de Costa Rica va
+en el prompt desde el primer día y aun así un mensaje de las 15:36 abrió con
+"Buenos días". Misma lección que con los emojis: **el prompt no es un candado** —
+pedirlo baja la frecuencia, no la lleva a cero. `corregirSaludo()` reemplaza el
+saludo de apertura si no corresponde a la hora, y solo ese: si el modelo eligió
+no saludar, se respeta; si dice "buenos días" en medio de una frase, no se toca.
+Se aplica dentro de `resp()` para que **también cubra el respaldo**, que empieza
+con "Buen día" fijo y a las 3 de la tarde estaba igual de mal.
+
 **Y tiene red, porque sale solo y nadie lo lee antes.** Dos reglas:
 
 - `FOLLOWUP_CLAIM` — promociones, descuentos, gratis, cupos, garantías,
