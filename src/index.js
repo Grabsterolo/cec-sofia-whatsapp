@@ -719,7 +719,8 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // getCurrentProspectAgentId) is treated as "a human might own this" and
   // skipped, never as "safe to proceed" — same fail-safe direction as the
   // payload-agentId fix this replaces.
-  const { agentId: liveAgentId, failed: agentLookupFailed } = await getCurrentProspectAgentId(env, prospectId);
+  const { agentId: liveAgentId, failed: agentLookupFailed, nombre: patientName } =
+    await getCurrentProspectAgentId(env, prospectId);
   if (agentLookupFailed || (liveAgentId && HUMAN_AGENT_IDS.has(liveAgentId))) {
     console.log(
       `Skipping inbound message: prospect ${prospectId} is owned by a human agent (live check: agentId=${liveAgentId}, lookupFailed=${agentLookupFailed})`
@@ -1108,6 +1109,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     procedureInterest: agility.procedureInterest,
     sentiment: agility.sentiment,
     phone,
+    patientName,
   });
 }
 
@@ -1863,6 +1865,7 @@ async function upsertConversation(env, {
   resetCounters,
   procedureInterest,
   sentiment,
+  patientName,
   phone,
 }) {
   const headers = {
@@ -1920,6 +1923,12 @@ async function upsertConversation(env, {
               last_interaction_id: interactionId,
               procedure_interest: procedureInterest ?? null,
               sentiment: sentiment ?? null,
+              // A diferencia de los de arriba, el nombre NO se pisa con null.
+              // Esos dos los recalcula Claude en cada turno, así que un null
+              // significa "no aplica ahora". El nombre viene de Zenvia y un null
+              // significa "no lo pude leer" — escribirlo borraría un nombre que
+              // ya teníamos por una falla momentánea de la API.
+              ...(patientName ? { patient_name: patientName } : {}),
               // El teléfono en claro. El Worker ya lo tiene en la mano en cada
               // mensaje (lo usa para calcular phone_hash) y hasta ahora lo
               // descartaba, así que phone_number quedaba vacío y había que
@@ -1949,6 +1958,7 @@ async function upsertConversation(env, {
               last_interaction_id: interactionId,
               procedure_interest: procedureInterest ?? null,
               sentiment: sentiment ?? null,
+              patient_name: patientName ?? null,
               phone_number: phone ?? null,
             }),
           });
@@ -2043,20 +2053,58 @@ async function getProspectStatus(env, prospectId) {
 // overriding a human agent. Retrying only reduces false positives from a
 // single network hiccup; the fail-closed behavior after exhausting retries
 // is unchanged.
+// El nombre del paciente, del objeto Prospect de Zenvia.
+//
+// Se lee TOLERANTE porque no está confirmado cómo se llama el campo: en el
+// objeto `agent` Zenvia usa firstName/lastName, así que el prospecto
+// probablemente sea igual, pero podría ser `name` o venir anidado en `contact`.
+// Adivinar y desplegar guardaría null en silencio y nos enteraríamos con miles
+// de filas vacías — mismo criterio que extractInboundMessages() con el sobre
+// del webhook, que también está escrito sin conocer la forma exacta.
+//
+// La primera vez que no encuentre nada, registra las claves que SÍ vinieron.
+// Eso convierte "no funciona" en "el campo se llama así" sin tener que pedirle
+// a nadie la API key.
+let yaSeRegistroLaFormaDelProspecto = false;
+
+function extraerNombreDelProspecto(data) {
+  if (!data || typeof data !== "object") return null;
+  const partes = [
+    data.firstName ?? data.first_name ?? data.contact?.firstName ?? null,
+    data.lastName ?? data.last_name ?? data.contact?.lastName ?? null,
+  ].filter((x) => typeof x === "string" && x.trim());
+  if (partes.length) return partes.join(" ").trim().slice(0, 120);
+
+  const plano = data.name ?? data.fullName ?? data.contact?.name ?? null;
+  if (typeof plano === "string" && plano.trim()) return plano.trim().slice(0, 120);
+
+  if (!yaSeRegistroLaFormaDelProspecto) {
+    yaSeRegistroLaFormaDelProspecto = true;
+    console.log("PROSPECT_SIN_NOMBRE claves disponibles:", JSON.stringify(Object.keys(data)));
+  }
+  return null;
+}
+
 async function getCurrentProspectAgentId(env, prospectId) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const res = await fetchWithTimeout(`${ZENVIA_API_BASE}/prospect/${prospectId}?api-key=${env.ZENVIA_API_KEY}`);
       if (res.ok) {
         const data = await res.json();
-        return { agentId: data.agent?.id ?? null, failed: false };
+        return {
+          agentId: data.agent?.id ?? null,
+          failed: false,
+          // Se aprovecha la misma respuesta: esta llamada ya se hacía en cada
+          // mensaje, así que el nombre sale gratis.
+          nombre: extraerNombreDelProspecto(data),
+        };
       }
     } catch {
       // fall through to retry/backoff below
     }
     if (attempt < 3) await sleep(RETRY_DELAYS_MS[attempt - 1]);
   }
-  return { agentId: null, failed: true };
+  return { agentId: null, failed: true, nombre: null };
 }
 
 // Retries transient failures (same RETRY_DELAYS_MS pattern as
