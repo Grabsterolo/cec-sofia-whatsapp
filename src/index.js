@@ -3319,6 +3319,24 @@ async function findFollowupCandidates(env) {
     `&prospect_id=not.is.null` +
     `&phone_hash=not.is.null` +
     `&or=(derived_to_appointment.is.null,derived_to_appointment.eq.false)` +
+    // No escribirle a quien no es paciente. El 2026-09-08 el barrido le mandó
+    // un seguimiento a un PROVEEDOR de agua destilada: Claude lo había
+    // clasificado bien —procedure_interest decía "No aplica - proveedor"— pero
+    // la taxonomía lo aplana a 'generico_sin_procedimiento', que es
+    // indistinguible de un paciente con consulta vaga. Por eso el filtro va
+    // sobre el texto libre y no sobre procedure_code: ahí es donde está la
+    // señal. Excluye 15 de 3.532 (proveedores, propuestas comerciales, visita
+    // médica, consultas de empleo).
+    //
+    // "publicidad" NO va en la lista a propósito: existe el valor
+    // "procedimiento de publicidad desconocido", que es un paciente llegado por
+    // un anuncio. Excluirlo sería peor que el problema que se arregla.
+    //
+    // El or() con is.null es necesario: sin él, `not.imatch` evalúa NULL como
+    // NULL y se perderían las 31 conversaciones sin clasificar, que sí son
+    // pacientes. Y el regex va SIN paréntesis de grupo — dentro de un or() de
+    // PostgREST chocan con los del grupo y la consulta falla entera.
+    `&or=(procedure_interest.is.null,procedure_interest.not.imatch.proveedor|comercial|no%20aplica|b2b|vacante|empleo|laboral)` +
     `&updated_at=gte.${desde}&updated_at=lte.${hasta}` +
     `&order=updated_at.asc&limit=200`;
 
