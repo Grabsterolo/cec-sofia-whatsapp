@@ -3598,6 +3598,84 @@ async function revisarActividadReciente(env, prospectId) {
   };
 }
 
+// ¿Salió algún mensaje NUESTRO después de este instante?
+//
+// Se consulta antes de reintentar un envío de seguimiento. El caso que cubre es
+// el que no deja rastro: Zenvia entrega el mensaje pero la confirmación HTTP se
+// pierde (timeout, 5xx después de procesar). Para el Worker eso se ve idéntico a
+// "no se entregó", y el reintento manda un segundo mensaje real mientras la base
+// registra uno solo. Es el único camino que quedaba para que alguien reciba dos.
+//
+// Devuelve true/false, o null si no se pudo averiguar.
+async function salioMensajeDespuesDe(env, prospectId, desdeMs) {
+  const res = await fetchWithTimeout(
+    `${ZENVIA_API_BASE}/prospect/${prospectId}/interactions?api-key=${env.ZENVIA_API_KEY}`
+  );
+  if (!res.ok) return null;
+  const interactions = await res.json();
+  if (!Array.isArray(interactions)) return null;
+  return interactions.some((i) => {
+    const m = i.output?.message;
+    if (!m || m.performer === "integration") return false;
+    const t = new Date(i.createdAt).getTime();
+    return Number.isFinite(t) && t >= desdeMs;
+  });
+}
+
+// Envío del seguimiento con verificación antes de cada reintento.
+//
+// NO usa sendChannelMessage() a propósito, aunque se le parezca. Esa función
+// reintenta a ciegas, y hace bien: cuando un paciente está esperando respuesta,
+// el riesgo de no contestarle supera al de un duplicado. Acá la aritmética se
+// invierte — nadie está esperando este mensaje, así que un duplicado molesta más
+// de lo que un mensaje perdido cuesta.
+//
+// La alternativa era quitar los reintentos, pero eso cambia un problema raro por
+// otro peor: el cupo se reserva ANTES de enviar, así que un tropiezo de red le
+// costaría a esa persona su seguimiento para siempre. Verificar conserva las dos
+// cosas. Solo gasta la llamada extra cuando un envío parece fallar: 16 de 33.995
+// mensajes agotaron reintentos en seis semanas (0,05%).
+//
+// Si la verificación misma falla, NO reintenta. Reintentar a ciegas es
+// exactamente el riesgo que esto viene a cerrar.
+async function enviarSeguimientoVerificado(env, prospectId, channel, contenido) {
+  // 30 s de margen por desfase entre el reloj del Worker y el de Zenvia.
+  const desde = Date.now() - 30_000;
+
+  for (let intento = 1; intento <= 3; intento++) {
+    let res = null;
+    try {
+      res = await fetchWithTimeout(
+        `${ZENVIA_API_BASE}/prospect/${prospectId}/messaging/${channel}?api-key=${env.ZENVIA_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ content: contenido }),
+        }
+      );
+      if (res.ok) return { ok: true, intentos: intento };
+      console.error("enviarSeguimientoVerificado: respuesta no ok", prospectId, res.status);
+    } catch (err) {
+      console.error("enviarSeguimientoVerificado lanzó", prospectId, err);
+    }
+
+    if (intento === 3) break;
+
+    const yaSalio = await salioMensajeDespuesDe(env, prospectId, desde);
+    if (yaSalio === true) {
+      // Sí se entregó; lo que se perdió fue la confirmación. Reintentar acá
+      // sería mandar el segundo mensaje que estamos tratando de evitar.
+      console.log("enviarSeguimientoVerificado: entregado sin confirmar", prospectId);
+      return { ok: true, intentos: intento, entregadoSinConfirmar: true };
+    }
+    if (yaSalio === null) {
+      return { ok: false, intentos: intento, noSePudoVerificar: true };
+    }
+    await sleep(RETRY_DELAYS_MS[intento - 1]);
+  }
+  return { ok: false, intentos: 3 };
+}
+
 async function runFollowupSweep(env, { dryRun }) {
   // El mismo kill switch de emergencia que corta las respuestas entrantes
   // (sofia_config.whatsapp_enabled, ver processInboundMessage). Va PRIMERO y no
@@ -3661,6 +3739,8 @@ async function runFollowupSweep(env, { dryRun }) {
     saltadosPorHumano: 0,
     saltadosPorEsperarRespuesta: 0,
     saltadosPorqueYaLeEscribieron: 0,
+    entregadosSinConfirmar: 0,
+    noSePudoVerificarElEnvio: 0,
     saltadosPorDuplicado: 0,
     cayeronAlRespaldo: {},
     fallidos: 0,
@@ -3731,8 +3811,10 @@ async function runFollowupSweep(env, { dryRun }) {
     if (cupo === "ya_existia") { resultado.saltadosPorDuplicado++; continue; }
     if (cupo === "error")      { resultado.fallidos++; continue; }
 
-    const enviado = await sendChannelMessage(env, cand.prospect_id, cand.channel, mensaje);
-    if (enviado?.ok) {
+    const enviado = await enviarSeguimientoVerificado(env, cand.prospect_id, cand.channel, mensaje);
+    if (enviado.entregadoSinConfirmar) resultado.entregadosSinConfirmar++;
+    if (enviado.noSePudoVerificar)     resultado.noSePudoVerificarElEnvio++;
+    if (enviado.ok) {
       resultado.enviados++;
       // Solo si el mensaje SALIÓ. Guardarlo antes dejaría a Sofía creyendo que
       // dijo algo que la paciente nunca recibió.
