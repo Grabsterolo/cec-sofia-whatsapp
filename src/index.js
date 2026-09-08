@@ -3565,10 +3565,6 @@ async function guardarSeguimientoEnHistorial(env, phoneHash, sesion, mensaje) {
   return res.ok;
 }
 
-// Ventana en la que se considera que "alguien ya le escribió". 12 h cubre una
-// campaña de la mañana contra un barrido de la tarde, que es el caso real.
-const FOLLOWUP_SILENCIO_AJENO_HORAS = 12;
-
 // ¿Alguien más ya le escribió a este paciente hace poco?
 //
 // EL CASO REAL (2026-09-08): dos pacientes recibieron a las 09:13 EXACTAMENTE el
@@ -3590,13 +3586,23 @@ const FOLLOWUP_SILENCIO_AJENO_HORAS = 12;
 //
 // Reusa las interacciones que findPendingCandidate ya trae, en la MISMA llamada
 // — ver revisarActividadReciente. No cuesta un subrequest más.
-function huboMensajeSalienteReciente(interactions) {
-  const corte = Date.now() - FOLLOWUP_SILENCIO_AJENO_HORAS * 3600_000;
+// El corte NO puede ser "las últimas 12 horas". Esa fue la primera versión y
+// dejó el seguimiento sin enviar NADA durante 2h30 sin avisar: la respuesta de
+// la propia Sofía es un mensaje saliente, y por construcción ocurrió hace 2-20
+// horas —que es exactamente la ventana de elegibilidad—, así que la guarda se
+// disparaba siempre contra ella misma.
+//
+// El corte correcto es "después del último intercambio". La campaña ajena llega
+// cuando la conversación ya estaba callada; la respuesta de Sofía es lo que la
+// dejó callada. Un minuto de margen porque el timestamp de Zenvia y el
+// updated_at de Supabase se escriben con segundos de diferencia.
+function huboMensajeSalienteDespuesDe(interactions, ultimoIntercambioMs) {
+  const corte = ultimoIntercambioMs + 60_000;
   return interactions.some((i) => {
     const m = i.output?.message;
     if (!m || m.performer === "integration") return false;
     const t = new Date(i.createdAt).getTime();
-    return Number.isFinite(t) && t >= corte;
+    return Number.isFinite(t) && t > corte;
   });
 }
 
@@ -3606,7 +3612,7 @@ function huboMensajeSalienteReciente(interactions) {
 // Reemplaza al par findPendingCandidate() + getCurrentProspectAgentId() que se
 // hacía antes: aquella función volvía a pedir el agente por su cuenta, así que
 // eran 3 requests para lo que ahora son 2.
-async function revisarActividadReciente(env, prospectId) {
+async function revisarActividadReciente(env, prospectId, ultimoIntercambioMs) {
   const res = await fetchWithTimeout(
     `${ZENVIA_API_BASE}/prospect/${prospectId}/interactions?api-key=${env.ZENVIA_API_KEY}`
   );
@@ -3621,7 +3627,7 @@ async function revisarActividadReciente(env, prospectId) {
   return {
     noSePudoRevisar: false,
     esperandoRespuesta: ultimo?.output?.message?.performer === "integration",
-    yaLeEscribieron: huboMensajeSalienteReciente(sorted),
+    yaLeEscribieron: huboMensajeSalienteDespuesDe(sorted, ultimoIntercambioMs),
   };
 }
 
@@ -3808,7 +3814,9 @@ async function runFollowupSweep(env, { dryRun }) {
       continue;
     }
 
-    const act = await revisarActividadReciente(env, cand.prospect_id);
+    const act = await revisarActividadReciente(
+      env, cand.prospect_id, new Date(cand.updated_at).getTime()
+    );
     if (act.noSePudoRevisar) {
       resultado.saltadosPorEsperarRespuesta++;
       resultado.detalle.push({ prospectId: cand.prospect_id, accion: "saltado_zenvia_no_responde" });
