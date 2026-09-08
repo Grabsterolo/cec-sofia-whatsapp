@@ -958,6 +958,64 @@ detenerse entre sí.
 
 ---
 
+## 2a. Costo: dos llamadas a Claude por mensaje, no una
+
+**La factura real es ~$320/mes** (10 recargas de $15 entre el 24-ago y el 7-sep
+= $10,70/día, ritmo estable). La auditoría del 2026-09-03 modelaba ~$88/mes
+porque contaba **solo tokens de entrada de una sola llamada**. Hay dos:
+
+1. **Sonnet 5** — la respuesta de Sofía (~$0,0051 entrada + ~162 tokens de
+   salida a $10/MTok).
+2. **Haiku 4.5** — `classifyEscalationWithHaiku`, que etiqueta procedimiento y
+   sentimiento. Corre en las dos ramas, escalada y no escalada.
+
+La segunda cuesta ~$34/mes y **no estaba contada en ningún lado**.
+
+### Optimización aplicada (2026-09-08): no reclasificar lo ya clasificado
+
+Una conversación de 6 mensajes se clasificaba 6 veces, y solo la última contaba
+— cada una sobrescribe a la anterior. Medido sobre la base: **el 38,8% de los
+turnos (9.789 de 25.258) son reclasificaciones que no cambian nada**, ~$13/mes.
+
+Ahora se salta a partir del **tercer** mensaje y solo si ya hay un procedimiento
+concreto guardado. Antes del tercero no, porque es donde el procedimiento se
+decanta; con un valor genérico tampoco, porque ahí la clasificación aún tiene
+trabajo.
+
+El dato sale de `getConversationState()`, que **ya se llamaba** en cada mensaje
+— solo se le pidieron dos columnas más. Cero requests nuevos.
+
+**⚠️ Dos trampas que hay que conocer antes de tocar esto:**
+
+- **Saltarse la clasificación NO puede significar devolver un objeto vacío.**
+  `upsertConversation()` hace `procedure_interest: procedureInterest ?? null`,
+  así que un `agility` vacío **borraría** el procedimiento de la conversación y
+  la sacaría de la cola de Seguimiento y del filtro del seguimiento proactivo.
+  Por eso la rama que salta arrastra los valores guardados.
+- **El sentimiento se congela.** Si el paciente se molesta en el turno 5, no
+  queda registrado. El score de Seguimiento usa `sentiment` (positivo 15 /
+  neutral 8 / negativo 3), así que un lead que se agrió puede quedar mejor
+  rankeado de lo que merece. Se aceptó el intercambio: el sentimiento casi
+  nunca cambia después de que el procedimiento está claro, y el costo de
+  equivocarse es un orden de lista, no un paciente sin atender. Si algún día
+  importa más, la salida es reclasificar cada N turnos en vez de nunca.
+
+### Lo que NO está en esta factura
+
+Esta cuenta es de **Anthropic solamente**. Sofía también usa OpenAI para
+transcribir notas de voz (Whisper) y para los embeddings del RAG. **Eso se
+factura aparte y nadie lo ha revisado.**
+
+Tampoco está lo que cobre **Zenvia** por mensaje enviado — el diseño del
+seguimiento se queda dentro de la ventana de 24 h justamente para usar la vía
+libre de Meta, pero ese contrato no está a la vista.
+
+### Desperdicio ya cerrado
+
+El `[mensaje sin texto]` (notas de voz, imágenes, stickers) ya no hace el viaje
+completo por OpenAI + RAG: `ragSearch()` lo filtra. Verificado el 2026-09-08:
+605 de 35.417 mensajes de paciente (1,71%).
+
 ## 2b. Seguimiento proactivo — `POST /followup/sweep` y cron `5,20,35,50`
 
 Sofía le escribe **una sola vez, y para siempre**, a quien se quedó callado

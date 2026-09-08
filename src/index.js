@@ -1014,10 +1014,49 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     // above, so every conversation Sofía resolved on her own (most of them)
     // stayed unlabeled in Zenvia even though Supabase had the
     // procedure_interest/sentiment data all along.
-    const availableLabels = await getAvailableLabels(env);
-    agility = await classifyEscalationWithHaiku(env, updatedHistory, availableLabels);
-    if (agility.label) {
-      await addLabelToProspect(env, prospectId, agility.label);
+    // Cada mensaje de paciente dispara DOS llamadas a Claude: Sonnet para la
+    // respuesta y Haiku para clasificar. La segunda corría en todos los turnos,
+    // así que una conversación de 6 mensajes se clasificaba 6 veces y solo la
+    // última contaba — cada una sobrescribe a la anterior. Medido sobre la base
+    // el 2026-09-08: el 38,8% de los turnos son reclasificaciones que no
+    // cambian nada (9.789 de 25.258), ~$13/mes.
+    //
+    // Se salta a partir del TERCER mensaje y solo si ya hay un procedimiento
+    // concreto guardado. Antes del tercero no, porque es justo donde el
+    // procedimiento se decanta; y con un valor genérico tampoco, porque
+    // entonces la clasificación todavía tiene trabajo que hacer.
+    //
+    // La etiqueta de Zenvia no se pierde: ya se aplicó en el turno que
+    // identificó el procedimiento, y volver a mandar la misma no agrega nada.
+    //
+    // LO QUE SÍ SE CONGELA es el sentimiento — si el paciente se molesta en el
+    // turno 5, no se registra. Es el precio de este ahorro y hay que saberlo:
+    // el score de Seguimiento usa sentiment (positivo 15 / neutral 8 /
+    // negativo 3), así que un lead que se agrió puede quedar mejor rankeado de
+    // lo que merece. Se aceptó porque el sentimiento casi nunca cambia después
+    // de que el procedimiento está claro, y porque el costo de equivocarse es
+    // un orden de lista, no un paciente sin atender.
+    const yaClasificada =
+      conversationState.messageCount >= 2 &&
+      yaSabemosElProcedimiento(conversationState.procedureInterest);
+
+    if (yaClasificada) {
+      // OJO: hay que arrastrar los valores guardados. upsertConversation hace
+      // `procedure_interest: procedureInterest ?? null`, así que devolver un
+      // objeto vacío acá BORRARÍA el procedimiento de la conversación y la
+      // sacaría de la cola de Seguimiento y del filtro del seguimiento
+      // proactivo. Saltarse el trabajo no puede significar perder el dato.
+      agility = {
+        procedureInterest: conversationState.procedureInterest,
+        sentiment: conversationState.sentiment,
+        label: null,
+      };
+    } else {
+      const availableLabels = await getAvailableLabels(env);
+      agility = await classifyEscalationWithHaiku(env, updatedHistory, availableLabels);
+      if (agility.label) {
+        await addLabelToProspect(env, prospectId, agility.label);
+      }
     }
 
     // [CERRAR] — casos que no necesitan seguimiento humano ni quedar
@@ -1727,7 +1766,7 @@ async function saveSessionWithRetry(env, phoneHash, channel, baseMessages, baseV
 
 async function getConversationState(env, phoneHash) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count,escalated,last_interaction_id&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count,escalated,last_interaction_id,procedure_interest,sentiment&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1735,12 +1774,16 @@ async function getConversationState(env, phoneHash) {
       },
     }
   );
-  if (!res.ok) return { messageCount: 0, escalated: false, lastInteractionId: null };
+  if (!res.ok) return { messageCount: 0, escalated: false, lastInteractionId: null, procedureInterest: null, sentiment: null };
   const rows = await res.json();
   return {
     messageCount: rows[0]?.message_count ?? 0,
     escalated: rows[0]?.escalated ?? false,
     lastInteractionId: rows[0]?.last_interaction_id ?? null,
+    // Se leen para poder saltarse la reclasificación cuando ya se sabe el
+    // procedimiento — ver classifyEscalationWithHaiku en la rama sin escalar.
+    procedureInterest: rows[0]?.procedure_interest ?? null,
+    sentiment: rows[0]?.sentiment ?? null,
   };
 }
 
@@ -2227,6 +2270,18 @@ async function sendEscalationNotification(env, escalationReason) {
 // Deliberately never throws and never blocks the caller for long on a
 // single failing step — the main flow (reply to patient, transfer to
 // group) must never depend on any of this working.
+// ¿El procedimiento que ya tenemos guardado es concreto, o todavía es genérico?
+// Mismo criterio que usa la vista sofia_followup_queue para decidir qué es un
+// interés real: si acá se afloja, se empieza a dar por bueno un "consulta de
+// precio" y la conversación nunca vuelve a clasificarse.
+const PROCEDIMIENTO_GENERICO =
+  /(informaci[oó]n general|no especificad|^general$|^precio|consulta de precio|informaci[oó]n de (precio|costo)|no identificado|no aplica|sin especificar|consulta general)/i;
+
+function yaSabemosElProcedimiento(procedureInterest) {
+  const p = (procedureInterest ?? "").trim();
+  return p !== "" && !PROCEDIMIENTO_GENERICO.test(p);
+}
+
 async function runEscalationAgility(env, { prospectId, history, escalationReason }) {
   try {
     const labels = await getAvailableLabels(env);
