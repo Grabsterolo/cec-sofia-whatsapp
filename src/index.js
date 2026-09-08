@@ -3732,6 +3732,58 @@ async function enviarSeguimientoVerificado(env, prospectId, channel, contenido) 
   return { ok: false, intentos: 3 };
 }
 
+// Cuántas horas hábiles seguidas sin enviar nada, teniendo cola, antes de gritar.
+// Con 4 barridos por hora, 2 h son 8 corridas en blanco: ya no es casualidad.
+const FOLLOWUP_ALERTA_HORAS = 2;
+
+// Avisa cuando el seguimiento está caído.
+//
+// POR QUÉ EXISTE: el 2026-09-08 una guarda mal calibrada dejó el barrido sin
+// enviar nada durante 2h30 y NADIE SE ENTERÓ. Se descubrió de casualidad, al ir
+// a medir otra cosa. El problema es que saltar un envío no deja rastro: un
+// barrido que se salta a todos se ve exactamente igual que uno sin candidatos.
+//
+// No cuenta corridas en blanco —eso exigiría estado y podría desincronizarse—
+// sino el tiempo desde el último envío real, que ya está en la base.
+//
+// El piso es el arranque del horario (9:00 CR) y no solo el último envío: si no
+// fuera así, cada mañana el hueco de la noche dispararía la alerta.
+async function alertarSiElSeguimientoEstaCaido(env, elegibles) {
+  if (elegibles <= 0) return; // sin cola no hay nada que enviar: normal
+  try {
+    const res = await fetchWithTimeout(
+      `${env.SUPABASE_URL}/rest/v1/sofia_followup_messages?select=sent_at&order=sent_at.desc&limit=1`,
+      {
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        },
+      }
+    );
+    if (!res.ok) return;
+    const filas = await res.json();
+    const ultimoEnvio = filas[0]?.sent_at ? new Date(filas[0].sent_at).getTime() : 0;
+
+    // Arranque del horario hábil de hoy, en UTC (Costa Rica es UTC-6 siempre).
+    const ahora = new Date();
+    const inicioHabil = Date.UTC(
+      ahora.getUTCFullYear(), ahora.getUTCMonth(), ahora.getUTCDate(),
+      FOLLOWUP_HOUR_START_CR + 6, 0, 0
+    );
+    const desde = Math.max(ultimoEnvio, inicioHabil);
+    const horas = (Date.now() - desde) / 3600_000;
+    if (horas < FOLLOWUP_ALERTA_HORAS) return;
+
+    console.error(`FOLLOWUP_CAIDO: ${horas.toFixed(1)}h sin enviar con ${elegibles} en cola`);
+    await logReliabilityEvent(env, {
+      eventType: "followup_sin_enviar",
+      detail: `${horas.toFixed(1)}h sin enviar ningún seguimiento teniendo ${elegibles} candidatos en cola. Revisar las guardas del barrido: saltar no deja rastro y una guarda mal calibrada se ve igual que una cola vacía.`,
+    });
+  } catch (err) {
+    console.error("alertarSiElSeguimientoEstaCaido falló", err);
+  }
+}
+
 async function runFollowupSweep(env, { dryRun }) {
   // El mismo kill switch de emergencia que corta las respuestas entrantes
   // (sofia_config.whatsapp_enabled, ver processInboundMessage). Va PRIMERO y no
@@ -3899,6 +3951,10 @@ async function runFollowupSweep(env, { dryRun }) {
       });
     }
   }
+
+  // Solo en corridas reales: un dry run no envía por diseño y dispararía la
+  // alerta cada vez que alguien lo prueba.
+  if (!dryRun) await alertarSiElSeguimientoEstaCaido(env, candidatos.length);
 
   return resultado;
 }

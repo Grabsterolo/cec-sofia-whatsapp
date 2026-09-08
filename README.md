@@ -1146,6 +1146,31 @@ select count(*) filter (
 from pares;
 ```
 
+### Alerta cuando el seguimiento se cae
+
+**Existe porque el 2026-09-08 el barrido estuvo 2h30 sin enviar nada y nadie se
+enteró.** Se descubrió de casualidad, al ir a medir otra cosa. El modo de falla
+es traicionero: **saltar un envío no deja rastro**, así que un barrido que se
+salta a todos los candidatos se ve exactamente igual que uno sin candidatos.
+
+`alertarSiElSeguimientoEstaCaido()` corre al cerrar cada barrido real (nunca en
+dry run, que no envía por diseño). No cuenta corridas en blanco —eso exigiría
+estado y podría desincronizarse— sino **el tiempo desde el último envío real**,
+que ya está en la base.
+
+Dispara cuando hay cola Y pasaron 2 h hábiles sin enviar nada. Con 4 barridos
+por hora eso son 8 corridas en blanco: ya no es casualidad.
+
+**El piso es el arranque del horario (9:00 CR), no solo el último envío.** Sin
+eso, el hueco de la noche dispararía la alerta cada mañana.
+
+Se registra como `followup_sin_enviar` en `sofia_reliability_events`, y el
+dashboard lo muestra en **Configurar a Sofía**, al lado del interruptor — que es
+donde alguien va a mirar cuando sospeche.
+
+Probado contra 6 casos, incluidos la caída real de ese día y el falso positivo
+de las 9 de la mañana: 0 fallos.
+
 ### No insistirle a quien ya dijo que no
 
 **El caso (2026-09-08):** una paciente escribió *"No gracias"* a las 14:49 por
