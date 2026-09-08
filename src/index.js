@@ -250,9 +250,32 @@ const FOLLOWUP_MONTO =
 // Devuelve { mensaje, motivo, tokensIn, tokensOut }. `motivo` es null cuando
 // la redacción salió bien; si no, dice por qué se cayó al respaldo — sin eso,
 // un porcentaje de mensajes genéricos es un número sin explicación.
+// Corrige el saludo según la hora real de Costa Rica.
+//
+// La hora ya va en el prompt, y aun así el 2026-09-08 un mensaje de las 15:36
+// abrió con "Buenos días". Misma lección que con los emojis: **el prompt no es
+// un candado**. Pedirlo baja la frecuencia; no la lleva a cero.
+//
+// Solo toca el saludo de APERTURA (los primeros ~30 caracteres) y solo si está
+// equivocado. No reescribe nada más: si el modelo eligió no saludar, se respeta.
+//
+// Cortes: mañana hasta las 12, tarde hasta las 19, noche después. Coinciden con
+// la ventana de envío (9-19), así que "noche" casi no se usa — está por si
+// alguna vez se amplía el horario.
+function corregirSaludo(texto, horaCR) {
+  const correcto = horaCR < 12 ? "Buenos días" : horaCR < 19 ? "Buenas tardes" : "Buenas noches";
+  return texto.replace(
+    /^\s*(buen(os)?\s+d[ií]as|buenas\s+tardes|buenas\s+noches|buen\s+d[ií]a)/i,
+    (m) => (m.trim().toLowerCase() === correcto.toLowerCase() ? m : correcto)
+  );
+}
+
 async function redactarSeguimiento(env, messages) {
+  // La corrección va acá y no solo en la rama generada: el respaldo empieza con
+  // "Buen día" fijo, y a las 3 de la tarde eso también está mal. Todo lo que
+  // sale por esta función pasa por el mismo filtro.
   const resp = (mensaje, motivo, u) => ({
-    mensaje, motivo,
+    mensaje: corregirSaludo(mensaje, h), motivo,
     tokensIn: u?.input_tokens ?? null,
     tokensOut: u?.output_tokens ?? null,
   });
