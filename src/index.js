@@ -226,6 +226,41 @@ const FOLLOWUP_MAX_PER_RUN = 8;
 
 // Respaldo determinista. Se usa cuando la redacción contextual falla o cuando
 // lo que devuelve no pasa el validador de abajo. Sin emojis, y no promete nada.
+// Tope de largo del mensaje de reenganche.
+//
+// Estuvo en 320 y era la causa PRINCIPAL de mensaje genérico: el 2026-09-08,
+// 6 de los 9 respaldos fueron por largo, más que por todas las guardas de
+// contenido juntas. Y no era mala suerte — de los 103 mensajes que sí salieron,
+// 33 quedaron a menos de 60 caracteres del tope, con un promedio de 226. Haiku
+// escribe naturalmente cerca de ese borde.
+//
+// El intercambio estaba al revés: rechazar un mensaje de 340 caracteres que
+// menciona el procedimiento de la paciente, para mandarle en su lugar el
+// respaldo genérico que no lo menciona, es cambiar algo bueno por algo peor.
+// El tope existe para frenar al modelo si se desboca, no para podar mensajes
+// sanos.
+//
+// 450 deja pasar la franja normal y sigue cortando lo desbocado. Las guardas de
+// CONTENIDO —promesas, montos— no se tocan: esas sí protegen.
+//
+// OJO si algún día se investiga un mensaje sospechoso: el README documenta un
+// caso (2026-09-08) donde "son 340 caracteres y el validador rechaza todo lo
+// que pase de 320" sirvió para probar que un mensaje NO salió de este Worker.
+// Ese argumento vale para mensajes anteriores a este cambio, no para los
+// nuevos.
+// Los dos crons, escritos una sola vez.
+//
+// DEBEN coincidir CARÁCTER POR CARÁCTER con [triggers].crons de wrangler.toml:
+// Cloudflare entrega el texto literal en event.cron y así es como el Worker
+// distingue una tarea de la otra. Un espacio de más y la comparación falla.
+//
+// Si dejan de coincidir, el bloque scheduled() de más abajo lo grita como
+// CRON_DESCONOCIDO en vez de dejar que una tarea deje de correr en silencio.
+const CRON_SEGUIMIENTO = "5,20,35,50 * * * *";  // SÍ le escribe a pacientes
+const CRON_REINTENTOS  = "*/20 * * * *";        // no le escribe a nadie
+
+const FOLLOWUP_LARGO_MAX = 450;
+
 const FOLLOWUP_MESSAGE_FALLBACK =
   "Buen día, le escribo del Centro Europeo de Cirugía. Quedó abierta nuestra " +
   "conversación y quería saber si le puedo ayudar con algo más o aclararle " +
@@ -346,7 +381,7 @@ async function redactarSeguimiento(env, messages) {
     // Validación. Cualquier duda cae al respaldo, nunca al mensaje del modelo.
     const u = data?.usage;
     if (!texto)               return resp(FOLLOWUP_MESSAGE_FALLBACK, "vacio", u);
-    if (texto.length > 320)   return resp(FOLLOWUP_MESSAGE_FALLBACK, "muy_largo", u);
+    if (texto.length > FOLLOWUP_LARGO_MAX) return resp(FOLLOWUP_MESSAGE_FALLBACK, "muy_largo", u);
     if (FOLLOWUP_CLAIM.test(texto)) return resp(FOLLOWUP_MESSAGE_FALLBACK, "afirmacion_prohibida", u);
     if (FOLLOWUP_MONTO.test(texto)) return resp(FOLLOWUP_MESSAGE_FALLBACK, "monto_en_el_texto", u);
     // Emojis: el prompt los prohíbe, pero el prompt no es un candado.
@@ -447,7 +482,7 @@ export default {
   // solo mensaje por persona para siempre (PK de sofia_followup_messages) y
   // horario diurno. Todas fallan cerrado.
   async scheduled(event, env, ctx) {
-    if (event.cron === "5,20,35,50 * * * *") {
+    if (event.cron === CRON_SEGUIMIENTO) {
       // Se loguea el resultado y no solo se dispara. Un job automático que le
       // escribe a pacientes tiene que dejar rastro de qué hizo en cada corrida
       // —incluido cuando no hizo nada y por qué—, o la única forma de saberlo
@@ -462,6 +497,29 @@ export default {
       );
       return;
     }
+
+    if (event.cron === CRON_REINTENTOS) {
+      ctx.waitUntil(retryStuckEscalations(env));
+      return;
+    }
+
+    // Un cron que no reconocemos significa que wrangler.toml y este archivo se
+    // desincronizaron. Antes esto no existía: cualquier cron desconocido caía
+    // al reintento de escalaciones, así que cambiar el horario del seguimiento
+    // en wrangler.toml y olvidar este archivo APAGABA el reenganche sin un solo
+    // error — los pacientes simplemente dejaban de recibir mensajes y nadie se
+    // enteraba hasta notarlo semanas después.
+    //
+    // Se sigue corriendo la tarea inocua (no le escribe a nadie), pero ahora
+    // deja rastro en `wrangler tail`.
+    console.error(
+      "CRON_DESCONOCIDO",
+      JSON.stringify({
+        recibido: event.cron,
+        esperados: [CRON_SEGUIMIENTO, CRON_REINTENTOS],
+        que_hacer: "wrangler.toml y src/index.js dejaron de coincidir. El reenganche NO está corriendo.",
+      })
+    );
     ctx.waitUntil(retryStuckEscalations(env));
   },
 };
