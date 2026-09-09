@@ -1215,7 +1215,9 @@ Ese mensaje de las 09:13 **no sale de este Worker**, y está verificado:
 
 - 0 de 100 filas de `sofia_followup_messages` tienen ese texto.
 - El barrido corre en los minutos 5, 20, 35 y 50 — nunca :13.
-- Son 340 caracteres; el validador rechaza todo lo que pase de 320.
+- Son 340 caracteres; el validador rechazaba todo lo que pasara de 320.
+  (El tope subió a 450 el 2026-09-09, así que este argumento sirve para
+  mensajes anteriores a esa fecha, no para los nuevos.)
 - La única plantilla que el Worker puede mandar es la de cumpleaños, y
   `BIRTHDAY_TEMPLATE_ID` ni siquiera está configurado.
 - Texto idéntico a dos personas distintas: imposible desde una redacción

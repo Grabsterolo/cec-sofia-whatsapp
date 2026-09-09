@@ -16,13 +16,23 @@ compatibility_date = "2026-07-01"
 #
 # El segundo SÍ le escribe a pacientes. Ver scheduled() en src/index.js para
 # las guardas que lo hacen aceptable: son ellas y no la frecuencia.
-# */20 -> retryStuckEscalations (no le escribe a nadie).
-# 5,35 -> runFollowupSweep (SÍ le escribe a pacientes). Separado a propósito:
-#         el presupuesto de subrequests es por invocación y los minutos 5 y 35
-#         nunca coinciden con los múltiplos de 20. El horario 9-19 hora CR se
-#         aplica dentro de la función, no acá: el cron es UTC y esa ventana
-#         cruza la medianoche UTC. Ver el comentario de scheduled() en
-#         src/index.js.
+# */20        -> retryStuckEscalations (no le escribe a nadie).
+# 5,20,35,50  -> runFollowupSweep (SÍ le escribe a pacientes).
+#
+# El horario 9-19 hora CR se aplica DENTRO de la función, no acá: el cron es UTC
+# y esa ventana cruza la medianoche UTC. Ver el comentario de scheduled().
+#
+# Los dos coinciden en el minuto 20. No es un descuido: Cloudflare dispara
+# scheduled() una vez POR EXPRESIÓN, cada una con su propio presupuesto de
+# subrequests, así que no compiten. (Este comentario decía antes "5,35 ... nunca
+# coinciden con los múltiplos de 20", y quedó desactualizado el 2026-09-08 al
+# subir el barrido a 4 corridas/hora.)
+#
+# ⚠ ESTOS DOS TEXTOS ESTÁN DUPLICADOS en src/index.js, como CRON_SEGUIMIENTO y
+# CRON_REINTENTOS. Cloudflare entrega el texto literal en event.cron y así es
+# como el Worker distingue una tarea de la otra. Si se cambia acá, HAY QUE
+# CAMBIARLO ALLÁ — si no, el Worker lo reporta como CRON_DESCONOCIDO en
+# `wrangler tail` y el reenganche deja de correr.
 [triggers]
 crons = ["*/20 * * * *", "5,20,35,50 * * * *"]
 
