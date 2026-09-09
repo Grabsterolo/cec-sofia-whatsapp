@@ -74,10 +74,19 @@ const URL_REGEX = /https?:\/\/[^\s]+/i;
 const SKIP_LINK_HOSTS =
   /(^|\.)(instagram\.com|facebook\.com|fb\.me|fb\.com|fb\.watch|m\.me|wa\.me|threads\.net|tiktok\.com|x\.com|twitter\.com|linkedin\.com)$/i;
 
+// Sin marca de género, a propósito. Estos mensajes se eligen al azar y salen
+// sin saber a quién le escriben: la versión anterior daba por hecho que toda
+// paciente era mujer ("la voy a poner en contacto"), así que a un paciente de
+// ginecomastia —procedimiento exclusivamente masculino— o de rinoplastia le
+// llegaba un mensaje que no le hablaba a él. El sistema no guarda el género en
+// ningún lado, así que la única forma correcta es no asumirlo.
+//
+// El patrón neutro ("le paso con") no es nuevo: ESCALATION_FALLBACK_REPLIES,
+// más abajo, ya estaba escrito así. Acá solo se emparejó el resto.
 const MESSAGE_LIMIT_REPLIES = [
-  "Quiero asegurarme de que le den la mejor ayuda posible con esto, así que la voy a poner en contacto con nuestro equipo — en breve le escriben.",
-  "Para que le puedan dar seguimiento como se merece, la voy a poner en contacto con nuestro equipo — en un momentito le contactan.",
-  "Con gusto la conecto con nuestro equipo para que le ayuden mejor con esto — en breve le escriben.",
+  "Quiero asegurarme de que le den la mejor ayuda posible con esto, así que le voy a pasar con nuestro equipo — en breve le escriben.",
+  "Para que le puedan dar seguimiento como se merece, le voy a pasar con nuestro equipo — en un momentito le contactan.",
+  "Con gusto le paso con nuestro equipo para que le ayuden mejor con esto — en breve le escriben.",
 ];
 
 function pickMessageLimitReply() {
@@ -89,8 +98,8 @@ function pickMessageLimitReply() {
 // of hitting the turn limit (see README "Confiabilidad: reintentos ante
 // fallas transitorias").
 const TECHNICAL_FAILURE_REPLIES = [
-  "Disculpe, tuve un problema técnico momentáneo. Ya la voy a conectar con nuestro equipo para que le ayude directamente.",
-  "Disculpe las molestias, tuve un inconveniente técnico de mi lado. La voy a poner en contacto con nuestro equipo para que le sigan ayudando.",
+  "Disculpe, tuve un problema técnico momentáneo. Ya le voy a pasar con nuestro equipo para que le ayude directamente.",
+  "Disculpe las molestias, tuve un inconveniente técnico de mi lado. Le voy a pasar con nuestro equipo para que le sigan ayudando.",
 ];
 
 function pickTechnicalFailureReply() {
