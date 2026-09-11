@@ -780,6 +780,21 @@ prospectId falso, no error de canal/formato), y Supabase guardó
      flujo ahí — y de paso activa el freno del punto anterior para el
      resto de esta conversación (mientras siga con el mismo
      `interactionId`).
+   - **Excepción al tope — no pasarle a un asesor a quien no es paciente
+     (2026-09-11):** antes de todo lo anterior, `motivoParaCerrarSinAsesor()`
+     revisa si (a) el último mensaje de Sofía fue un silencio
+     `[NO_RESPONDER]`, (b) `procedure_interest` calza con `SIN_TRATAMIENTO`
+     ("ninguno", "no aplica", proveedor, empleo...) o (c) la conversación está
+     `descartado` en `sofia_followup_status` sin procedimiento concreto. Si
+     alguna aplica: manda `LIMIT_CLOSING_REPLY` (nada, si Sofía venía
+     callada), archiva en Zenvia con `infoGeneral`, guarda `escalated: false`
+     y reinicia el contador (`resetCounters`). Log: `SOFIA_TOPE_SIN_ASESOR`.
+   - **`[NO_RESPONDER: motivo]` es silencio (2026-09-11):** `parseEscalation()`
+     limpia la etiqueta siempre; si no queda texto, no se envía nada, se
+     loguea `SOFIA_SILENCIO` y la etiqueta queda en el historial y en
+     `last_message` (así `findFollowupCandidates()` la excluye). Hasta esa
+     fecha el prompt la pedía pero este archivo no la conocía y salía tal cual
+     por WhatsApp: 73 personas la recibieron.
    - Carga `sofia_config` (system_prompt + knowledge_base) desde Supabase.
    - RAG: embedding con `text-embedding-3-small` de los últimos 2 mensajes
      del usuario → `match_sofia_chunks` (top 6, threshold 0.5) → si no hay
@@ -1032,6 +1047,11 @@ que el asesor ya dio, o se re-ofrece una valoración ya agendada.
 
 Los leads que un asesor abandonó son problema de la sección Seguimiento del
 dashboard, no de un bot escribiéndoles encima.
+
+Tampoco a quien Sofía decidió no contestarle: si `last_message` trae
+`[NO_RESPONDER`, el candidato se descarta en la consulta (2026-09-11). Antes el
+barrido le escribía "¿le puedo ayudar con algo más?" a quien había escrito
+"Keguapa".
 
 ### Los umbrales, y de dónde salen
 

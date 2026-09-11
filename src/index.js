@@ -93,6 +93,12 @@ function pickMessageLimitReply() {
   return MESSAGE_LIMIT_REPLIES[Math.floor(Math.random() * MESSAGE_LIMIT_REPLIES.length)];
 }
 
+// Al tope, para quien no es paciente (ver motivoParaCerrarSinAsesor). No
+// promete que alguien le escriba —nadie lo va a hacer— y deja la puerta
+// abierta por si algún día consulta de verdad.
+const LIMIT_CLOSING_REPLY =
+  "Muchas gracias por escribirnos. Si en algún momento desea información sobre alguno de nuestros tratamientos, con gusto le atendemos por este medio.";
+
 // Sent when callClaude() exhausts its retries — same "hand off to a human"
 // shape as MESSAGE_LIMIT_REPLIES above, but for a technical failure instead
 // of hitting the turn limit (see README "Confiabilidad: reintentos ante
@@ -921,6 +927,50 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   );
 
   if (conversationState.messageCount >= MAX_CONVERSATION_TURNS) {
+    // Antes de pasársela a un asesor: ¿es un paciente? El tope existe para que
+    // una conversación larga no se quede en manos de Sofía, no para mandarle
+    // al equipo a quien nunca preguntó por un tratamiento. Caso real
+    // (2026-09-10, "Alejandro"): 11 mensajes sobre un premio de $400, un pie
+    // lastimado y falta de plata; el tope se lo asignó a Jordan, y el equipo
+    // ya lo había marcado Descartado seis días antes.
+    const motivoCierre = await motivoParaCerrarSinAsesor(env, {
+      phoneHash,
+      messages: session.messages,
+      procedureInterest: conversationState.procedureInterest,
+    });
+    if (motivoCierre) {
+      // Si Sofía ya venía callada, sigue callada: una despedida sería
+      // contestarle a quien decidió no contestarle.
+      const despedida = esSilencio(ultimoMensajeDeSofia(session.messages)) ? null : LIMIT_CLOSING_REPLY;
+      const registro = despedida ?? `[NO_RESPONDER: ${motivoCierre}]`;
+      await claimPromise;
+      if (despedida) await sendChannelMessageOrEscalate(env, prospectId, channel, despedida, { phoneHash });
+      await archiveProspect(env, prospectId, "infoGeneral");
+      await saveSessionWithRetry(
+        env, phoneHash, channel, session.messages, session.version,
+        [{ role: "user", content: contentForHistory }, { role: "assistant", content: registro }]
+      );
+      // resetCounters: el contador vuelve a cero. Si mañana esta persona
+      // pregunta por un tratamiento, Sofía la atiende desde el principio en vez
+      // de caer otra vez en el tope con el primer mensaje.
+      await upsertConversation(env, {
+        phoneHash,
+        prospectId,
+        channel,
+        lastMessage: registro,
+        escalated: false,
+        escalationReason: null,
+        interactionId,
+        resetCounters: true,
+        procedureInterest: conversationState.procedureInterest,
+        sentiment: conversationState.sentiment,
+        phone,
+        patientName,
+      });
+      console.log("SOFIA_TOPE_SIN_ASESOR", JSON.stringify({ prospectId, motivo: motivoCierre, despedida: !!despedida }));
+      return;
+    }
+
     const limitReasonText = "límite de mensajes alcanzado";
     const limitReply = pickMessageLimitReply();
     await claimPromise;
@@ -1047,7 +1097,8 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // block explicitly instead of assuming it's first.
   const textBlock = (claudeData?.content || []).find((b) => b.type === "text");
   const rawText = textBlock?.text ?? "";
-  const { reply, escalated: taggedEscalated, escalation_reason: taggedReason, shouldClose } = parseEscalation(rawText);
+  const { reply, escalated: taggedEscalated, escalation_reason: taggedReason, shouldClose, silenced, silenceTag } =
+    parseEscalation(rawText);
 
   // Sofía sometimes tells the patient she's passing their case to the team
   // ("le voy a pasar la información al equipo", "le voy a transferir...")
@@ -1074,7 +1125,11 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // is "". finalReply is what actually goes out to the patient and gets
   // persisted everywhere below (history, session, lastMessage), so nothing
   // downstream ever sees the empty string.
-  const finalReply = escalated && !reply ? pickEscalationFallbackReply() : reply;
+  //
+  // En silencio no sale nada, pero el historial y last_message guardan la
+  // etiqueta: así en el próximo turno Sofía sabe que decidió no contestar, y
+  // el seguimiento proactivo la reconoce y no le escribe.
+  const finalReply = silenced ? silenceTag : escalated && !reply ? pickEscalationFallbackReply() : reply;
 
   const updatedHistory = await saveSessionWithRetry(
     env, phoneHash, channel, session.messages, session.version,
@@ -1099,7 +1154,11 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     });
     await transferToNextAgentInPool(env, prospectId, { phoneHash });
   } else {
-    await sendChannelMessageOrEscalate(env, prospectId, channel, reply, { phoneHash });
+    if (silenced) {
+      console.log("SOFIA_SILENCIO", JSON.stringify({ prospectId, etiqueta: silenceTag }));
+    } else {
+      await sendChannelMessageOrEscalate(env, prospectId, channel, reply, { phoneHash });
+    }
     // Classify every non-escalated turn too (not just escalations) so the
     // dashboard's conversation list shows a real topic/sentiment instead of
     // "sin clasificar" for the conversations Sofía resolves on her own — the
@@ -1206,11 +1265,83 @@ function parseEscalation(rawText) {
   // aparezca (no debería, pero escalar siempre gana).
   const closeMatch = rawText.match(/\[CERRAR\]/i);
   const shouldClose = !escalated && !!closeMatch;
+  // [NO_RESPONDER: motivo] — el system_prompt lo pide para quien escribe sin
+  // intención de consulta (coqueteo, compañía). Hasta el 2026-09-11 este
+  // archivo no lo conocía y la etiqueta salía TAL CUAL por WhatsApp: 73
+  // personas la recibieron, y al menos 12 eran pacientes que después
+  // preguntaron precios. Se limpia siempre; solo es silencio si no queda
+  // texto. Si Sofía escribió algo además de la etiqueta (6 de 132 casos,
+  // p. ej. "Espera, permíteme reconsiderar esto" y una respuesta real), se
+  // manda ese texto — contestarle de más a un curioso es mucho menos grave
+  // que dejar callado a un paciente.
+  const silenceMatch = rawText.match(NO_RESPONDER_TAG);
   const reply = rawText
     .replace(/\s*\[ESCALAR:?\s*([^\]]*)\]\s*/i, " ")
     .replace(/\s*\[CERRAR\]\s*/i, " ")
+    .replace(new RegExp(`\\s*${NO_RESPONDER_TAG.source}\\s*`, "gi"), " ")
     .trim();
-  return { reply, escalated, escalation_reason, shouldClose };
+  const silenced = !escalated && !!silenceMatch && reply === "";
+  return { reply, escalated, escalation_reason, shouldClose, silenced, silenceTag: silenced ? silenceMatch[0] : null };
+}
+
+const NO_RESPONDER_TAG = /\[NO_RESPONDER:?\s*[^\]]*\]/i;
+
+function esSilencio(content) {
+  return NO_RESPONDER_TAG.test(content ?? "");
+}
+
+function ultimoMensajeDeSofia(messages) {
+  return [...(messages || [])].reverse().find((m) => m.role === "assistant")?.content ?? "";
+}
+
+// Lo que el clasificador escribe cuando no hay tratamiento de por medio.
+// Medido sobre toda la base el 2026-09-11: estas son las únicas formas que
+// aparecen ("ninguno", "No aplica - proveedor", "Sin interés estético",
+// "Consulta laboral"...) y ninguna es un paciente. Los genéricos como
+// "información general" o "no especificado" NO entran a propósito: ahí sí
+// suele haber un paciente que todavía no dijo qué quiere.
+const SIN_TRATAMIENTO =
+  /^\s*(ningun|no aplica|sin inter[eé]s|sin procedimiento)|proveedor|comercial|b2b|empleo|vacante|laboral/i;
+
+// ¿Por qué cerrar al tope sin pasar a un asesor? Devuelve el motivo, o null
+// para pasarla como siempre. Ante la duda —o si una lectura falla— null:
+// mandarle al equipo a un no paciente cuesta un rato; equivocarse al revés
+// cuesta un paciente.
+async function motivoParaCerrarSinAsesor(env, { phoneHash, messages, procedureInterest }) {
+  if (esSilencio(ultimoMensajeDeSofia(messages))) return "Sofía ya no le respondía";
+  if (SIN_TRATAMIENTO.test(procedureInterest ?? "")) return `sin tratamiento (${procedureInterest})`;
+  // "Descartado" en Seguimiento es la palabra de una persona que ya revisó el
+  // caso. Pero si después apareció un tratamiento concreto, la conversación
+  // cambió y vuelve a merecer un asesor.
+  if (!yaSabemosElProcedimiento(procedureInterest) && (await elEquipoLaDescarto(env, phoneHash))) {
+    return "el equipo ya la había descartado";
+  }
+  return null;
+}
+
+async function elEquipoLaDescarto(env, phoneHash) {
+  const headers = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+  };
+  try {
+    const convRes = await fetchWithTimeout(
+      `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=id`,
+      { headers }
+    );
+    if (!convRes.ok) return false;
+    const ids = (await convRes.json()).map((r) => r.id);
+    if (!ids.length) return false;
+    const stRes = await fetchWithTimeout(
+      `${env.SUPABASE_URL}/rest/v1/sofia_followup_status?conversation_id=in.(${ids.join(",")})&estado=eq.descartado&select=conversation_id&limit=1`,
+      { headers }
+    );
+    if (!stRes.ok) return false;
+    return (await stRes.json()).length > 0;
+  } catch (err) {
+    console.error("elEquipoLaDescarto falló, se pasa al asesor como siempre", err);
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3586,6 +3717,13 @@ async function findFollowupCandidates(env) {
     // pacientes. Y el regex va SIN paréntesis de grupo — dentro de un or() de
     // PostgREST chocan con los del grupo y la consulta falla entera.
     `&or=(procedure_interest.is.null,procedure_interest.not.imatch.proveedor|comercial|no%20aplica|b2b|vacante|empleo|laboral)` +
+    // Ni a quien Sofía decidió no contestarle ([NO_RESPONDER]). Sin esto el
+    // barrido hacía justo lo que ella se había negado a hacer: a quien
+    // escribió "Keguapa" o "Te amo ati" le llegaba, dos horas después, "le
+    // escribo del Centro Europeo de Cirugía... ¿le puedo ayudar con algo
+    // más?". En silencio, last_message guarda la etiqueta — ver
+    // processInboundMessage.
+    `&or=(last_message.is.null,last_message.not.ilike.*NO_RESPONDER*)` +
     `&updated_at=gte.${desde}&updated_at=lte.${hasta}` +
     `&order=updated_at.asc&limit=200`;
 
