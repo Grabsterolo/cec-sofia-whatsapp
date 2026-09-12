@@ -2502,3 +2502,72 @@ tiene que encontrar la respuesta ahí dentro. El riesgo de dilución es bajo
 con Sonnet 5 y la rama ya estaba probada en producción, pero conviene leer
 conversaciones reales los primeros días. `rag_chunks: 0` marca exactamente
 cuáles tomaron esa rama.
+
+---
+
+## 5t. Sofía negaba tratamientos que sí están en la base — el índice de tratamientos (2026-09-11)
+
+Caso real, prospecto `6aa4ad2abf80962160d6039b`: la paciente escribió
+"¿Cuánto cuestan tus servicios?" y después "Para la técnica preserve". Sofía
+contestó "No tengo confirmada esa información específica sobre la técnica
+Preserve". El fragmento de Preservé™ existe y describe la técnica completa.
+
+### Por qué
+
+`ragSearch()` busca con los dos últimos mensajes juntos, y las palabras de
+precio se llevaron la búsqueda. Repetida con el mismo texto y la misma
+función:
+
+| fragmento | similitud |
+|---|---|
+| sección 6 — Limpieza facial | 0,480 |
+| sección 7 — Precios y pagos | 0,458 |
+| sección 6 — OxyGeneo | 0,453 |
+| Preservé™ | fuera de los 8 primeros |
+
+Como hubo fragmentos, no llegó el `knowledge_base` completo, que sí lo tiene.
+El resto lo hizo la regla del `system_prompt` que pide verificar "que alguno
+de los fragmentos mencione LITERALMENTE el procedimiento" y, si no, responder
+que no está confirmado. No es por la tilde: el 2026-09-08 falló igual con
+"preservé".
+
+Es el mismo problema que el de las promociones (5s): el RAG, al enfocar, le
+quita a Sofía la evidencia de que algo existe.
+
+**Magnitud:** 267 respuestas "no lo tengo confirmado" en 30 días. De esas, 65
+nombran un tratamiento que está en la base: Ultherapy 16, Preservé 8, Trilipo
+8, ADN de salmón 8, Radiesse 7, ácido hialurónico 5, NCTF 4, Liftera 4, y
+otros. El resto son preguntas sin nombre ("precio") o cosas que la base no
+tiene (IgniteRF, Smooth Eyes, Fotona): eso no lo arregla este cambio, son
+huecos de la base o negativos que faltan en la sección 5.22.
+
+### Qué cambió
+
+- **`indexarTratamientos()`** lee las secciones 4 y 5 y devuelve cada
+  tratamiento con su ficha: 80 hoy. Usa el mismo corte que `reindex.js`, y
+  está verificado que las 80 fichas son idénticas a un fragmento guardado.
+- **`construirCatalogo()`**: la lista de nombres va siempre en la rama del RAG,
+  en un bloque cacheado antes de las promociones. Mide 3.291 caracteres, unos
+  1.425 tokens: **≈ $3,40/mes**, proporcional al bloque de promociones
+  ($5,0/mes por 2.085 tokens, misma rama y mismo caché). Le dice a Sofía que
+  lo que está en la lista existe aunque no esté en los fragmentos, y que
+  "no lo tengo confirmado" queda solo para lo que no está.
+- **`sumarFichasNombradas()`**: si el paciente nombra un tratamiento (sin
+  tildes ni ™/®) y el RAG no trajo su ficha, la suma en lugar del fragmento
+  de menor similitud. Como mucho dos, tope `MAX_FRAGMENTOS` (6). En una
+  muestra de 200 turnos recientes pasó en el 2% y agregó 8 caracteres por
+  mensaje en promedio: **≈ $0,11/mes**. A veces resta, porque la ficha es más
+  corta que el fragmento que sale.
+- `SOFIA_USAGE` suma `fichas_nombradas`, con los nombres que se agregaron.
+
+No se tocó el `system_prompt`.
+
+### Límites conocidos
+
+- Se reconoce el nombre entero. "Mia" solo no suma la ficha de Mia® Femtech™,
+  porque chocaría con "mía". Las faltas de ortografía ("Maxtopexia") tampoco,
+  pero ahí el índice sí le permite a Sofía reconocer el tratamiento.
+- Un nombre que es también una palabra común suma una ficha de más ("hola soy
+  Lili" trae la de Lili®). El costo es un fragmento cambiado, nada más.
+- Si alguien renumera las secciones 4 y 5, el índice desaparece. Queda el
+  rastro `CATALOGO_NO_EXTRAIDO` en `wrangler tail`.
