@@ -1004,7 +1004,12 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
 
   const { system, knowledge_base } = sofiaConfig;
   const chunks = await ragSearch(env, history);
-  const systemBlocks = buildSystemBlocks(system, knowledge_base, chunks);
+  // Si el paciente nombró un tratamiento y el RAG no trajo su ficha, se suma
+  // (ver sumarFichasNombradas). `chunks` queda como lo devolvió el RAG, para
+  // SOFIA_USAGE.
+  const tratamientos = indexarTratamientos(knowledge_base);
+  const { fragmentos, nombradas } = sumarFichasNombradas(chunks, tratamientos, textoDeBusqueda(history));
+  const systemBlocks = buildSystemBlocks(system, knowledge_base, fragmentos, tratamientos);
 
   // Only this turn's message needs the image block — everything else in
   // history is already plain text (never persisted as an image, see above).
@@ -1038,6 +1043,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       salida: uso.output_tokens ?? 0,
       rag_chunks: chunks.length,
       rag_mejor_similitud: chunks[0]?.similarity ?? null,
+      fichas_nombradas: nombradas,
     }));
   }
 
@@ -1598,16 +1604,28 @@ async function resolveInboundContent(env, { text, attachment }) {
 // no literal porque ragSearch() tiene que reconocerlo para NO buscarlo.
 const PLACEHOLDER_SIN_TEXTO = "[mensaje sin texto]";
 
-async function ragSearch(env, history) {
-  // Buscar un "[mensaje sin texto]" no puede dar nada: no hay nada que buscar.
-  // Medido: 49 de 2.937 mensajes de paciente (1,7%) sobre 1.000 sesiones. Hoy
-  // igual se embeben en OpenAI y recuperan seis chunks al azar que terminan en
-  // el prompt de Claude, unos 290 viajes completos al mes para nada.
-  const searchQuery = history
+// Lo que se busca: los dos últimos mensajes del paciente, juntos. Lo usa
+// ragSearch() y también sumarFichasNombradas(), que tiene que mirar el mismo
+// texto para saber qué tratamiento nombró el paciente.
+//
+// Buscar un "[mensaje sin texto]" no puede dar nada: no hay nada que buscar.
+// Medido: 49 de 2.937 mensajes de paciente (1,7%) sobre 1.000 sesiones. Hoy
+// igual se embeben en OpenAI y recuperan seis chunks al azar que terminan en
+// el prompt de Claude, unos 290 viajes completos al mes para nada.
+function textoDeBusqueda(history) {
+  return history
     .filter((m) => m.role === "user" && contentToText(m.content).trim() !== PLACEHOLDER_SIN_TEXTO)
     .slice(-2)
     .map((m) => contentToText(m.content))
     .join(" ");
+}
+
+// Tope de fragmentos por mensaje, contando las fichas que se suman por nombre
+// en sumarFichasNombradas().
+const MAX_FRAGMENTOS = 6;
+
+async function ragSearch(env, history) {
+  const searchQuery = textoDeBusqueda(history);
 
   // Sin texto que buscar, Sofía responde con el knowledge_base completo — que
   // es la rama cacheada y la más barata por token.
@@ -1638,7 +1656,7 @@ async function ragSearch(env, history) {
       },
       body: JSON.stringify({
         query_embedding: queryEmbedding,
-        match_count: 6,
+        match_count: MAX_FRAGMENTOS,
         // Medido sobre 180 consultas reconstruidas de conversaciones reales de
         // ESTE Worker (auditoría 2026-09-03), no sobre consultas inventadas.
         //
@@ -1705,7 +1723,168 @@ function extraerPromociones(knowledgeBase) {
   return seccion.trim() || null;
 }
 
-function buildSystemBlocks(system, knowledge_base, chunks) {
+// Índice de los tratamientos del knowledge_base, con la ficha de cada uno.
+// Espejo en cecmarketing/functions/api/chat.js.
+//
+// Existe por un caso real (prospecto 6aa4ad2abf80962160d6039b, 2026-09-11):
+// la paciente preguntó "¿Cuánto cuestan tus servicios?" y después "Para la
+// técnica preserve". La búsqueda junta los dos mensajes, y las palabras de
+// precio se llevaron la similitud: pasaron el umbral la sección 6, la 7 y
+// OxyGeneo, y Preservé™ no quedó ni entre los 8 primeros. Como hubo
+// fragmentos, tampoco llegó el knowledge_base completo. Sofía no vio a
+// Preservé por ningún lado y aplicó la regla del system_prompt para
+// procedimientos que no puede confirmar: "No tengo confirmada esa información
+// específica sobre la técnica Preserve". Negó la técnica que creó el fundador.
+//
+// No es un caso aislado: esa respuesta salió 267 veces en los 30 días previos,
+// y una parte eran tratamientos que sí están en la base (Preservé 4 veces en
+// cinco días, Trilipo, Ultherapy, Radiesse, Morpheus, Geneo, mastopexia).
+// Tampoco es por la tilde: el 2026-09-08 falló igual con "preservé".
+//
+// Es el mismo problema que el de las promociones (ver extraerPromociones): el
+// RAG, al enfocar, le quita a Sofía la evidencia de que algo existe. Del
+// índice salen dos cosas:
+//   - construirCatalogo(): la lista de nombres, siempre, en la rama del RAG.
+//   - sumarFichasNombradas(): la ficha entera cuando el paciente la nombra.
+//
+// Un tratamiento es una línea "**Nombre**" dentro de una subsección de las
+// secciones 4 y 5, o una subsección entera ("### 5.5 Ultherapy") cuando no
+// tiene nombres en negrita. Es el mismo corte con el que reindex.js (en el
+// repo cecmarketing) arma los fragmentos, así que la ficha es el mismo texto
+// que el fragmento guardado.
+function indexarTratamientos(knowledgeBase) {
+  if (!knowledgeBase) return [];
+  const esLineaDeNombre = (l) => /^\*\*[^*]+\*\*/.test(l.trim());
+  const tratamientos = [];
+
+  for (const seccion of knowledgeBase.split(/(?=^## )/m)) {
+    if (!/^## [45]\.\s/.test(seccion)) continue;
+    const tituloSeccion = seccion.split("\n")[0].replace(/^##\s*[\d.]+\s*/, "").trim();
+
+    for (const sub of seccion.split(/(?=^### )/m).map((s) => s.trim())) {
+      const lineas = sub.split("\n");
+      const encabezado = lineas[0];
+      if (!encabezado.startsWith("### ")) continue;
+      const grupo = encabezado.replace(/^###\s*[\d.]+[a-z]?\s*/, "").trim();
+      const noSeOfrece = /no se ofrec/i.test(grupo);
+
+      if (!lineas.some(esLineaDeNombre)) {
+        tratamientos.push({ nombre: grupo, grupo: tituloSeccion, noSeOfrece, ficha: sub });
+        continue;
+      }
+
+      let actual = null;
+      for (const linea of lineas.slice(1)) {
+        if (esLineaDeNombre(linea)) {
+          const nombre = linea.trim().match(/^\*\*([^*]+)\*\*/)[1].trim();
+          actual = { nombre, grupo, noSeOfrece, lineas: [encabezado, linea] };
+          tratamientos.push(actual);
+        } else if (actual) {
+          actual.lineas.push(linea);
+        }
+      }
+    }
+  }
+
+  return tratamientos.map(({ lineas, ...t }) => (lineas ? { ...t, ficha: lineas.join("\n").trim() } : t));
+}
+
+// La lista de nombres, agrupada por subsección. Va cacheada, igual que las
+// promociones: es estática entre mensajes y cambia solo cuando se edita el
+// knowledge_base.
+function construirCatalogo(tratamientos) {
+  const grupos = new Map();
+  const noSeOfrecen = [];
+  for (const t of tratamientos) {
+    if (t.noSeOfrece) {
+      noSeOfrecen.push(t.nombre);
+      continue;
+    }
+    if (!grupos.has(t.grupo)) grupos.set(t.grupo, []);
+    grupos.get(t.grupo).push(t.nombre);
+  }
+  if (grupos.size === 0) return null;
+
+  const lineas = [...grupos].map(([grupo, nombres]) => `- ${grupo}: ${nombres.join(" · ")}`);
+  if (noSeOfrecen.length > 0) {
+    lineas.push(`- NO se ofrecen en CEC (aplica la regla de tratamientos que CEC no ofrece): ${noSeOfrecen.join(" · ")}`);
+  }
+  return lineas.join("\n");
+}
+
+const INSTRUCCIONES_CATALOGO =
+  "ÍNDICE COMPLETO DE TRATAMIENTOS Y TEMAS DEL CEC.\n" +
+  "Los fragmentos de la base de conocimiento que vienen más abajo son solo una parte de la base, " +
+  "elegida por parecido con el mensaje del paciente. Que un tratamiento no esté en esos fragmentos " +
+  "NO significa que el CEC no lo ofrezca: esta es la lista completa.\n" +
+  "- Si el paciente nombra un tratamiento de esta lista, aunque lo escriba sin tildes, sin ™ o ®, o con " +
+  "errores de ortografía, el CEC SÍ lo ofrece. Nunca le digas que no tienes confirmada la información " +
+  "ni que no conoces el tratamiento.\n" +
+  "- Si su ficha está entre los fragmentos, responde con ella. Si no está, confírmale que sí se realiza " +
+  "en el CEC, sin describirlo con conocimiento general, y pregúntale qué le gustaría saber u ofrécele la valoración.\n" +
+  "- Responder que no tienes la información confirmada queda solo para tratamientos que no están en esta lista.\n" +
+  "- Las reglas de precios no cambian: las cirugías nunca llevan precio.\n\n";
+
+// Letras sin tildes ni ™/®, en minúscula y con espacios en los bordes, para
+// comparar palabras enteras: "Preservé™" y "preserve" quedan iguales.
+function normalizarNombre(texto) {
+  const plano = texto.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  return ` ${plano.replace(/[^a-z0-9]+/g, " ").trim()} `;
+}
+
+// Las formas en que un paciente puede escribir un nombre del índice.
+// "Liposucción / Lipoescultura Vaser" da dos, "Morpheus 8" también se
+// reconoce como "morpheus8", y de los paréntesis solo se toma lo que parece
+// un nombre propio (lleva mayúscula: "PDRN", "Votiva"). Lo descriptivo, como
+// "(levantamiento de senos)", la búsqueda semántica ya lo encuentra bien: su
+// punto débil son los nombres de marca, que no significan nada en español.
+function variantesDeNombre(nombre) {
+  const principales = nombre.replace(/\([^)]*\)/g, " ").split(/\s+[\/+—]\s+|,/);
+  const entreParentesis = [...nombre.matchAll(/\(([^)]*)\)/g)]
+    .flatMap((m) => m[1].split(","))
+    .filter((p) => /[A-Z]/.test(p));
+  const variantes = [];
+  for (const parte of [...principales, ...entreParentesis]) {
+    const v = normalizarNombre(parte);
+    if (v.trim().length < 3) continue;
+    variantes.push(v);
+    if (/\d/.test(v)) variantes.push(` ${v.trim().replace(/ /g, "")} `);
+  }
+  return variantes;
+}
+
+// Cuando el paciente nombra un tratamiento del índice y el RAG no trajo su
+// ficha, la suma. Solo en la rama del RAG: sin fragmentos, Sofía ya recibe el
+// knowledge_base completo. Nunca pasa de MAX_FRAGMENTOS: si no hay lugar,
+// sale el fragmento de menor similitud. Como mucho dos fichas, la del nombre
+// más largo primero ("mesoterapia facial sin agujas" antes que "mesoterapia").
+//
+// Se compara por contenido y no por `category`: las promociones de la sección
+// 6 usan los mismos nombres ("Limpieza facial"), y un fragmento de promoción
+// no es la ficha del tratamiento.
+function sumarFichasNombradas(chunks, tratamientos, texto) {
+  if (chunks.length === 0 || !texto) return { fragmentos: chunks, nombradas: [] };
+  const textoNormalizado = normalizarNombre(texto);
+
+  const nombradas = tratamientos
+    .map((t) => ({
+      t,
+      largo: Math.max(0, ...variantesDeNombre(t.nombre).filter((v) => textoNormalizado.includes(v)).map((v) => v.length)),
+    }))
+    .filter(({ t, largo }) => largo > 0 && !chunks.some((c) => c.content?.trim() === t.ficha))
+    .sort((a, b) => b.largo - a.largo)
+    .slice(0, 2)
+    .map(({ t }) => t);
+
+  if (nombradas.length === 0) return { fragmentos: chunks, nombradas: [] };
+  const lugar = MAX_FRAGMENTOS - nombradas.length;
+  return {
+    fragmentos: [...nombradas.map((t) => ({ content: t.ficha })), ...chunks.slice(0, lugar)],
+    nombradas: nombradas.map((t) => t.nombre),
+  };
+}
+
+function buildSystemBlocks(system, knowledge_base, chunks, tratamientos) {
   const systemBlocks = [
     {
       type: "text",
@@ -1722,6 +1901,23 @@ function buildSystemBlocks(system, knowledge_base, chunks) {
   ];
 
   if (chunks.length > 0) {
+    // El índice de tratamientos va primero y cacheado, por lo mismo que las
+    // promociones de abajo: es estático entre mensajes y se lee a 0,1x. Ver
+    // indexarTratamientos(). Con él son tres cache_control en esta rama; la
+    // API acepta cuatro como máximo.
+    const catalogo = construirCatalogo(tratamientos);
+    if (catalogo) {
+      systemBlocks.push({
+        type: "text",
+        text: INSTRUCCIONES_CATALOGO + catalogo,
+        cache_control: { type: "ephemeral", ttl: "1h" },
+      });
+    } else {
+      // Mismo riesgo que PROMOCIONES_NO_EXTRAIDAS: si alguien renumera las
+      // secciones 4 y 5 desde el dashboard, el índice desaparece en silencio.
+      console.error("CATALOGO_NO_EXTRAIDO", "no se encontraron tratamientos en las secciones 4 y 5 del knowledge_base");
+    }
+
     // Va ANTES de los fragmentos y con su propio cache_control: es estático
     // entre mensajes (cambia una vez al mes), así que se lee a 0,1x en vez de
     // pagarse como entrada nueva. Sin cachear costaría 10 veces más
