@@ -1723,6 +1723,38 @@ function extraerPromociones(knowledgeBase) {
   return seccion.trim() || null;
 }
 
+// Lo que va arriba de la lista de promociones. Espejo en
+// cecmarketing/functions/api/chat.js. Ver README 5u.
+//
+// La primera versión decía solo "no le ofrezcas precio promocional ni le
+// digas que hay una promoción para él", y alcanzó para la mayoría: de 30
+// respuestas sobre Trilipo que hablaron de promociones entre el 2026-09-04 y
+// el 2026-09-14, 21 dijeron bien que no tiene. Pero el 2026-09-13 (sesión
+// 05de7761) Sofía le preguntó a la paciente la zona "antes de darle el
+// precio" —el paso que el system_prompt pide para los tratamientos en
+// promoción— y al recibirla habló del "precio específico de esta promoción".
+// Otras 4 dijeron "no lo tengo con precio de promoción confirmado", que da a
+// entender que la promoción existe y solo falta el dato: el asesor recibe
+// después a un paciente que pregunta por ella. La lista decía qué no afirmar,
+// pero no que el guion entero (indagar y después dar el precio promocional)
+// es solo para lo que está en ella.
+//
+// La última línea es del mismo día: una respuesta sobre Botox dijo "este mes
+// de agosto" con la lista de septiembre delante.
+//
+// El prompt no es un candado: esto baja la frecuencia, no la lleva a cero.
+const INSTRUCCIONES_PROMOCIONES =
+  "PROMOCIONES VIGENTES — ESTA ES LA LISTA COMPLETA.\n" +
+  "Si el tratamiento por el que pregunta el paciente NO aparece acá, ni solo ni dentro de un paquete, " +
+  "no tiene promoción este mes. Con ese tratamiento:\n" +
+  "- No le ofrezcas precio promocional ni hables de \"esta promoción\" o \"la promoción\" como si existiera.\n" +
+  "- Nunca digas que la promoción o su precio no lo tienes confirmado: eso da a entender que existe.\n" +
+  "- Indagar la zona y después dar el precio promocional es solo para los tratamientos de esta lista. " +
+  "Con los demás no anuncies que vas a dar un precio (\"antes de darle el precio...\"): no tienes uno.\n" +
+  "- Si pide el precio, sigue las reglas normales de precios, sin mencionar promociones.\n" +
+  "- Solo si pregunta directamente por una promoción, dile con claridad que este mes ese tratamiento no tiene.\n" +
+  "El mes de las promociones es el del encabezado de esta lista.\n\n";
+
 // Índice de los tratamientos del knowledge_base, con la ficha de cada uno.
 // Espejo en cecmarketing/functions/api/chat.js.
 //
@@ -1927,11 +1959,7 @@ function buildSystemBlocks(system, knowledge_base, chunks, tratamientos) {
     if (promociones) {
       systemBlocks.push({
         type: "text",
-        text:
-          "PROMOCIONES VIGENTES — ESTA ES LA LISTA COMPLETA.\n" +
-          "Si el tratamiento por el que pregunta el paciente NO aparece acá, no tiene promoción este mes: " +
-          "no le ofrezcas precio promocional ni le digas que hay una promoción para él.\n\n" +
-          promociones,
+        text: INSTRUCCIONES_PROMOCIONES + promociones,
         cache_control: { type: "ephemeral", ttl: "1h" },
       });
     } else {
