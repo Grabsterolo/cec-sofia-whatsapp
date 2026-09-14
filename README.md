@@ -2571,3 +2571,92 @@ No se tocó el `system_prompt`.
   Lili" trae la de Lili®). El costo es un fragmento cambiado, nada más.
 - Si alguien renumera las secciones 4 y 5, el índice desaparece. Queda el
   rastro `CATALOGO_NO_EXTRAIDO` en `wrangler tail`.
+
+---
+
+## 5u. Sofía habló de "esta promoción" de Trilipo con la lista de promociones delante (2026-09-13)
+
+Caso real, sesión `05de7761-d882-4062-89e7-59f9af8e6469`, 13/09 a las 10:55,
+con la versión `c12bd038` ya desplegada (la de 5t, que trae el bloque de
+promociones de 5s):
+
+1. Paciente: "¿Cuánto cuesta el tratamiento de Trilipo?"
+2. Sofía: "Antes de darle el precio, cuénteme: ¿qué zona le gustaría tratar…?"
+3. Paciente: "La zona del abdomen es la que me gustaría"
+4. Sofía: "Sobre el precio específico de **esta promoción**, no lo tengo
+   confirmado…"
+
+Trilipo no tiene promoción. Lo reportó el equipo con una captura: "recuerde
+que no hay promo".
+
+### Por qué
+
+El bloque de promociones decía qué no afirmar ("no le ofrezcas precio
+promocional ni le digas que hay una promoción para él"), pero el
+`system_prompt` tiene un guion para los tratamientos en promoción: primero
+indagar la zona, después dar el precio promocional. Sofía lo arrancó en el
+paso 2 ("antes de darle el precio") y lo cerró en el 4 con "esta promoción".
+Nada le decía que el guion entero es solo para lo que está en la lista.
+
+**Magnitud** — respuestas sobre Trilipo que hablaron de promociones, del
+04/09 al 14/09:
+
+| tipo | respuestas |
+|---|---|
+| dicen bien que no tiene promoción | 21 |
+| "no lo tengo con precio de promoción confirmado" (da a entender que existe) | 4 |
+| inventan la promoción | 1 |
+| otras | 4 |
+| **total** | **30** |
+
+Ese mismo 13/09 una respuesta sobre Botox dijo "este mes de agosto" con la
+lista de septiembre delante. "Agosto" no aparece ni en el `system_prompt` ni
+en el `knowledge_base`.
+
+### Qué cambió
+
+`INSTRUCCIONES_PROMOCIONES` reemplaza las dos líneas que iban arriba de la
+lista. Mismo texto en `cecmarketing/functions/api/chat.js`. Agrega:
+
+- que un tratamiento que no está en la lista, ni solo ni dentro de un
+  paquete, no tiene promoción;
+- que no se hable de "esta promoción" ni se diga que la promoción "no está
+  confirmada";
+- que el guion de indagar y dar el precio promocional es solo para lo que
+  está en la lista;
+- que si piden el precio de otro tratamiento se sigan las reglas normales,
+  sin mencionar promociones;
+- que el mes es el del encabezado de la lista.
+
+No se tocó el `system_prompt` ni la base. El bloque sigue cacheado; crece unos
+200 tokens, o sea centavos al mes.
+
+### Cómo comprobar que funcionó
+
+No se pudo probar antes del deploy: en esta máquina no está la clave de
+Anthropic ni `SOFIA_CHAT_SECRET`. Después del deploy, repetir la medición de
+arriba sobre los días nuevos:
+
+```sql
+with r as (
+  select m->>'content' c from sofia_whatsapp_sessions s, jsonb_array_elements(s.messages) m
+  where s.updated_at > '<fecha del deploy>' and m->>'role'='assistant'
+    and m->>'content' ilike '%trilipo%' and m->>'content' ilike '%promoci%')
+select count(*) total,
+  count(*) filter (where c ~* 'no (lo )?tengo (con precio de promoci|confirmado dentro de las promoci|entre las promoci|una promoción vigente para confirmar)') ambiguas,
+  count(*) filter (where c ~* '(de|en) esta promoci|la promoción de (este|trilipo)') inventa
+from r;
+```
+
+### Límites conocidos
+
+- **El prompt no es un candado.** Si vuelve a pasar, el paso siguiente es un
+  control sobre la respuesta, como `FOLLOWUP_CLAIM` en los seguimientos: una
+  respuesta que habla de una promoción sin nombrar nada de la sección 6.
+- **Solo cubre la rama del RAG.** En la del respaldo (sin fragmentos, o un
+  "[mensaje sin texto]" solo) Sofía ve la sección 6 dentro del
+  `knowledge_base` completo, sin estas instrucciones. El 08/09 (sesión
+  `73fcd6fc`), después de un "[mensaje sin texto]", ofreció Morpheus Burst Deep
+  Corporal a $600 por área o $1.650 por tres sesiones: no está en la sección 6,
+  ni en el resto de la base, ni en el `system_prompt`. No se sabe en qué rama
+  pasó.
