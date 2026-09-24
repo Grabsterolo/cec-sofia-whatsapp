@@ -1680,11 +1680,14 @@ Zenvia si ese prospecto terminó en venta.
   `campaignConversion` ("Venta de campaña") — confirmado en vivo vía
   `GET /as-user/archiving-reasons`.
 - El dashboard (`cecmarketing`) lo muestra en **Métricas Sofía**, tarjeta
-  "Conversión a paciente" — `functions/api/conversion-stats.js` hace de
+  "Conversión real en Zenvia" — `functions/api/conversion-stats.js` hace de
   proxy (mismo patrón que `send-birthday.js`, secret nunca llega al
   navegador). *(Al implementarse vivía en Inicio, pero esa tarjeta se
   reemplazó por sentimiento en `1171471` del repo del dashboard y el
-  endpoint se quedó meses sin ningún consumidor.)*
+  endpoint se quedó meses sin ningún consumidor, hasta que el 2026-09-24 se
+  le puso la tarjeta actual.)* La tarjeta no usa el `conversionRate` de la
+  respuesta: ese ignora el `to` de la pantalla, así que cruza `detail`
+  contra los `prospect_id` del rango que se está viendo.
 
 **Limitación 1 — no es retroactivo:** el número solo tiene sentido después
 de que se acumulen suficientes conversaciones nuevas; el día que se
@@ -1708,6 +1711,25 @@ Paginar no es una opción con esta API. El arreglo de fondo sería **persistir
 el `archivingReason` en Supabase** a medida que se observa (una columna en
 `sofia_conversations`), de modo que el histórico se acumule donde no hay tope
 y deje de depender de una consulta capada en cada llamada. No está hecho.
+
+**Limitación 3 — Supabase cortaba en 1000 filas, ARREGLADO (2026-09-24):**
+la consulta a `sofia_conversations` no paginaba. PostgREST devuelve como
+mucho 1000 filas por respuesta y no avisa que truncó, así que el endpoint
+juntaba los `prospect_id` de las primeras 1000 conversaciones y calculaba la
+conversión sobre esa muestra, presentándola como el total.
+
+Se vio al estrenar la tarjeta en el dashboard: `?since=2026-09-01` devolvía
+`conversationsWithProspectId: 1000` cuando la tabla tenía 5081 filas con
+`prospect_id` en ese rango. El número que salía — 1,2% — estaba calculado
+sobre una quinta parte arbitraria.
+
+Ahora pagina de a 1000 con `limit`/`offset` y `order=created_at.asc` (sin
+`ORDER BY` el offset no garantiza páginas disjuntas), con un tope de 50
+páginas como guarda. Es el mismo patrón que `fetchAllInRange` en el
+dashboard, que ya había tropezado con este límite antes.
+
+Ojo con la diferencia entre las dos limitaciones: el tope de 5000 es de la
+API de Zenvia y no se puede paginar; este era de Supabase y sí.
 
 **`detail` (2026-08-27):** la respuesta también trae `detail`, un mapa
 `{ prospect_id: archivingReason }`, para que el dashboard pueda filtrar leads

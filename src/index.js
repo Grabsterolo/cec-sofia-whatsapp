@@ -3185,22 +3185,36 @@ async function handleConversionStats(request, env) {
   const url = new URL(request.url);
   const since = url.searchParams.get("since"); // ISO date, optional
 
-  let query = `${env.SUPABASE_URL}/rest/v1/sofia_conversations?select=prospect_id&prospect_id=not.is.null`;
-  if (since) query += `&created_at=gte.${encodeURIComponent(since)}`;
+  // PostgREST devuelve como mucho 1.000 filas por respuesta y no avisa que
+  // truncó. Septiembre de 2026 ya tenía 5.081 conversaciones con prospect_id,
+  // así que la conversión venía calculada sobre las primeras 1.000 y en
+  // silencio: 1,2% sobre una muestra arbitraria, presentado como el total.
+  // Se pagina igual que fetchAllInRange en el dashboard. El orden explícito
+  // es necesario: sin ORDER BY, el offset no garantiza páginas disjuntas.
+  const SUPABASE_PAGE_SIZE = 1000;
+  const MAX_PAGES = 50; // 50.000 conversaciones; guarda contra un bucle infinito
+  const rows = [];
+  for (let page = 0; page < MAX_PAGES; page++) {
+    let query = `${env.SUPABASE_URL}/rest/v1/sofia_conversations?select=prospect_id&prospect_id=not.is.null&order=created_at.asc`;
+    query += `&limit=${SUPABASE_PAGE_SIZE}&offset=${page * SUPABASE_PAGE_SIZE}`;
+    if (since) query += `&created_at=gte.${encodeURIComponent(since)}`;
 
-  const rowsRes = await fetch(query, {
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-  if (!rowsRes.ok) {
-    return new Response(JSON.stringify({ error: `Error leyendo sofia_conversations: ${rowsRes.status}` }), {
-      status: 502,
-      headers: { "content-type": "application/json" },
+    const rowsRes = await fetch(query, {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      },
     });
+    if (!rowsRes.ok) {
+      return new Response(JSON.stringify({ error: `Error leyendo sofia_conversations: ${rowsRes.status}` }), {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const lote = await rowsRes.json();
+    rows.push(...lote);
+    if (lote.length < SUPABASE_PAGE_SIZE) break;
   }
-  const rows = await rowsRes.json();
   const prospectIds = [...new Set(rows.map((r) => r.prospect_id))];
 
   if (prospectIds.length === 0) {
