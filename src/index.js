@@ -1255,6 +1255,19 @@ const HANDOFF_PROMISE_PATTERNS = [
   /le voy a transferir/i,
   /le va a contactar (nuestro |el )?equipo/i,
   /nuestro equipo le va a (estar contactando|contactar)/i,
+  // Agregados el 2026-09-25: la lista de agosto solo cubría "le voy a pasar"
+  // y sus variantes, pero Sofía promete averiguar de muchas otras formas. La
+  // más común sale del propio system_prompt, que para un tratamiento que no
+  // puede confirmar le sugiere textualmente "Le consulto con el equipo y le
+  // confirmo". En 30 días eso dejó 227 mensajes fuera de la red y 53
+  // conversaciones donde la paciente quedó esperando una respuesta que nadie
+  // tenía encargada. Medidos contra esos 30 días: un solo falso positivo, y
+  // era una escalación legítima igual.
+  /le (consulto|pregunto|averiguo) (con|al|a) (el |mi |nuestro )?(equipo|asesor|departamento|[áa]rea)/i,
+  /le voy a (consultar|averiguar|preguntar)/i,
+  /(d[ée]jeme|perm[íi]tame|deje que) (consultar|averiguar|verificar|confirmar)/i,
+  /le (paso|traslado|comparto) (su|esta) (caso|consulta|duda|informaci[óo]n|pregunta)/i,
+  /le aviso (apenas|en cuanto|ni bien)/i,
 ];
 
 function mentionsHandoffPromise(text) {
