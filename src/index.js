@@ -272,6 +272,25 @@ const FOLLOWUP_MESSAGE_FALLBACK =
   "conversación y quería saber si le puedo ayudar con algo más o aclararle " +
   "alguna duda.";
 
+// Respaldo aparte para quien escribió UNA sola vez. El de arriba dice "quedó
+// abierta nuestra conversación", y con un solo mensaje de por medio eso suena
+// a conversación que nunca existió. Ver FOLLOWUP_PRIMER_MENSAJE.
+const FOLLOWUP_MESSAGE_FALLBACK_PRIMER =
+  "Buen día, le escribo del Centro Europeo de Cirugía. Quería saber si le " +
+  "quedó alguna duda sobre lo que consultó, con gusto le ayudo.";
+
+// Cuántas horas de silencio antes de escribirle a quien mandó UN solo mensaje.
+// Más que las 2 de FOLLOWUP_MIN_SILENCE_HOURS a propósito: quien sostuvo una
+// conversación de ida y vuelta ya mostró que quiere hablar, y a las 2 horas un
+// recordatorio se lee como servicio. Quien escribió una vez todavía no mostró
+// nada, y escribirle a las 2 horas se lee como acoso. Seis horas deja que la
+// persona vuelva sola —que es lo que pasa en la mayoría de los casos— antes de
+// que la clínica insista.
+//
+// El techo sigue siendo FOLLOWUP_MAX_SILENCE_HOURS (20h): pasado eso se cierra
+// la ventana de 24h de WhatsApp y ya no se puede mandar texto libre.
+const FOLLOWUP_MIN_SILENCE_PRIMER_MENSAJE_HORAS = 6;
+
 // Lo que NUNCA puede salir en un mensaje automático que nadie lee antes de
 // enviarlo. Sofía ya prometió una promoción de Trilipo que no existía
 // (f60755d) teniendo a un paciente enfrente; sin supervisión es esa trampa con
@@ -320,7 +339,7 @@ function corregirSaludo(texto, horaCR) {
   );
 }
 
-async function redactarSeguimiento(env, messages) {
+async function redactarSeguimiento(env, messages, { primerMensaje = false } = {}) {
   // La corrección va acá y no solo en la rama generada: el respaldo empieza con
   // "Buen día" fijo, y a las 3 de la tarde eso también está mal. Todo lo que
   // sale por esta función pasa por el mismo filtro.
@@ -337,7 +356,8 @@ async function redactarSeguimiento(env, messages) {
     .slice(-6)
     .map((m) => `${m.role === "user" ? "Paciente" : "Sofía"}: ${m.content}`)
     .join("\n");
-  if (!historial) return resp(FOLLOWUP_MESSAGE_FALLBACK, "sin_historial");
+  const respaldo = primerMensaje ? FOLLOWUP_MESSAGE_FALLBACK_PRIMER : FOLLOWUP_MESSAGE_FALLBACK;
+  if (!historial) return resp(respaldo, "sin_historial");
 
   try {
     const res = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
@@ -354,8 +374,16 @@ async function redactarSeguimiento(env, messages) {
         // corrida real, un mensaje de las 6 de la tarde abrió con "Buenos
         // días". El otro que acertó lo hizo por azar, no por criterio.
         system:
-          "Sos Sofía, del Centro Europeo de Cirugía. El paciente dejó de responder hace un par de " +
-          "horas. Escribí UN mensaje de WhatsApp para retomar la conversación.\n\n" +
+          "Sos Sofía, del Centro Europeo de Cirugía. " +
+          (primerMensaje
+            // Con un solo mensaje de por medio no hay conversación que "retomar",
+            // y hablar como si la hubiera se nota falso. Tampoco hubo una
+            // pregunta sin responder: la persona preguntó, se le contestó, y no
+            // volvió. Lo único honesto que se puede ofrecer es resolver dudas.
+            ? "El paciente escribió UNA sola vez, usted ya le respondió, y no volvió a escribir. " +
+              "Escribí UN mensaje de WhatsApp breve ofreciéndole resolver dudas sobre lo que consultó.\n\n"
+            : "El paciente dejó de responder hace un par de horas. Escribí UN mensaje de WhatsApp " +
+              "para retomar la conversación.\n\n") +
           `Hora actual en Costa Rica: ${horaCR}. Si saludás, que el saludo corresponda a esa hora.\n\n` +
           "REGLAS ESTRICTAS:\n" +
           "- Máximo 2 oraciones.\n" +
@@ -379,23 +407,23 @@ async function redactarSeguimiento(env, messages) {
     });
     if (!res.ok) {
       console.error("redactarSeguimiento: Claude respondió", res.status);
-      return resp(FOLLOWUP_MESSAGE_FALLBACK, `api_${res.status}`);
+      return resp(respaldo, `api_${res.status}`);
     }
     const data = await res.json();
     const texto = (data?.content || []).find((b) => b.type === "text")?.text?.trim();
 
     // Validación. Cualquier duda cae al respaldo, nunca al mensaje del modelo.
     const u = data?.usage;
-    if (!texto)               return resp(FOLLOWUP_MESSAGE_FALLBACK, "vacio", u);
-    if (texto.length > FOLLOWUP_LARGO_MAX) return resp(FOLLOWUP_MESSAGE_FALLBACK, "muy_largo", u);
-    if (FOLLOWUP_CLAIM.test(texto)) return resp(FOLLOWUP_MESSAGE_FALLBACK, "afirmacion_prohibida", u);
-    if (FOLLOWUP_MONTO.test(texto)) return resp(FOLLOWUP_MESSAGE_FALLBACK, "monto_en_el_texto", u);
+    if (!texto)               return resp(respaldo, "vacio", u);
+    if (texto.length > FOLLOWUP_LARGO_MAX) return resp(respaldo, "muy_largo", u);
+    if (FOLLOWUP_CLAIM.test(texto)) return resp(respaldo, "afirmacion_prohibida", u);
+    if (FOLLOWUP_MONTO.test(texto)) return resp(respaldo, "monto_en_el_texto", u);
     // Emojis: el prompt los prohíbe, pero el prompt no es un candado.
     const limpio = texto.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, "").replace(/\s{2,}/g, " ").trim();
     return resp(limpio, null, u);
   } catch (err) {
     console.error("redactarSeguimiento falló", err);
-    return resp(FOLLOWUP_MESSAGE_FALLBACK, "excepcion");
+    return resp(respaldo, "excepcion");
   }
 }
 
@@ -2063,6 +2091,44 @@ function formatCostaRicaDateTime(date = new Date()) {
 // reply sent to the patient, see the caller's CLAUDE_CALL_FAILED branch).
 // Returns null once all attempts are exhausted; callers must treat that as
 // "no reply available", never fall back to an empty string.
+// La API de Anthropic espera turnos que alternen user/assistant. El historial
+// guardado SÍ puede traer dos entradas seguidas del mismo rol desde que el
+// seguimiento proactivo se guarda como turno propio (ver
+// guardarSeguimientoEnHistorial): Sofía se despide y, horas después, vuelve a
+// escribir sin que el paciente haya dicho nada en medio.
+//
+// Antes eso se evitaba pegando el seguimiento al final del mensaje anterior,
+// lo que dejaba el historial mintiendo: una sola intervención que decía "que
+// tenga un excelente día" y, sin corte, "buenos días, quedó pendiente...".
+// Medido el 2026-09-29: 251 de 956 conversaciones de cinco días con el
+// historial así. El clasificador y el dashboard leían eso como un solo mensaje.
+//
+// Ahora se guardan separados —que es la verdad— y se fusionan ACÁ, solo para
+// la llamada. Lo que recibe el modelo es idéntico a lo que recibía antes;
+// lo que cambia es que el registro quedó bien.
+function fusionarTurnosSeguidos(history) {
+  const salida = [];
+  // La API además exige que el PRIMER mensaje sea del paciente. Hoy no puede
+  // pasar de otra forma —processInboundMessage siempre recorta después de
+  // agregar el mensaje entrante, así que el user queda primero—, pero desde que
+  // el seguimiento agrega una entrada propia el arreglo guardado sí puede
+  // quedar empezando por un mensaje de Sofía. Sale barato cerrarlo acá: perder
+  // el turno más viejo es mucho menos grave que un 400 que deja al paciente sin
+  // respuesta.
+  const desdeElPaciente = history.findIndex((m) => m.role === "user");
+  for (const m of desdeElPaciente > 0 ? history.slice(desdeElPaciente) : history) {
+    const anterior = salida[salida.length - 1];
+    // Solo se fusiona texto plano. Un bloque de imagen (array de content) se
+    // deja intacto: mezclarlo rompería el formato que espera la API.
+    if (anterior && anterior.role === m.role && typeof anterior.content === "string" && typeof m.content === "string") {
+      salida[salida.length - 1] = { ...anterior, content: `${anterior.content}\n\n${m.content}` };
+    } else {
+      salida.push(m);
+    }
+  }
+  return salida;
+}
+
 async function callClaude(env, systemBlocks, history) {
   let lastFailure = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -2084,7 +2150,7 @@ async function callClaude(env, systemBlocks, history) {
           // this function). Disabling it keeps content[0] a plain text block.
           thinking: { type: "disabled" },
           system: systemBlocks,
-          messages: history,
+          messages: fusionarTurnosSeguidos(history),
         }),
       }, 15000);
       if (response.ok) {
@@ -2754,7 +2820,39 @@ async function addLabelToProspect(env, prospectId, label) {
 // subscriptions, despite the confusingly identical name). Left in, since
 // it's best-effort and harmless when it fails, and it'll start working the
 // moment that permission is granted from the Zenvia side — see README 1.5d.
-async function sendEscalationNotification(env, escalationReason) {
+// El push que le avisa al asesor que le acaba de caer una conversación.
+//
+// Hasta el 2026-09-29 esto solo hacía console.error al fallar, y por eso la
+// auditoría de esa fecha —hecha contra la base— no lo vio: la falla no dejaba
+// ni una fila en ningún lado. Se descubrió mirando `wrangler tail` en vivo, por
+// casualidad, mientras se verificaba otro despliegue. Venía devolviendo 400
+// "This app does not have the permissions to send notifications", que es un
+// permiso de la app de Zenvia y no una falla pasajera.
+//
+// Importa más de lo que parece: el traspaso en Zenvia SÍ funciona (el contador
+// del round-robin avanza, medido en vivo), así que la conversación llega a la
+// bandeja del asesor — pero nadie le dice que llegó. Ahora queda registrado y
+// se puede contar cuántas escalaciones se quedan sin aviso.
+//
+// ESTADO AL 2026-09-29: APAGADO. JP confirmó que el permiso de "Custom App"
+// no se va a habilitar en la cuenta de Zenvia, así que esta llamada no puede
+// funcionar nunca. Se deja el código completo —no se borra— porque si algún día
+// cambia esa decisión, alcanza con poner la constante en true.
+//
+// Por qué apagarla y no dejarla fallando: corre en CADA escalación (~55 al día)
+// justo antes de transferToNextAgentInPool(), o sea que cada una gasta un viaje
+// a Zenvia y demora el traspaso al asesor para obtener siempre el mismo 400.
+// Antes "no costaba nada que fallara"; medido, sí cuesta.
+//
+// El asesor NO se queda sin saber: la transferencia le asigna la conversación y
+// le aparece en su panel, y addEscalationNote() le deja el contexto de los dos
+// últimos mensajes. Lo que falta es solo el aviso proactivo.
+const ESCALATION_PUSH_HABILITADO = false;
+
+// prospectId se pasa desde runEscalationAgility() por si se reactiva y se quiere
+// registrar a quién correspondía cada intento.
+async function sendEscalationNotification(env, escalationReason, prospectId = null) {
+  if (!ESCALATION_PUSH_HABILITADO) return;
   try {
     const title = "Sofía escaló una conversación";
     const body = escalationReason || "Revisar conversación de WhatsApp";
@@ -2827,7 +2925,7 @@ async function runEscalationAgility(env, { prospectId, history, escalationReason
     if (classification.label) {
       await addLabelToProspect(env, prospectId, classification.label);
     }
-    await sendEscalationNotification(env, escalationReason);
+    await sendEscalationNotification(env, escalationReason, prospectId);
     return classification;
   } catch (err) {
     console.error("runEscalationAgility failed", err);
@@ -2906,6 +3004,20 @@ async function transferToNextAgentInPool(env, prospectId, { phoneHash } = {}) {
 // comment above), so this should clear any backlog within one or two runs.
 const MAX_STUCK_ESCALATIONS_PER_RUN = 25;
 
+// Cuánto hacia atrás mira retryStuckEscalations(). Sin esto la consulta pedía
+// 25 filas de un universo de 4.793 conversaciones escaladas SIN ORDER BY y sin
+// filtro de fecha — auditoría del 2026-09-29. El 88% de ese universo llevaba
+// más de una semana sin actividad, así que los 25 cupos se gastaban siempre en
+// casos de agosto (reproducido: devolvía conversaciones del 8-ago, 25-ago,
+// 31-ago, 1-sep) y un traspaso que fallara HOY no se reintentaba nunca.
+//
+// 72h y no más: para una conversación escalada `updated_at` queda congelado en
+// el momento de la escalación, porque Sofía se calla. O sea que esto es
+// literalmente "escaladas en los últimos 3 días". Pasado ese plazo, si nadie
+// escribió, el reintento ya no aporta: el siguiente mensaje del paciente la
+// reanima solo por el cooldown de 48h (ver ESCALATION_COOLDOWN_HOURS).
+const STUCK_ESCALATION_WINDOW_HOURS = 72;
+
 // Single source of truth for "retry a stuck handoff": reuses
 // transferToNextAgentInPool() exactly as processInboundMessage()'s inline
 // retry does — same function, same HUMAN_AGENT_IDS/archived rules, same
@@ -2920,8 +3032,17 @@ async function retryStuckEscalations(env) {
     Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
   };
 
+  const desdeIso = new Date(Date.now() - STUCK_ESCALATION_WINDOW_HOURS * 3600_000).toISOString();
+
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?escalated=eq.true&prospect_id=not.is.null&select=prospect_id,phone_hash&limit=${MAX_STUCK_ESCALATIONS_PER_RUN}`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations` +
+      `?escalated=eq.true&prospect_id=not.is.null` +
+      `&updated_at=gte.${desdeIso}` +
+      // Las más recientes primero: son las que todavía tienen al paciente
+      // esperando. Sin ORDER BY, Postgres devolvía las del principio del heap
+      // —las más viejas— y las nuevas no entraban nunca.
+      `&order=updated_at.desc` +
+      `&select=prospect_id,phone_hash&limit=${MAX_STUCK_ESCALATIONS_PER_RUN}`,
     { headers }
   );
   if (!res.ok) {
@@ -3108,20 +3229,48 @@ async function pickNextPoolAgent(env) {
       `${env.SUPABASE_URL}/rest/v1/sofia_config?id=eq.1&select=escalation_round_robin_index`,
       { headers }
     );
-    const currentIndex = res.ok ? (await res.json())[0]?.escalation_round_robin_index ?? 0 : 0;
 
+    // Si la LECTURA falla, antes se caía a currentIndex = 0 — o sea, a Adrián,
+    // siempre, y además se escribía un 1 encima, reseteando la rotación de
+    // todos. Un parpadeo de red le mandaba a una sola persona todas las
+    // escalaciones siguientes. Ahora: se reparte al azar (que a la larga
+    // reparte igual de parejo) y NO se escribe nada, para no pisar el contador
+    // bueno con un valor inventado.
+    if (!res.ok) {
+      console.error("pickNextPoolAgent: no se pudo leer el contador", res.status);
+      await logReliabilityEvent(env, {
+        eventType: "round_robin_failed",
+        detail: `lectura de escalation_round_robin_index falló: http ${res.status} — se asignó al azar, contador intacto`,
+      });
+      return HUMAN_AGENTS[Math.floor(Math.random() * HUMAN_AGENTS.length)].id;
+    }
+
+    const currentIndex = (await res.json())[0]?.escalation_round_robin_index ?? 0;
     const agent = HUMAN_AGENTS[currentIndex % HUMAN_AGENTS.length];
 
-    await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_config?id=eq.1`, {
+    // La ESCRITURA tampoco se revisaba — auditoría del 2026-09-29. El traspaso
+    // igual ocurre (el asesor ya está elegido), pero si esto falla el contador
+    // no avanza y el siguiente traspaso le toca a la MISMA persona. Repetido,
+    // desbalancea el reparto sin que nadie se entere. No se reintenta a
+    // propósito: mandar dos veces el mismo PATCH bajo contención empeora la
+    // carrera que ya tiene el leer-y-escribir. Solo se deja rastro.
+    const escritura = await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_config?id=eq.1`, {
       method: "PATCH",
       headers: { ...headers, Prefer: "return=minimal" },
       body: JSON.stringify({ escalation_round_robin_index: currentIndex + 1 }),
     });
+    if (!escritura.ok) {
+      console.error("pickNextPoolAgent: el contador no avanzó", escritura.status);
+      await logReliabilityEvent(env, {
+        eventType: "round_robin_failed",
+        detail: `escritura de escalation_round_robin_index falló: http ${escritura.status} — el próximo traspaso repite agente ${agent.name}`,
+      });
+    }
 
     return agent.id;
   } catch (err) {
     console.error("pickNextPoolAgent threw", err);
-    return HUMAN_AGENTS[0].id;
+    return HUMAN_AGENTS[Math.floor(Math.random() * HUMAN_AGENTS.length)].id;
   }
 }
 
@@ -3937,16 +4086,67 @@ function estaEnHorarioDeSeguimiento(ahora = new Date()) {
 // recibe, y eso está confirmado en los datos — las 12.099 sesiones tienen
 // exactamente la misma cantidad de mensajes `user` y `assistant`, cero
 // desbalanceadas.
-async function findFollowupCandidates(env) {
+// El interruptor del primer mensaje se lee APARTE y no dentro de
+// loadSofiaConfig(), a propósito. PostgREST responde 400 —no un campo vacío—
+// cuando se le pide una columna que no existe, y loadSofiaConfig() ante un
+// error devuelve system: "" con whatsapp_enabled: true. O sea que sumar la
+// columna a ese select haría que, si la migración todavía no se aplicó, Sofía
+// siguiera contestando pero SIN prompt ni base de conocimiento. Leerlo acá deja
+// ese riesgo en cero: lo peor que puede pasar es que el interruptor se lea como
+// apagado, que es justo el valor seguro.
+async function seguimientoPrimerMensajeActivo(env) {
+  try {
+    const res = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/sofia_config?id=eq.1&select=followup_primer_mensaje_enabled`,
+      {
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        },
+      }
+    );
+    if (!res.ok) {
+      console.log(`seguimientoPrimerMensajeActivo: no se pudo leer (http ${res.status}) — se asume apagado`);
+      return false;
+    }
+    return (await res.json())[0]?.followup_primer_mensaje_enabled === true;
+  } catch (err) {
+    console.error("seguimientoPrimerMensajeActivo falló — se asume apagado", err);
+    return false;
+  }
+}
+
+// Intercala varias listas por turnos: uno de cada una, hasta agotarlas. No
+// corta nada — el corte lo sigue haciendo el lote (FOLLOWUP_MAX_PER_RUN) donde
+// siempre se hizo. Intercalando acá, ese mismo slice(0, 8) reparte solo las
+// plazas entre los dos caminos, y el dry run sigue viendo la lista completa.
+function intercalar(listas) {
+  const salida = [];
+  const copias = listas.map((l) => [...l]);
+  while (copias.some((l) => l.length)) {
+    for (const lista of copias) {
+      const siguiente = lista.shift();
+      if (siguiente) salida.push(siguiente);
+    }
+  }
+  return salida;
+}
+
+async function findFollowupCandidates(env, { primerMensajeActivo = false } = {}) {
   const ahora = Date.now();
   const desde = new Date(ahora - FOLLOWUP_MAX_SILENCE_HOURS * 3600_000).toISOString();
   const hasta = new Date(ahora - FOLLOWUP_MIN_SILENCE_HOURS * 3600_000).toISOString();
+  // Ventana más ancha por abajo para el primer mensaje — ver
+  // FOLLOWUP_MIN_SILENCE_PRIMER_MENSAJE_HORAS.
+  const hastaPrimer = new Date(ahora - FOLLOWUP_MIN_SILENCE_PRIMER_MENSAJE_HORAS * 3600_000).toISOString();
 
-  const url =
-    `${env.SUPABASE_URL}/rest/v1/sofia_conversations` +
-    `?select=id,phone_hash,prospect_id,channel,procedure_code,message_count,updated_at` +
-    `&escalated=eq.false` +
-    `&message_count=gte.2` +
+  const headers = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+  };
+
+  // Filtros que valen para cualquier candidato, con o sin conversación previa.
+  const comunes =
     `&prospect_id=not.is.null` +
     `&phone_hash=not.is.null` +
     `&or=(derived_to_appointment.is.null,derived_to_appointment.eq.false)` +
@@ -3974,21 +4174,83 @@ async function findFollowupCandidates(env) {
     // escribo del Centro Europeo de Cirugía... ¿le puedo ayudar con algo
     // más?". En silencio, last_message guarda la etiqueta — ver
     // processInboundMessage.
-    `&or=(last_message.is.null,last_message.not.ilike.*NO_RESPONDER*)` +
+    `&or=(last_message.is.null,last_message.not.ilike.*NO_RESPONDER*)`;
+
+  const base = `${env.SUPABASE_URL}/rest/v1/sofia_conversations` +
+    `?select=id,phone_hash,prospect_id,channel,procedure_code,procedure_interest,message_count,updated_at` +
+    `&escalated=eq.false`;
+
+  // (1) La lista de siempre: gente que sostuvo una conversación y se calló.
+  const urlConversacion =
+    base + `&message_count=gte.2` + comunes +
     `&updated_at=gte.${desde}&updated_at=lte.${hasta}` +
     `&order=updated_at.asc&limit=200`;
 
-  const res = await fetchWithTimeout(url, {
-    headers: {
-      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-    },
-  });
-  if (!res.ok) {
-    console.error("findFollowupCandidates failed", res.status, await res.text());
-    return null; // falla cerrado: sin lista, no se manda nada
+  // (2) Los que escribieron UNA sola vez. Auditoría del 2026-09-29: son el
+  // 33-39% de todo el tráfico, semana tras semana —unas 500 personas— y caían
+  // fuera de los tres mecanismos a la vez: no escalan, el `message_count>=2` de
+  // acá arriba los dejaba fuera del reenganche, y la cola de Seguimiento pide
+  // 3+ mensajes. Verificado sobre 342 casos de cinco días: cero recibieron un
+  // segundo mensaje, cero tienen ficha. Nadie los volvía a tocar nunca.
+  //
+  // Se entra por `procedure_code` y no por el texto de `procedure_interest`
+  // como la lista (1). Dos razones: es la columna generada, que ya normaliza;
+  // y el filtro de texto trata como genérico todo lo que EMPIECE con "precio",
+  // así que "precio Ultherapy" —tratamiento identificado y todo— quedaba
+  // afuera. Acá se exige un código real, que es la señal de que la persona
+  // alcanzó a decir qué quería: de 336 casos, 155 la dieron.
+  //
+  // Arranca APAGADO (`followup_primer_mensaje_enabled` nace en false). Este es
+  // el único camino del barrido que le escribe a alguien que no sostuvo una
+  // conversación, así que se enciende a mano y se puede apagar sin desplegar.
+  const urlPrimerMensaje =
+    base + `&message_count=eq.1` + comunes +
+    `&procedure_code=not.is.null` +
+    // Todos los `generico_*`, no una lista cerrada: hay cinco hoy
+    // (sin_procedimiento, solo_precio, proceso, logistica) y la taxonomía
+    // crece. Probado contra producción el 2026-09-29: con la lista cerrada se
+    // colaba `generico_logistica` — gente que solo preguntó la dirección de la
+    // clínica, a quien un "¿le quedó alguna duda sobre lo que consultó?" no le
+    // dice nada. `sin_clasificar` también queda fuera por ahora: ahí SÍ suele
+    // haber interés real ("abdomen y celulitis"), pero mientras esto arranca
+    // conviene equivocarse callando.
+    `&procedure_code=not.like.generico*` +
+    `&procedure_code=neq.sin_clasificar` +
+    `&updated_at=gte.${desde}&updated_at=lte.${hastaPrimer}` +
+    `&order=updated_at.asc&limit=100`;
+
+  const urls = primerMensajeActivo ? [urlConversacion, urlPrimerMensaje] : [urlConversacion];
+  const listas = [];
+  for (const url of urls) {
+    const res = await fetchWithTimeout(url, { headers });
+    if (!res.ok) {
+      console.error("findFollowupCandidates failed", res.status, await res.text());
+      return null; // falla cerrado: sin lista completa, no se manda nada
+    }
+    listas.push(await res.json());
   }
-  const candidatos = await res.json();
+
+  // La lista (1) primero: quien ya sostuvo una conversación está más caliente
+  // que quien escribió una vez, y el lote por corrida es chico
+  // (FOLLOWUP_MAX_PER_RUN). Sin este orden, un pico de primeros mensajes
+  // desplazaría a los candidatos buenos hasta que se les venciera la ventana.
+  // No hay riesgo de duplicados entre las dos: `message_count` no puede ser a
+  // la vez 1 y >= 2.
+  // Se reparten las plazas del lote entre las dos listas en vez de concatenarlas
+  // y cortar: concatenadas, la de conversación tapa a la de primer mensaje.
+  //
+  // Por qué tapa, medido el 2026-09-29 con el interruptor ya encendido: de las 8
+  // plazas del lote, 6 se las llevaban candidatos que se saltan en TODAS las
+  // corridas —se despidió, un asesor ya le escribió, un humano tomó la
+  // conversación—. Esos motivos no quedan registrados en ningún lado, así que la
+  // consulta los vuelve a traer cada vez, y como ordena por updated_at.asc se
+  // quedan fijos al frente de la fila. Solo 2 plazas hacían trabajo real, y los
+  // 14 de primer mensaje no llegaban nunca: media hora encendido, cero enviados.
+  //
+  // Repartir no arregla el desperdicio de plazas —eso pide recordar a quién ya
+  // se saltó, que es otro cambio— pero sí garantiza que ningún camino se quede
+  // sin turno por culpa del otro.
+  const candidatos = intercalar(listas);
   if (!candidatos.length) return [];
 
   // Descartar a quien ya recibió su único seguimiento. La PK de
@@ -3997,12 +4259,7 @@ async function findFollowupCandidates(env) {
   const hashes = candidatos.map((c) => `"${c.phone_hash}"`).join(",");
   const yaRes = await fetchWithTimeout(
     `${env.SUPABASE_URL}/rest/v1/sofia_followup_messages?select=phone_hash&phone_hash=in.(${hashes})`,
-    {
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
+    { headers }
   );
   if (!yaRes.ok) {
     console.error("findFollowupCandidates: no se pudo leer followup_messages", yaRes.status);
@@ -4011,6 +4268,7 @@ async function findFollowupCandidates(env) {
   const yaEscritos = new Set((await yaRes.json()).map((r) => r.phone_hash));
   return candidatos.filter((c) => !yaEscritos.has(c.phone_hash));
 }
+
 
 // Reserva el cupo ANTES de enviar. Si el envío falla después, el cupo queda
 // quemado y esa persona no recibe seguimiento nunca — es a propósito. Entre
@@ -4066,10 +4324,13 @@ async function reservarCupoDeSeguimiento(env, cand, redaccion) {
 // de la paciente ya trae el contexto.
 async function guardarSeguimientoEnHistorial(env, phoneHash, sesion, mensaje) {
   if (!sesion?.messages?.length) return false;
-  const msgs = [...sesion.messages];
-  const ultimo = msgs[msgs.length - 1];
+  const ultimo = sesion.messages[sesion.messages.length - 1];
   if (ultimo?.role !== "assistant") return false;
-  msgs[msgs.length - 1] = { ...ultimo, content: `${ultimo.content}\n\n${mensaje}` };
+  // Entrada propia, no pegada al mensaje anterior: son dos mensajes distintos,
+  // enviados con horas de diferencia. Ver fusionarTurnosSeguidos() para por qué
+  // esto no rompe la llamada a Claude. El slice mantiene el mismo tope que
+  // saveSessionWithRetry — sin él, el arreglo crecería a 21 entradas.
+  const msgs = [...sesion.messages, { role: "assistant", content: mensaje }].slice(-MAX_HISTORY_MESSAGES);
 
   const res = await fetchWithTimeout(
     `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?phone_hash=eq.${phoneHash}&version=eq.${sesion.version ?? 0}`,
@@ -4288,7 +4549,7 @@ async function alertarSiElSeguimientoEstaCaido(env, elegibles) {
   }
 }
 
-async function runFollowupSweep(env, { dryRun }) {
+async function runFollowupSweep(env, { dryRun, forzarPrimerMensaje = false }) {
   // El mismo kill switch de emergencia que corta las respuestas entrantes
   // (sofia_config.whatsapp_enabled, ver processInboundMessage). Va PRIMERO y no
   // es negociable: sin esto, apretar el freno desde el dashboard haría que
@@ -4312,12 +4573,26 @@ async function runFollowupSweep(env, { dryRun }) {
     return { dryRun, skipped: "fuera de horario (9-19 hora CR)", enviados: 0 };
   }
 
-  const candidatos = await findFollowupCandidates(env);
+  // forzarPrimerMensaje solo llega en seco desde handleFollowupSweep — ver ahí.
+  const primerMensajeActivo = forzarPrimerMensaje || (await seguimientoPrimerMensajeActivo(env));
+  const candidatos = await findFollowupCandidates(env, { primerMensajeActivo });
   if (candidatos === null) {
     return { dryRun, error: "No se pudo construir la lista — no se envió nada.", enviados: 0 };
   }
 
-  const lote = candidatos.slice(0, FOLLOWUP_MAX_PER_RUN);
+  // En una vista previa pedida con `primerMensaje: true`, mostrar SOLO los de
+  // un mensaje. Sin esto la vista previa no servía para lo único que se hizo:
+  // los candidatos que ya conversaron van primero a propósito (ver
+  // findFollowupCandidates), así que se llevaban las 8 plazas del lote y los de
+  // primer mensaje quedaban siempre para la corrida siguiente — probado el
+  // 2026-09-29: 15 elegibles de primer mensaje y ni uno en la muestra.
+  //
+  // Solo afecta al seco: forzarPrimerMensaje nunca es true en una corrida real
+  // (ver handleFollowupSweep), así que la prioridad de verdad no cambia.
+  const paraEsteLote = forzarPrimerMensaje
+    ? candidatos.filter((c) => c.message_count === 1)
+    : candidatos;
+  const lote = paraEsteLote.slice(0, FOLLOWUP_MAX_PER_RUN);
 
   // Historial de todo el lote en una sola consulta. Traerlo por candidato
   // gastaría un subrequest más por cada uno y el presupuesto por invocación es
@@ -4344,9 +4619,11 @@ async function runFollowupSweep(env, { dryRun }) {
   }
   const resultado = {
     dryRun,
+    primerMensajeActivo,
     elegibles: candidatos.length,
+    elegiblesPrimerMensaje: candidatos.filter((c) => c.message_count === 1).length,
     enLote: lote.length,
-    pendientesParaLaProximaCorrida: Math.max(candidatos.length - lote.length, 0),
+    pendientesParaLaProximaCorrida: Math.max(paraEsteLote.length - lote.length, 0),
     enviados: 0,
     saltadosPorHumano: 0,
     saltadosPorEsperarRespuesta: 0,
@@ -4418,14 +4695,16 @@ async function runFollowupSweep(env, { dryRun }) {
         accion: "se_enviaria",
         // Se redacta también en seco: el punto de una corrida de prueba es
         // poder leer el mensaje real antes de que salga, no solo la lista.
-        mensaje: (await redactarSeguimiento(env, sesiones.get(cand.phone_hash)?.messages)).mensaje,
+        mensaje: (await redactarSeguimiento(env, sesiones.get(cand.phone_hash)?.messages, { primerMensaje: cand.message_count === 1 })).mensaje,
         procedure_code: cand.procedure_code,
         callado_desde: cand.updated_at,
       });
       continue;
     }
 
-    const redaccion = await redactarSeguimiento(env, sesiones.get(cand.phone_hash)?.messages);
+    const redaccion = await redactarSeguimiento(env, sesiones.get(cand.phone_hash)?.messages, {
+      primerMensaje: cand.message_count === 1,
+    });
     const mensaje = redaccion.mensaje;
     if (redaccion.motivo) resultado.cayeronAlRespaldo[redaccion.motivo] =
       (resultado.cayeronAlRespaldo[redaccion.motivo] ?? 0) + 1;
@@ -4483,7 +4762,18 @@ async function handleFollowupSweep(request, env) {
   }
   const dryRun = body.dryRun !== false;
 
-  const resultado = await runFollowupSweep(env, { dryRun });
+  // `primerMensaje: true` fuerza el camino del primer mensaje SOLO en seco.
+  // Sin esto había un hueco: para poder leer esos mensajes antes de que salga
+  // ninguno había que encender el interruptor de la base, y con el interruptor
+  // encendido el cron empieza a mandarlos de verdad en los siguientes 15
+  // minutos. O sea que la única forma de "ver antes" era arriesgarse a enviar.
+  //
+  // El `&& dryRun` no es decorativo: una corrida real sigue exigiendo
+  // followup_primer_mensaje_enabled en la base. Este parámetro no puede
+  // mandarle un mensaje a nadie, solo mostrar cuáles saldrían.
+  const forzarPrimerMensaje = body.primerMensaje === true && dryRun;
+
+  const resultado = await runFollowupSweep(env, { dryRun, forzarPrimerMensaje });
   return new Response(JSON.stringify(resultado), {
     status: 200,
     headers: { "content-type": "application/json" },
