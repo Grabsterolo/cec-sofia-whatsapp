@@ -2755,6 +2755,84 @@ async function getCurrentProspectAgentId(env, prospectId) {
 // told the patient about) never got persisted as escalated=true. That left
 // the next inbound message reading escalated=false and getting answered by
 // Sofía again — "manda el mensaje de escalación pero sigue contestando".
+// ---------------------------------------------------------------------------
+// Partir mensajes largos — auditoría del 2026-09-29
+// ---------------------------------------------------------------------------
+//
+// El system_prompt manda 4-6 líneas por mensaje. Medido sobre los 2.793
+// mensajes de cinco días: la mediana es 11 líneas, el p95 son 22 y el más largo
+// llegó a 33. El 81% pasa de 6. La regla está escrita desde julio y las
+// auditorías internas la vienen señalando desde entonces sin que cambie nada —
+// o sea que pedírselo al modelo una vez más no es una solución.
+//
+// La decisión de JP: no acortar, PARTIR. Un muro de once líneas en WhatsApp es
+// lo que ahuyenta a la gente; la misma información en dos o tres mensajes se
+// lee como una conversación normal. Así no se pierde nada de contenido — que
+// era el riesgo de truncar.
+//
+// Reglas del corte:
+//   - Solo por párrafos. Nunca a media frase: preferible un mensaje de 9 líneas
+//     a uno cortado por la mitad.
+//   - Solo si de verdad hace falta. Hasta 6 líneas sale como un solo mensaje,
+//     igual que hoy.
+//   - Máximo 3 partes. Cuatro o cinco mensajes seguidos se leen como spam, no
+//     como conversación. Si sobra contenido, la última parte lo lleva completo.
+//
+// Se parte SOLO al enviar. El historial guarda el texto entero como un turno,
+// que es lo que Sofía dijo: así no cambia nada de lo que ella recuerda, ni la
+// clasificación, ni el contexto que recibe Claude.
+const LINEAS_POR_MENSAJE = 6;   // lo que manda el prompt
+const MAX_PARTES = 3;
+const CARACTERES_POR_LINEA = 42; // ancho aproximado en un teléfono
+
+function lineasVisuales(texto) {
+  return String(texto || "")
+    .split("\n")
+    .reduce((total, linea) => total + Math.max(1, Math.ceil(linea.length / CARACTERES_POR_LINEA)), 0);
+}
+
+function partirParaWhatsApp(texto) {
+  const limpio = String(texto || "").trim();
+  if (!limpio || lineasVisuales(limpio) <= LINEAS_POR_MENSAJE) return [limpio];
+
+  const parrafos = limpio.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  if (parrafos.length <= 1) return [limpio]; // un solo bloque: partirlo sería cortar una frase
+
+  const partes = [];
+  for (const parrafo of parrafos) {
+    const actual = partes[partes.length - 1];
+    // Cabe en la parte que venimos armando, y todavía podemos abrir más partes.
+    if (actual && lineasVisuales(`${actual}\n\n${parrafo}`) <= LINEAS_POR_MENSAJE) {
+      partes[partes.length - 1] = `${actual}\n\n${parrafo}`;
+    } else if (partes.length < MAX_PARTES) {
+      partes.push(parrafo);
+    } else {
+      // Ya llegamos al tope de partes: lo que queda se acumula en la última.
+      // Nunca se descarta contenido.
+      partes[partes.length - 1] = `${actual}\n\n${parrafo}`;
+    }
+  }
+
+  // Un saludo suelto como primer mensaje ("Buenas noches. Con gusto le explico.")
+  // se lee como un tartamudeo, no como una conversación. Cualquier parte de 2
+  // líneas o menos que tenga algo después se junta con lo que sigue, aunque el
+  // resultado pase del límite: un mensaje de 9 líneas es mejor que uno de 1
+  // seguido de otro de 8.
+  //
+  // Una parte CORTA AL FINAL sí se deja sola: ahí suele ser la pregunta de
+  // cierre ("¿Hay algún tratamiento que le interese?"), y separada se lee bien.
+  const unidas = [];
+  for (let i = 0; i < partes.length; i++) {
+    const esUltima = i === partes.length - 1;
+    if (!esUltima && lineasVisuales(partes[i]) <= 2) {
+      partes[i + 1] = `${partes[i]}\n\n${partes[i + 1]}`;
+      continue;
+    }
+    unidas.push(partes[i]);
+  }
+  return unidas;
+}
+
 async function sendChannelMessage(env, prospectId, channel, content) {
   let lastRes = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -2790,8 +2868,23 @@ async function sendChannelMessage(env, prospectId, channel, content) {
 // ends with either the patient getting Sofía's reply, or a human getting
 // assigned to follow up, never silence on both ends.
 async function sendChannelMessageOrEscalate(env, prospectId, channel, content, { phoneHash } = {}) {
-  const res = await sendChannelMessage(env, prospectId, channel, content);
-  if (res?.ok) return true;
+  // Un mensaje largo sale partido en 2 o 3 — ver partirParaWhatsApp(). Se
+  // envían en orden y esperando cada uno: sin el await, Zenvia podría
+  // entregarlos desordenados y la respuesta quedaría al revés.
+  const partes = partirParaWhatsApp(content);
+  let res = null;
+  for (const parte of partes) {
+    res = await sendChannelMessage(env, prospectId, channel, parte);
+    // Si una parte no sale, se corta acá: mandar la tercera sin la segunda deja
+    // una respuesta incoherente. Se cae al mismo camino de siempre (escalar).
+    if (!res?.ok) break;
+  }
+  if (res?.ok) {
+    if (partes.length > 1) {
+      console.log("SOFIA_PARTIDO", JSON.stringify({ prospectId, partes: partes.length }));
+    }
+    return true;
+  }
   console.error("sendChannelMessageOrEscalate: delivery failed after retries", prospectId, channel, res?.status);
   await logReliabilityEvent(env, {
     eventType: "send_failed",
