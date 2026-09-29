@@ -852,7 +852,92 @@ async function claimInteraction(env, interactionId) {
   }
 }
 
-async function processInboundMessage({ text, phone, prospectId, agentId, interactionId, channel, attachment }, env) {
+// ---------------------------------------------------------------------------
+// Mensajes seguidos del mismo paciente (2026-09-29)
+// ---------------------------------------------------------------------------
+//
+// Cada mensaje que entra dispara una respuesta completa, por separado. Medido
+// sobre dos días de tráfico real: 2.190 mensajes de pacientes -> 2.190
+// respuestas, sin una sola excepción. Mientras la gente escribe una pregunta
+// por turno eso está bien; el problema es quien escribe como se escribe por
+// WhatsApp de verdad, en ráfaga.
+//
+// Caso que lo destapó (JP, prueba propia): "Quiero saber cuanto cuesta", "si
+// hay promos", "y si duele", los tres en el mismo minuto. Sofía contestó tres
+// veces, y como cada respuesta se generó sin saber de las otras, le repitió lo
+// del dolor y lo de las promociones. La paciente de la prueba terminó
+// preguntando "¿por qué me mandas tantos mensajes?".
+//
+// El prompt no puede arreglarlo — de hecho ordena "un mensaje del paciente =
+// una respuesta de Sofía", que es exactamente esto. Sofía nunca ve los tres
+// mensajes juntos: ve uno, contesta, ve el siguiente. La única forma de que
+// los vea juntos es esperar antes de contestar.
+//
+// Qué hace: espera AGRUPAR_ESPERA_MS y le pregunta a Zenvia qué mensajes del
+// paciente quedaron sin contestar. Si el último de esos no es el mío, el que
+// llegó después va a contestar por los dos y yo me retiro en silencio. Si el
+// último soy yo, junto los textos y contesto una sola vez por todos.
+//
+// Falla abierta en todos lados (Zenvia caído, mensaje que Zenvia todavía no
+// indexó, adjuntos de por medio): contesta el mensaje solo, igual que antes.
+// Contestar dos veces es feo; no contestar es perder a la paciente.
+const AGRUPAR_ESPERA_MS = 10_000;
+const AGRUPAR_MAX_MENSAJES = 5;
+
+async function agruparMensajesSeguidos(env, { prospectId, interactionId, texto, attachment }) {
+  const solo = { seguir: true, texto, agrupados: 1 };
+  // Un adjunto no se puede juntar con nada: de acá solo sale texto, y la foto
+  // o la nota de voz se perderían. Ese mensaje va por su cuenta, como antes.
+  if (!prospectId || !interactionId || attachment) return solo;
+
+  await sleep(AGRUPAR_ESPERA_MS);
+
+  let interacciones;
+  try {
+    const res = await fetchWithTimeout(
+      `${ZENVIA_API_BASE}/prospect/${prospectId}/interactions?api-key=${env.ZENVIA_API_KEY}`
+    );
+    if (!res.ok) return solo;
+    interacciones = await res.json();
+  } catch {
+    return solo;
+  }
+  if (!Array.isArray(interacciones) || interacciones.length === 0) return solo;
+
+  // Orden defensivo — mismo motivo que en findPendingCandidate(). Las
+  // asignaciones y las notas internas no traen output.message y quedan fuera.
+  const conMensaje = interacciones
+    .filter((i) => i?.output?.message)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+
+  // Todo lo que llegó del paciente después de la última salida nuestra.
+  // Cualquier mensaje que no sea "integration" es nuestro y corta la racha.
+  let pendientes = [];
+  for (const i of conMensaje) {
+    if (i.output.message.performer === "integration") pendientes.push(i);
+    else pendientes = [];
+  }
+
+  // Mi propio mensaje no aparece: Zenvia todavía no lo indexó. Sin eso no
+  // puedo saber si soy el último, así que contesto solo.
+  const mio = pendientes.findIndex((i) => i.id === interactionId);
+  if (mio === -1) return solo;
+  if (pendientes.some((i) => i.output.message.attachment)) return solo;
+
+  // Llegó otro después del mío: ese va a agrupar y contestar por los dos.
+  if (mio !== pendientes.length - 1) return { seguir: false, texto, agrupados: 0 };
+  if (pendientes.length === 1) return solo;
+
+  const textos = pendientes
+    .slice(-AGRUPAR_MAX_MENSAJES)
+    .map((i) => String(i.output.message.content || i.output.message.body || "").trim())
+    .filter(Boolean);
+  if (textos.length === 0) return solo;
+
+  return { seguir: true, texto: textos.join("\n"), agrupados: textos.length };
+}
+
+async function processInboundMessage({ text, phone, prospectId, agentId, interactionId, channel, attachment, agrupar = true }, env) {
   // Deduplicate redelivered webhook events. Zenvia (or an upstream retry)
   // can redeliver the same interaction more than once — without this, each
   // redelivery re-runs the whole pipeline as if it were a brand new
@@ -888,6 +973,26 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     console.log(`Skipping inbound message: Sofía is paused (whatsapp_enabled=false), prospect ${prospectId}`);
     return;
   }
+
+  // Espera por si el paciente viene escribiendo en ráfaga — ver
+  // agruparMensajesSeguidos(). Va acá arriba, antes de leer el agente, el
+  // estado y el historial, para que todo lo que se lee abajo sea posterior a
+  // la espera y no quede viejo.
+  //
+  // agrupar=false lo usa processRetryBatch(): ahí los mensajes ya son viejos,
+  // no hay ninguna ráfaga que esperar, y 20 reintentos x 10 segundos serían
+  // más de tres minutos de espera pura en un lote de fondo.
+  const agrupado = agrupar
+    ? await agruparMensajesSeguidos(env, { prospectId, interactionId, texto: text, attachment })
+    : { seguir: true, texto: text, agrupados: 1 };
+  if (!agrupado.seguir) {
+    console.log("SOFIA_AGRUPADO_CEDE", JSON.stringify({ prospectId, interactionId }));
+    return;
+  }
+  if (agrupado.agrupados > 1) {
+    console.log("SOFIA_AGRUPADO", JSON.stringify({ prospectId, mensajes: agrupado.agrupados }));
+  }
+  text = agrupado.texto;
 
   // Computed early (only depends on `phone`) so it's available for
   // sofia_reliability_events logging on the fail-closed branch right below,
@@ -2773,16 +2878,28 @@ async function getCurrentProspectAgentId(env, prospectId) {
 // Reglas del corte:
 //   - Solo por párrafos. Nunca a media frase: preferible un mensaje de 9 líneas
 //     a uno cortado por la mitad.
-//   - Solo si de verdad hace falta. Hasta 6 líneas sale como un solo mensaje,
-//     igual que hoy.
-//   - Máximo 3 partes. Cuatro o cinco mensajes seguidos se leen como spam, no
-//     como conversación. Si sobra contenido, la última parte lo lleva completo.
+//   - Solo si de verdad hace falta. Ver el límite de abajo.
+//   - Máximo 2 partes. Tres mensajes seguidos se leen como spam, no como
+//     conversación. Si sobra contenido, la última parte lo lleva completo.
 //
 // Se parte SOLO al enviar. El historial guarda el texto entero como un turno,
 // que es lo que Sofía dijo: así no cambia nada de lo que ella recuerda, ni la
 // clasificación, ni el contexto que recibe Claude.
-const LINEAS_POR_MENSAJE = 6;   // lo que manda el prompt
-const MAX_PARTES = 3;
+//
+// Ajustado 2026-09-29 (JP, captura de su propia prueba: siete globos seguidos
+// y la paciente preguntando "¿por qué me mandas tantos mensajes?"). El límite
+// era 6 líneas / 3 partes, copiado del "máximo 4 líneas" del prompt. Medido
+// sobre las 2.261 respuestas de los dos días anteriores: el 72% salía partida
+// y el 25% salía en TRES mensajes — el partidor había dejado de ser una red
+// para los mensajes largos y se había vuelto el comportamiento normal. Encima
+// el prompt ahora ordena explícitamente "UN SOLO MENSAJE por cada mensaje del
+// paciente", así que partir por defecto contradice la instrucción.
+//
+// 12 líneas (~500 caracteres) y 2 partes: con los mismos datos, baja al 39% y
+// ningún caso sale en tres. Vuelve a ser lo que tenía que ser: el muro de
+// texto se parte, la respuesta normal sale entera.
+const LINEAS_POR_MENSAJE = 12;  // ~500 caracteres: un muro de verdad, no un párrafo largo
+const MAX_PARTES = 2;
 const CARACTERES_POR_LINEA = 42; // ancho aproximado en un teléfono
 
 function lineasVisuales(texto) {
@@ -3364,6 +3481,26 @@ async function transferirTraspasosPendientes(env) {
       await cerrarTraspasoPendiente(env, fila.id, fila.escalation_reason);
       continue;
     }
+
+    // La nota de contexto, ANTES de transferir — igual que en la escalación
+    // normal. Sin esto el asesor abre el caso en frío, que es justo lo que este
+    // cambio pretende evitar: de noche Sofía recogió tamizaje y preferencias, y
+    // esa es la información que le ahorra la llamada.
+    //
+    // Se traen 6 mensajes y no 2 como en la escalación del día: acá la
+    // conversación siguió después de decidir el traspaso, así que lo valioso
+    // —el tamizaje, los días que le sirven— está en los turnos posteriores.
+    const ses = await fetchWithTimeout(
+      `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?phone_hash=eq.${fila.phone_hash}&select=messages&limit=1`,
+      { headers }
+    ).catch(() => null);
+    const mensajes = ses?.ok ? ((await ses.json())[0]?.messages ?? []) : [];
+    await addEscalationNote(
+      env,
+      fila.prospect_id,
+      `${fila.escalation_reason || "no especificado"} — conversación de fuera de horario, Sofía siguió atendiendo`,
+      mensajes.slice(-6)
+    );
 
     const traspaso = await transferToNextAgentInPool(env, fila.prospect_id, { phoneHash: fila.phone_hash });
     if (!traspaso.ok) { resultado.fallidos++; continue; }
@@ -4465,6 +4602,7 @@ async function processRetryBatch(env, batch) {
           interactionId: `retry:${last.id}`,
           channel,
           attachment,
+          agrupar: false,
         },
         env
       );
