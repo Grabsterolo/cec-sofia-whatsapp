@@ -54,6 +54,84 @@ const MAX_CONVERSATION_TURNS = 10; // sofia_conversations.message_count ceiling 
 // in every practical sense, whether or not Zenvia ever reports "archived".
 const ESCALATION_COOLDOWN_HOURS = 48;
 
+// ---------------------------------------------------------------------------
+// Atención nocturna — diseño en cecmarketing/docs/DISENO_ATENCION_NOCTURNA.html
+// ---------------------------------------------------------------------------
+//
+// El problema: escalar pone `escalated = true`, y eso CALLA a Sofía hasta que un
+// humano cierre el caso. De día está bien. De noche la paciente pide una cita a
+// las 11 p.m., Sofía escala, se calla, no hay ningún asesor conectado, y si
+// vuelve a preguntar recibe silencio absoluto hasta las 8 de la mañana.
+//
+// Medido sobre 21 días: el 44,7% del tráfico entra fuera de horario y el 35,5%
+// de las escalaciones espera a la mañana siguiente, 10,8 h promedio.
+//
+// La solución es no escalar: dejar el traspaso pendiente, que Sofía siga
+// conversando —y recogiendo tamizaje y preferencias— y transferir cuando el
+// equipo abra. De paso mantiene viva la ventana de 24 h de WhatsApp, porque cada
+// mensaje de la paciente la renueva y callarse es justo lo que la deja vencer.
+
+// Horario del equipo comercial. Domingo no aparece: está cerrado.
+const EQUIPO_HORARIO_CR = {
+  1: [8, 18], 2: [8, 18], 3: [8, 18], 4: [8, 18], 5: [8, 18], // lunes a viernes
+  6: [8, 16],                                                  // sábado
+};
+
+function equipoDisponible(ahora = new Date()) {
+  // Costa Rica es UTC-6 todo el año, sin horario de verano — mismo cálculo que
+  // estaEnHorarioDeSeguimiento().
+  const cr = new Date(ahora.getTime() - 6 * 3600_000);
+  const franja = EQUIPO_HORARIO_CR[cr.getUTCDay()];
+  if (!franja) return false; // domingo
+  const hora = cr.getUTCHours();
+  return hora >= franja[0] && hora < franja[1];
+}
+
+// Tope de seguridad: si algo lleva más de esto pendiente, se transfiere aunque
+// el equipo no esté. Un trabajo que falle no puede dejar pacientes en el limbo —
+// es exactamente el error que se encontró el 2026-09-29 en retryStuckEscalations.
+// 14 h cubre la noche más larga (sábado 4 p.m. a domingo… no: ahí son 40 h, y
+// justamente por eso el domingo dispara el tope y se transfiere igual, que es lo
+// correcto: más vale asignado y esperando que invisible).
+const TRASPASO_PENDIENTE_TOPE_HORAS = 14;
+
+// Lo que NO se difiere nunca, a ninguna hora. Mismo vocabulario que la columna
+// `urgente` de la vista sofia_followup_queue, que lleva meses en uso.
+const MOTIVO_URGENTE =
+  /(insatisfac|inconform|disconform|queja|reclamo|molest[ao]|director|gerenci|complicaci|infecci[oó]n|sangrado|emergencia|otro cirujano|segunda opini|mal resultado|demanda|abogado|legal|dolor|fiebre|post.?operat|posoperat|s[ií]ntoma|urgente)/i;
+
+function esUrgente(motivo) {
+  return MOTIVO_URGENTE.test(motivo ?? "");
+}
+
+// Las frases van en el código y no en el system_prompt a propósito: el prompt es
+// configuración de producción con su propio procedimiento, y estas tienen que
+// salir EXACTAS. El texto lo revisó JP antes de activarse
+// (ver sección 4 del documento de diseño).
+//
+// La segunda oración de cada una es la que más importa: Sofía NO tiene acceso a
+// la agenda, así que no puede apartar una cita ni prometer una hora. Decirlo
+// explícitamente es lo que evita que la paciente entienda que ya tiene cita.
+const NOCTURNO_ENTRE_SEMANA =
+  "El equipo que coordina las citas atiende de 8 de la mañana a 6 de la tarde, " +
+  "así que le escriben mañana. Mientras tanto le puedo adelantar lo que " +
+  "necesiten saber, para que cuando la contacten sea solo cuestión de definir el día.";
+
+const NOCTURNO_FIN_DE_SEMANA =
+  "El equipo coordina las citas de lunes a viernes de 8 a 6, y los sábados hasta " +
+  "las 4 de la tarde, así que le van a escribir el lunes. Mientras tanto, con " +
+  "gusto le resuelvo cualquier duda del procedimiento para que llegue con todo claro.";
+
+// ¿Cuál de las dos toca? El sábado después de las 4 y el domingo esperan al
+// lunes; cualquier otra noche espera a la mañana siguiente.
+function fraseDeEspera(ahora = new Date()) {
+  const cr = new Date(ahora.getTime() - 6 * 3600_000);
+  const dia = cr.getUTCDay();
+  const hora = cr.getUTCHours();
+  const esperaAlLunes = dia === 0 || (dia === 6 && hora >= 16);
+  return esperaAlLunes ? NOCTURNO_FIN_DE_SEMANA : NOCTURNO_ENTRE_SEMANA;
+}
+
 // Images/audio: cap at 8MB (Claude's per-image limit is smaller, but this
 // keeps memory/latency sane; oversized files just fail gracefully). Links:
 // cap page size read at 1.5MB before stripping HTML down to plain text.
@@ -533,7 +611,13 @@ export default {
     }
 
     if (event.cron === CRON_REINTENTOS) {
+      // Las dos son reparación de traspasos y ninguna le escribe a un paciente,
+      // así que comparten el cron de cada 20 minutos.
       ctx.waitUntil(retryStuckEscalations(env));
+      ctx.waitUntil(
+        transferirTraspasosPendientes(env)
+          .catch((err) => console.error("TRASPASOS_PENDIENTES falló", err))
+      );
       return;
     }
 
@@ -1163,7 +1247,25 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // En silencio no sale nada, pero el historial y last_message guardan la
   // etiqueta: así en el próximo turno Sofía sabe que decidió no contestar, y
   // el seguimiento proactivo la reconoce y no le escribe.
-  const finalReply = silenced ? silenceTag : escalated && !reply ? pickEscalationFallbackReply() : reply;
+  // ¿Se difiere el traspaso? Solo si Sofía decidió escalar, el equipo no está,
+  // el caso no es urgente y el interruptor está encendido. La consulta del
+  // interruptor se hace únicamente cuando las tres primeras ya se cumplen, para
+  // no gastar un request en cada mensaje del día.
+  const diferible = escalated && !equipoDisponible() && !esUrgente(escalation_reason);
+  const diferir = diferible && (await atencionNocturnaActiva(env));
+  // Si ya venía pendiente de antes, no se le repite la promesa en cada turno:
+  // se le contesta normal y ya está.
+  const yaEstabaPendiente = !!conversationState.traspasoPendienteDesde;
+
+  let finalReply = silenced ? silenceTag : escalated && !reply ? pickEscalationFallbackReply() : reply;
+  if (diferir && !yaEstabaPendiente) {
+    // Si Sofía prometió un traspaso ("le contactan a la brevedad"), esa promesa
+    // es justamente lo que no se puede cumplir de noche: se reemplaza entera.
+    // Si escribió algo sin prometer nada, se conserva y se le agrega el plazo.
+    finalReply = mentionsHandoffPromise(finalReply)
+      ? fraseDeEspera()
+      : `${finalReply}\n\n${fraseDeEspera()}`.trim();
+  }
 
   const updatedHistory = await saveSessionWithRetry(
     env, phoneHash, channel, session.messages, session.version,
@@ -1172,7 +1274,19 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
 
   let agility = { procedureInterest: null, sentiment: null };
 
-  if (escalated) {
+  if (diferir) {
+    // NO se transfiere y NO se marca escalated: esa bandera es la que la calla, y
+    // el punto de todo esto es que siga atendiendo hasta que haya alguien.
+    await sendChannelMessageOrEscalate(env, prospectId, channel, finalReply, { phoneHash });
+    // Se clasifica igual, para que el tratamiento y el sentimiento queden
+    // guardados y la conversación aparezca bien en el dashboard desde la noche.
+    const availableLabels = await getAvailableLabels(env);
+    agility = await classifyEscalationWithHaiku(env, updatedHistory, availableLabels);
+    if (agility.label) await addLabelToProspect(env, prospectId, agility.label);
+    console.log("SOFIA_TRASPASO_DIFERIDO", JSON.stringify({
+      prospectId, motivo: escalation_reason, yaEstabaPendiente,
+    }));
+  } else if (escalated) {
     // Give the human agent context before they open the chat cold.
     await addEscalationNote(env, prospectId, escalation_reason, updatedHistory.slice(-2));
 
@@ -1262,8 +1376,9 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     prospectId,
     channel,
     lastMessage: finalReply,
-    escalated,
-    escalationReason: escalation_reason,
+    // Al diferir va false a propósito: la conversación sigue siendo de Sofía.
+    escalated: diferir ? false : escalated,
+    escalationReason: diferir ? null : escalation_reason,
     interactionId,
     resetCounters,
     procedureInterest: agility.procedureInterest,
@@ -1271,6 +1386,11 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     phone,
     patientName,
   });
+
+  // Después del upsert, porque puede ser el que crea la fila.
+  if (diferir && !yaEstabaPendiente) {
+    await marcarTraspasoPendiente(env, phoneHash, escalation_reason);
+  }
 }
 
 // Phrases pulled directly from the 88 real conversations found in the
@@ -2297,7 +2417,7 @@ async function saveSessionWithRetry(env, phoneHash, channel, baseMessages, baseV
 
 async function getConversationState(env, phoneHash) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count,escalated,last_interaction_id,procedure_interest,sentiment&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count,escalated,last_interaction_id,procedure_interest,sentiment,traspaso_pendiente_desde&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2305,7 +2425,7 @@ async function getConversationState(env, phoneHash) {
       },
     }
   );
-  if (!res.ok) return { messageCount: 0, escalated: false, lastInteractionId: null, procedureInterest: null, sentiment: null };
+  if (!res.ok) return { messageCount: 0, escalated: false, lastInteractionId: null, procedureInterest: null, sentiment: null, traspasoPendienteDesde: null };
   const rows = await res.json();
   return {
     messageCount: rows[0]?.message_count ?? 0,
@@ -2315,6 +2435,9 @@ async function getConversationState(env, phoneHash) {
     // procedimiento — ver classifyEscalationWithHaiku en la rama sin escalar.
     procedureInterest: rows[0]?.procedure_interest ?? null,
     sentiment: rows[0]?.sentiment ?? null,
+    // Si ya hay un traspaso pendiente, no se le vuelve a prometer nada en cada
+    // turno — ver el diferimiento en processInboundMessage.
+    traspasoPendienteDesde: rows[0]?.traspaso_pendiente_desde ?? null,
   };
 }
 
@@ -3026,6 +3149,101 @@ const STUCK_ESCALATION_WINDOW_HOURS = 72;
 // conversation nobody replies to after the failed handoff doesn't sit
 // forever assigned to nobody real. Never archives, closes, or messages the
 // patient — the only side effect is retrying a Zenvia agent reassignment.
+// Cuántos traspasos pendientes por corrida. Cada uno gasta 2 subrequests
+// (chequeo de dueño + transferencia) más el PATCH. Con corridas cada 20 minutos
+// alcanza de sobra para los ~28 que se acumulan en una noche.
+const MAX_TRASPASOS_PENDIENTES_POR_CORRIDA = 20;
+
+// El otro extremo de la atención nocturna: transferir lo que Sofía difirió,
+// cuando el equipo abre. Corre en el cron de cada 20 minutos.
+//
+// Dos condiciones para transferir, y basta con una:
+//   - el equipo ya está disponible, o
+//   - el caso lleva más de TRASPASO_PENDIENTE_TOPE_HORAS esperando.
+//
+// La segunda es el freno de seguridad: si este barrido falla varias veces, o si
+// alguien apaga el interruptor con casos ya diferidos, esos pacientes no pueden
+// quedarse invisibles para siempre. Más vale asignado y esperando que perdido.
+async function transferirTraspasosPendientes(env) {
+  const headers = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+  };
+  const hayEquipo = equipoDisponible();
+  const tope = new Date(Date.now() - TRASPASO_PENDIENTE_TOPE_HORAS * 3600_000).toISOString();
+
+  // Si no hay equipo, solo se rescatan los vencidos. Si lo hay, todos.
+  const filtro = hayEquipo ? "" : `&traspaso_pendiente_desde=lte.${tope}`;
+  const res = await fetchWithTimeout(
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations` +
+      `?traspaso_pendiente_desde=not.is.null&prospect_id=not.is.null` +
+      filtro +
+      // Los que llevan más esperando van primero — el error opuesto al que tenía
+      // retryStuckEscalations, que no ordenaba y se comía los cupos con casos viejos.
+      `&order=traspaso_pendiente_desde.asc` +
+      `&select=id,phone_hash,prospect_id,escalation_reason,traspaso_pendiente_desde` +
+      `&limit=${MAX_TRASPASOS_PENDIENTES_POR_CORRIDA}`,
+    { headers }
+  );
+  if (!res.ok) {
+    console.error("transferirTraspasosPendientes: no se pudo leer la lista", res.status);
+    return;
+  }
+  const filas = await res.json();
+  if (!filas.length) return;
+
+  const resultado = { hayEquipo, encontrados: filas.length, transferidos: 0, yaTeniaHumano: 0, fallidos: 0, porTope: 0 };
+
+  for (const fila of filas) {
+    const vencido = Date.parse(fila.traspaso_pendiente_desde) <= Date.parse(tope);
+    if (!hayEquipo && !vencido) continue;
+    if (vencido && !hayEquipo) resultado.porTope++;
+
+    // Misma regla de siempre: si un humano ya la tomó, no se toca. Falla cerrado.
+    const { agentId, failed } = await getCurrentProspectAgentId(env, fila.prospect_id);
+    if (failed) { resultado.fallidos++; continue; }
+    if (agentId && HUMAN_AGENT_IDS.has(agentId)) {
+      // Ya la tomó alguien: se limpia el pendiente y se marca escalada, que es
+      // lo que de hecho pasó.
+      resultado.yaTeniaHumano++;
+      await cerrarTraspasoPendiente(env, fila.id, fila.escalation_reason);
+      continue;
+    }
+
+    const ok = await transferToNextAgentInPool(env, fila.prospect_id, { phoneHash: fila.phone_hash });
+    if (!ok) { resultado.fallidos++; continue; }
+    await cerrarTraspasoPendiente(env, fila.id, fila.escalation_reason);
+    resultado.transferidos++;
+  }
+
+  console.log("TRASPASOS_PENDIENTES", JSON.stringify(resultado));
+}
+
+// Cierra el pendiente: la conversación pasa a escalada de verdad y deja de
+// aparecer en el barrido. A partir de acá Sofía sí se calla, que es lo correcto
+// porque ya hay un asesor con el caso.
+async function cerrarTraspasoPendiente(env, id, motivo) {
+  try {
+    const res = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_conversations?id=eq.${id}`, {
+      method: "PATCH",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        traspaso_pendiente_desde: null,
+        escalated: true,
+        escalation_reason: motivo ?? null,
+      }),
+    });
+    if (!res.ok) console.error("cerrarTraspasoPendiente falló", res.status, id);
+  } catch (err) {
+    console.error("cerrarTraspasoPendiente threw", err);
+  }
+}
+
 async function retryStuckEscalations(env) {
   const headers = {
     apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -4094,6 +4312,58 @@ function estaEnHorarioDeSeguimiento(ahora = new Date()) {
 // siguiera contestando pero SIN prompt ni base de conocimiento. Leerlo acá deja
 // ese riesgo en cero: lo peor que puede pasar es que el interruptor se lea como
 // apagado, que es justo el valor seguro.
+// Aparte de loadSofiaConfig() por la misma razón que
+// seguimientoPrimerMensajeActivo(): PostgREST devuelve 400 al pedir una columna
+// inexistente, y ante un error esa función devuelve system:"" con
+// whatsapp_enabled:true — Sofía contestaría SIN PROMPT si faltara la migración.
+async function atencionNocturnaActiva(env) {
+  try {
+    const res = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/sofia_config?id=eq.1&select=atencion_nocturna_enabled`,
+      { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
+    );
+    if (!res.ok) {
+      console.log(`atencionNocturnaActiva: no se pudo leer (http ${res.status}) — se asume apagada`);
+      return false;
+    }
+    return (await res.json())[0]?.atencion_nocturna_enabled === true;
+  } catch (err) {
+    console.error("atencionNocturnaActiva falló — se asume apagada", err);
+    return false;
+  }
+}
+
+// Marca el traspaso como pendiente. PATCH aparte y no dentro de
+// upsertConversation() a propósito: esa función tiene una lógica delicada de
+// campos pegajosos (escalated, escalation_reason) que no conviene tocar para
+// esto. Guarda también el motivo, que es lo que el barrido de la mañana le pasa
+// al asesor como contexto.
+async function marcarTraspasoPendiente(env, phoneHash, motivo) {
+  try {
+    const res = await fetchWithTimeout(
+      `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}`,
+      {
+        method: "PATCH",
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "return=minimal",
+        },
+        body: JSON.stringify({
+          traspaso_pendiente_desde: new Date().toISOString(),
+          escalation_reason: motivo ?? null,
+        }),
+      }
+    );
+    if (!res.ok) console.error("marcarTraspasoPendiente falló", res.status);
+    return res.ok;
+  } catch (err) {
+    console.error("marcarTraspasoPendiente threw", err);
+    return false;
+  }
+}
+
 async function seguimientoPrimerMensajeActivo(env) {
   try {
     const res = await fetch(
