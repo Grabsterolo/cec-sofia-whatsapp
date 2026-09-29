@@ -618,6 +618,10 @@ export default {
         transferirTraspasosPendientes(env)
           .catch((err) => console.error("TRASPASOS_PENDIENTES falló", err))
       );
+      ctx.waitUntil(
+        verificarHandoffs(env)
+          .catch((err) => console.error("HANDOFFS_VERIFICADOS falló", err))
+      );
       return;
     }
 
@@ -1092,7 +1096,11 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       history,
       escalationReason: limitReasonText,
     });
-    await transferToNextAgentInPool(env, prospectId, { phoneHash });
+    const traspasoTope = await transferToNextAgentInPool(env, prospectId, { phoneHash });
+    await registrarHandoff(env, {
+      prospectId, phoneHash, motivo: limitReasonText,
+      agenteAsignado: traspasoTope.agentId, traspasoOk: traspasoTope.ok,
+    });
 
     const updatedHistory = await saveSessionWithRetry(
       env, phoneHash, channel, session.messages, session.version,
@@ -1188,7 +1196,11 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       history,
       escalationReason: "falla_tecnica_claude",
     });
-    await transferToNextAgentInPool(env, prospectId, { phoneHash });
+    const traspasoFalla = await transferToNextAgentInPool(env, prospectId, { phoneHash });
+    await registrarHandoff(env, {
+      prospectId, phoneHash, motivo: "falla_tecnica_claude",
+      agenteAsignado: traspasoFalla.agentId, traspasoOk: traspasoFalla.ok,
+    });
 
     const updatedHistoryAfterFailure = await saveSessionWithRetry(
       env, phoneHash, channel, session.messages, session.version,
@@ -1300,7 +1312,11 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       history: updatedHistory,
       escalationReason: escalation_reason,
     });
-    await transferToNextAgentInPool(env, prospectId, { phoneHash });
+    const traspaso = await transferToNextAgentInPool(env, prospectId, { phoneHash });
+    await registrarHandoff(env, {
+      prospectId, phoneHash, motivo: escalation_reason,
+      agenteAsignado: traspaso.agentId, traspasoOk: traspaso.ok,
+    });
   } else {
     if (silenced) {
       console.log("SOFIA_SILENCIO", JSON.stringify({ prospectId, etiqueta: silenceTag }));
@@ -3106,6 +3122,11 @@ async function transferProspectToAgent(env, prospectId, agentId) {
 // transfer that failed after all 3 retries left zero trace anywhere.
 // Now logged to sofia_reliability_events (transfer_failed) so it's at
 // least visible, and callers get back whether it actually succeeded.
+// Devuelve { ok, agentId } y no solo un booleano: registrarHandoff() necesita
+// saber a quién se le asignó para poder medir por asesor. Los demás sitios que
+// la llaman ignoran el objeto, que en contexto booleano siempre es verdadero —
+// por eso el único que comprobaba el resultado (transferirTraspasosPendientes)
+// pasó a mirar `.ok` explícitamente.
 async function transferToNextAgentInPool(env, prospectId, { phoneHash } = {}) {
   const agentId = await pickNextPoolAgent(env);
   const res = await transferProspectToAgent(env, prospectId, agentId);
@@ -3119,7 +3140,48 @@ async function transferToNextAgentInPool(env, prospectId, { phoneHash } = {}) {
       detail: `transferProspectToAgent failed after retries (agent ${agentId}, status ${res?.status ?? "network error"})`,
     });
   }
-  return succeeded;
+  return { ok: succeeded, agentId };
+}
+
+// ---------------------------------------------------------------------------
+// Registro de traspasos — hallazgo #1 de la auditoría del 2026-09-29
+// ---------------------------------------------------------------------------
+//
+// El traspaso ocurre en Zenvia y no dejaba NINGUNA fila. Por eso de 275
+// escalaciones solo había rastro de trabajo humano en 54: no porque 221
+// pacientes quedaran sin atender, sino porque no había forma de distinguir un
+// caso atendido de uno abandonado.
+//
+// prospect_id es único en la tabla y el insert ignora duplicados: los reintentos
+// (retryStuckEscalations, la red de auto-reparación) no crean filas nuevas ni
+// pisan la hora original de la escalación, que es la que hay que medir.
+async function registrarHandoff(env, { prospectId, phoneHash, motivo, agenteAsignado, traspasoOk }) {
+  if (!prospectId) return;
+  try {
+    // `on_conflict=prospect_id` no es opcional: sin él, PostgREST ignora el
+    // Prefer y devuelve 409 al chocar con el índice único. Probado contra
+    // producción el 2026-09-29 — el código "funcionaba" igual, pero cada
+    // reintento habría dejado un error en el log.
+    const res = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_handoffs?on_conflict=prospect_id`, {
+      method: "POST",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal,resolution=ignore-duplicates",
+      },
+      body: JSON.stringify({
+        prospect_id: prospectId,
+        phone_hash: phoneHash ?? null,
+        motivo: motivo ?? null,
+        agente_asignado: agenteAsignado ?? null,
+        traspaso_ok: traspasoOk ?? null,
+      }),
+    });
+    if (!res.ok) console.error("registrarHandoff falló", res.status, prospectId);
+  } catch (err) {
+    console.error("registrarHandoff threw", err);
+  }
 }
 
 // Cloudflare subrequest budget per invocation — same reasoning as the batch
@@ -3210,8 +3272,12 @@ async function transferirTraspasosPendientes(env) {
       continue;
     }
 
-    const ok = await transferToNextAgentInPool(env, fila.prospect_id, { phoneHash: fila.phone_hash });
-    if (!ok) { resultado.fallidos++; continue; }
+    const traspaso = await transferToNextAgentInPool(env, fila.prospect_id, { phoneHash: fila.phone_hash });
+    if (!traspaso.ok) { resultado.fallidos++; continue; }
+    await registrarHandoff(env, {
+      prospectId: fila.prospect_id, phoneHash: fila.phone_hash,
+      motivo: fila.escalation_reason, agenteAsignado: traspaso.agentId, traspasoOk: true,
+    });
     await cerrarTraspasoPendiente(env, fila.id, fila.escalation_reason);
     resultado.transferidos++;
   }
@@ -3241,6 +3307,149 @@ async function cerrarTraspasoPendiente(env, id, motivo) {
     if (!res.ok) console.error("cerrarTraspasoPendiente falló", res.status, id);
   } catch (err) {
     console.error("cerrarTraspasoPendiente threw", err);
+  }
+}
+
+// Cuántos traspasos se verifican por corrida. Cada uno gasta 2 subrequests
+// (interacciones de Zenvia + el PATCH), y comparte el presupuesto de la
+// invocación con retryStuckEscalations y transferirTraspasosPendientes. Con 72
+// corridas al día son 720 verificaciones posibles contra ~55 traspasos diarios:
+// sobra para revisar cada uno varias veces.
+const MAX_HANDOFFS_A_VERIFICAR = 10;
+// No tiene sentido preguntar a los cinco minutos: se le da tiempo al asesor.
+const HANDOFF_PRIMERA_REVISION_HORAS = 1;
+// Cada cuánto se vuelve a mirar uno que sigue sin respuesta.
+const HANDOFF_REVISAR_CADA_HORAS = 3;
+// Pasado esto sin que nadie escriba, se da por no atendido. Cubre un fin de
+// semana completo (viernes tarde a lunes) sin declarar abandonado algo que el
+// lunes sí se atendió.
+const HANDOFF_RENDIRSE_HORAS = 72;
+
+// La respuesta al hallazgo #1: ¿alguien del equipo le escribió a este paciente
+// después de que Sofía se lo pasó?
+//
+// Se puede contestar sin ambigüedad por una razón concreta: una vez escalada,
+// Sofía se calla (ver el principio de processInboundMessage). Así que cualquier
+// mensaje saliente posterior a la escalación solo puede haberlo escrito una
+// persona. El filtro por agentId es cinturón y tirantes.
+async function verificarHandoffs(env) {
+  const headers = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+  };
+  const ahora = Date.now();
+  const listoParaRevisar = new Date(ahora - HANDOFF_PRIMERA_REVISION_HORAS * 3600_000).toISOString();
+  const revisadoHace = new Date(ahora - HANDOFF_REVISAR_CADA_HORAS * 3600_000).toISOString();
+
+  const res = await fetchWithTimeout(
+    `${env.SUPABASE_URL}/rest/v1/sofia_handoffs` +
+      `?estado=eq.pendiente&escalado_en=lte.${listoParaRevisar}` +
+      `&or=(verificado_en.is.null,verificado_en.lte.${revisadoHace})` +
+      `&order=escalado_en.asc&select=id,prospect_id,escalado_en,intentos` +
+      `&limit=${MAX_HANDOFFS_A_VERIFICAR}`,
+    { headers }
+  );
+  if (!res.ok) {
+    console.error("verificarHandoffs: no se pudo leer la lista", res.status);
+    return;
+  }
+  const filas = await res.json();
+  if (!filas.length) return;
+
+  const resultado = { revisados: filas.length, respondidos: 0, sinRespuesta: 0, siguenEsperando: 0, noSePudoMirar: 0 };
+
+  for (const fila of filas) {
+    const escaladoMs = Date.parse(fila.escalado_en);
+    const respuesta = await buscarRespuestaHumana(env, fila.prospect_id, escaladoMs);
+
+    if (respuesta.noSePudoMirar) {
+      // Sin poder mirar no se concluye nada: se deja pendiente y se reintenta.
+      resultado.noSePudoMirar++;
+      await actualizarHandoff(env, fila.id, { verificado_en: new Date().toISOString(), intentos: fila.intentos + 1 });
+      continue;
+    }
+
+    if (respuesta.respondidoEn) {
+      resultado.respondidos++;
+      await actualizarHandoff(env, fila.id, {
+        estado: "respondido",
+        respondido_en: respuesta.respondidoEn,
+        respondido_por: respuesta.respondidoPor,
+        verificado_en: new Date().toISOString(),
+        intentos: fila.intentos + 1,
+      });
+      continue;
+    }
+
+    const vencido = ahora - escaladoMs >= HANDOFF_RENDIRSE_HORAS * 3600_000;
+    if (vencido) {
+      resultado.sinRespuesta++;
+      await actualizarHandoff(env, fila.id, {
+        estado: "sin_respuesta",
+        verificado_en: new Date().toISOString(),
+        intentos: fila.intentos + 1,
+      });
+    } else {
+      resultado.siguenEsperando++;
+      await actualizarHandoff(env, fila.id, { verificado_en: new Date().toISOString(), intentos: fila.intentos + 1 });
+    }
+  }
+
+  console.log("HANDOFFS_VERIFICADOS", JSON.stringify(resultado));
+}
+
+// Busca en Zenvia el primer mensaje saliente posterior a la escalación.
+// Devuelve { respondidoEn, respondidoPor } o { noSePudoMirar: true }.
+async function buscarRespuestaHumana(env, prospectId, escaladoMs) {
+  try {
+    const res = await fetchWithTimeout(
+      `${ZENVIA_API_BASE}/prospect/${prospectId}/interactions?api-key=${env.ZENVIA_API_KEY}`
+    );
+    if (!res.ok) return { noSePudoMirar: true };
+    const interacciones = await res.json();
+    if (!Array.isArray(interacciones)) return { noSePudoMirar: true };
+
+    // Un minuto de colchón: el propio mensaje de transición de Sofía ("le paso
+    // con el equipo") sale justo antes del traspaso y no es una respuesta humana.
+    const corte = escaladoMs + 60_000;
+    const candidatas = interacciones
+      .filter((i) => {
+        const m = i.output?.message;
+        if (!m || m.performer === "integration") return false; // entrante: es la paciente
+        const agente = i.agentId ?? i.agent?.id ?? null;
+        if (agente === SOFIA_AGENT_ID) return false;           // por si acaso
+        const t = new Date(i.createdAt).getTime();
+        return Number.isFinite(t) && t > corte;
+      })
+      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+
+    const primera = candidatas[0];
+    if (!primera) return { respondidoEn: null, respondidoPor: null };
+    return {
+      respondidoEn: new Date(primera.createdAt).toISOString(),
+      respondidoPor: primera.agentId ?? primera.agent?.id ?? null,
+    };
+  } catch (err) {
+    console.error("buscarRespuestaHumana falló", prospectId, err);
+    return { noSePudoMirar: true };
+  }
+}
+
+async function actualizarHandoff(env, id, campos) {
+  try {
+    const res = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_handoffs?id=eq.${id}`, {
+      method: "PATCH",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify(campos),
+    });
+    if (!res.ok) console.error("actualizarHandoff falló", res.status, id);
+  } catch (err) {
+    console.error("actualizarHandoff threw", err);
   }
 }
 
