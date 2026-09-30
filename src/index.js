@@ -5221,7 +5221,18 @@ async function findFollowupCandidates(env, { primerMensajeActivo = false } = {})
 
   const base = `${env.SUPABASE_URL}/rest/v1/sofia_conversations` +
     `?select=id,phone_hash,prospect_id,channel,procedure_code,procedure_interest,message_count,updated_at` +
-    `&escalated=eq.false`;
+    `&escalated=eq.false` +
+    // Ni a quien ya tiene un traspaso esperando. Las dos colas de la noche
+    // dejan escalated=false a propósito —para que Sofía pueda seguir
+    // contestando— y sin esto el barrido las trata como conversaciones
+    // abandonadas. El choque no es teórico: una conversación diferida el
+    // sábado por la tarde espera al lunes, y el domingo a las 9 de la mañana
+    // cae dentro de la ventana del seguimiento (9 a 19, todos los días). La
+    // paciente a la que Sofía le dijo "el equipo le escribe el lunes" habría
+    // recibido un "¿le quedó alguna duda?" el domingo. Encontrado leyendo las
+    // reglas unas contra otras el 2026-09-29, antes de que pasara.
+    `&traspaso_pendiente_desde=is.null` +
+    `&escalacion_espera_desde=is.null`;
 
   // (1) La lista de siempre: gente que sostuvo una conversación y se calló.
   const urlConversacion =
