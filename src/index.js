@@ -3695,7 +3695,11 @@ async function transferToNextAgentInPool(env, prospectId, { phoneHash } = {}) {
 // prospect_id es único en la tabla y el insert ignora duplicados: los reintentos
 // (retryStuckEscalations, la red de auto-reparación) no crean filas nuevas ni
 // pisan la hora original de la escalación, que es la que hay que medir.
-async function registrarHandoff(env, { prospectId, phoneHash, motivo, agenteAsignado, traspasoOk }) {
+// escaladoEn: cuándo DECIDIÓ Sofía pasar el caso. Se omite en el traspaso
+// normal, donde decidir y transferir es el mismo instante. Los dos barridos sí
+// lo pasan, porque ahí pueden separarse horas — ver la migración
+// handoffs_separar_decision_de_asignacion. asignado_en siempre es ahora.
+async function registrarHandoff(env, { prospectId, phoneHash, motivo, agenteAsignado, traspasoOk, escaladoEn }) {
   if (!prospectId) return;
   try {
     // `on_conflict=prospect_id` no es opcional: sin él, PostgREST ignora el
@@ -3716,6 +3720,7 @@ async function registrarHandoff(env, { prospectId, phoneHash, motivo, agenteAsig
         motivo: motivo ?? null,
         agente_asignado: agenteAsignado ?? null,
         traspaso_ok: traspasoOk ?? null,
+        ...(escaladoEn ? { escalado_en: escaladoEn } : {}),
       }),
     });
     if (!res.ok) console.error("registrarHandoff falló", res.status, prospectId);
@@ -3853,6 +3858,8 @@ async function transferirTraspasosPendientes(env) {
     await registrarHandoff(env, {
       prospectId: fila.prospect_id, phoneHash: fila.phone_hash,
       motivo: fila.escalation_reason, agenteAsignado: traspaso.agentId, traspasoOk: true,
+      // La paciente lleva esperando desde acá, no desde que el barrido corrió.
+      escaladoEn: fila.traspaso_pendiente_desde,
     });
     await cerrarTraspasoPendiente(env, fila.id, fila.escalation_reason);
     resultado.transferidos++;
@@ -3887,7 +3894,7 @@ async function escalarEsperasVencidas(env) {
       // las dos toquen la misma fila sería transferirla dos veces.
       `&traspaso_pendiente_desde=is.null` +
       `&order=escalacion_espera_desde.asc` +
-      `&select=id,phone_hash,prospect_id,escalation_reason` +
+      `&select=id,phone_hash,prospect_id,escalation_reason,escalacion_espera_desde` +
       `&limit=${MAX_ESPERAS_VENCIDAS_POR_CORRIDA}`,
     { headers }
   );
@@ -3927,6 +3934,7 @@ async function escalarEsperasVencidas(env) {
     await registrarHandoff(env, {
       prospectId: fila.prospect_id, phoneHash: fila.phone_hash,
       motivo: fila.escalation_reason, agenteAsignado: traspaso.agentId, traspasoOk: true,
+      escaladoEn: fila.escalacion_espera_desde,
     });
     await cerrarEsperaDeRespuesta(env, fila.id, fila.escalation_reason);
     resultado.escaladas++;
