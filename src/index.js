@@ -117,27 +117,56 @@ function esUrgente(motivo) {
 // salir EXACTAS. El texto lo revisó JP antes de activarse
 // (ver sección 4 del documento de diseño).
 //
-// La segunda oración de cada una es la que más importa: Sofía NO tiene acceso a
-// la agenda, así que no puede apartar una cita ni prometer una hora. Decirlo
-// explícitamente es lo que evita que la paciente entienda que ya tiene cita.
-const NOCTURNO_ENTRE_SEMANA =
-  "El equipo que coordina las citas atiende de 8 de la mañana a 6 de la tarde, " +
-  "así que le escriben mañana. Mientras tanto le puedo adelantar lo que " +
-  "necesiten saber, para que cuando la contacten sea solo cuestión de definir el día.";
+// Lo que más importa: Sofía NO tiene acceso a la agenda, así que la frase dice
+// cuándo le escriben y no promete ninguna hora — eso es lo que evita que la
+// paciente entienda que ya tiene cita.
+//
+// Reescritas el 2026-09-29, primera noche en producción. La versión anterior
+// hablaba de "el equipo que coordina LAS CITAS" y cerraba con "para que cuando
+// la contacten sea solo cuestión de DEFINIR EL DÍA": daba por sentado que todo
+// traspaso es para agendar. Caso real (María, lifting facial, 7:15 p.m.): pidió
+// ver fotos de resultados ANTES de agendar y recibió esa frase, o sea una
+// respuesta sobre coordinar el día a alguien que acababa de decir que todavía
+// no quería agendar. Fuera de contexto y con tono de empujón.
+//
+// Ahora no nombran el motivo del traspaso: dicen cuándo le escriben y que
+// mientras tanto Sofía sigue disponible. Sirven igual para una cita, para unas
+// fotos, para un precio o para una duda médica.
+//
+// El ofrecimiento va aparte porque Sofía muy seguido ya cerró con uno suyo
+// ("Cualquier otra cosa que necesite mientras tanto, con gusto le ayudo"). Al
+// conservar su respuesta en vez de reemplazarla, pegarle el nuestro encima deja
+// la misma frase dos veces seguidas — ver yaOfreceSeguirAyudando().
+const NOCTURNO_ENTRE_SEMANA = "El equipo le va a escribir mañana: atienden de 8 de la mañana a 6 de la tarde.";
 
 const NOCTURNO_FIN_DE_SEMANA =
-  "El equipo coordina las citas de lunes a viernes de 8 a 6, y los sábados hasta " +
-  "las 4 de la tarde, así que le van a escribir el lunes. Mientras tanto, con " +
-  "gusto le resuelvo cualquier duda del procedimiento para que llegue con todo claro.";
+  "El equipo le va a escribir el lunes: atienden de lunes a viernes de 8 a 6, y los " +
+  "sábados hasta las 4 de la tarde.";
+
+const NOCTURNO_OFRECIMIENTO = "Mientras tanto, con gusto le sigo ayudando con lo que necesite.";
+
+// ¿Sofía ya cerró ofreciéndose a seguir ayudando? Entonces el ofrecimiento
+// nuestro sobra.
+const YA_OFRECE = [
+  /mientras tanto/i,
+  /con gusto le (ayudo|sigo ayudando|colaboro)/i,
+  /cualquier (otra )?(cosa|duda|consulta|pregunta)/i,
+  /(ac[áa]|aqu[íi]) estoy/i,
+  /qued[oa] (atenta|pendiente|a la orden)/i,
+];
+function yaOfreceSeguirAyudando(texto) {
+  return YA_OFRECE.some((re) => re.test(String(texto || "")));
+}
 
 // ¿Cuál de las dos toca? El sábado después de las 4 y el domingo esperan al
 // lunes; cualquier otra noche espera a la mañana siguiente.
-function fraseDeEspera(ahora = new Date()) {
+function fraseDeEspera(ahora = new Date(), { conOfrecimiento = true } = {}) {
   const cr = new Date(ahora.getTime() - 6 * 3600_000);
   const dia = cr.getUTCDay();
   const hora = cr.getUTCHours();
   const esperaAlLunes = dia === 0 || (dia === 6 && hora >= 16);
-  return esperaAlLunes ? NOCTURNO_FIN_DE_SEMANA : NOCTURNO_ENTRE_SEMANA;
+  const cuando = esperaAlLunes ? NOCTURNO_FIN_DE_SEMANA : NOCTURNO_ENTRE_SEMANA;
+  return conOfrecimiento ? `${cuando} ${NOCTURNO_OFRECIMIENTO}` : cuando;
 }
 
 // Images/audio: cap at 8MB (Claude's per-image limit is smaller, but this
@@ -1391,11 +1420,17 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   let finalReply = silenced ? silenceTag : escalated && !reply ? pickEscalationFallbackReply() : reply;
   if (diferir && !yaEstabaPendiente) {
     // Si Sofía prometió un traspaso ("le contactan a la brevedad"), esa promesa
-    // es justamente lo que no se puede cumplir de noche: se reemplaza entera.
-    // Si escribió algo sin prometer nada, se conserva y se le agrega el plazo.
-    finalReply = mentionsHandoffPromise(finalReply)
-      ? fraseDeEspera()
-      : `${finalReply}\n\n${fraseDeEspera()}`.trim();
+    // es justamente lo que no se puede cumplir de noche. Antes se reemplazaba la
+    // respuesta ENTERA, y con ella se perdía lo que la paciente había preguntado
+    // — ver el caso de María en el comentario de NOCTURNO_ENTRE_SEMANA. Ahora se
+    // quita solo la promesa y se conserva el resto.
+    const sustancia = quitarPromesaDeTraspaso(finalReply);
+    finalReply =
+      sustancia.length >= MINIMO_SUSTANCIA_NOCTURNA
+        ? `${sustancia}\n\n${fraseDeEspera(new Date(), {
+            conOfrecimiento: !yaOfreceSeguirAyudando(sustancia),
+          })}`.trim()
+        : fraseDeEspera();
   }
 
   // -------------------------------------------------------------------------
@@ -1623,6 +1658,30 @@ const HANDOFF_PROMISE_PATTERNS = [
 function mentionsHandoffPromise(text) {
   return HANDOFF_PROMISE_PATTERNS.some((re) => re.test(text));
 }
+
+// Saca las oraciones donde Sofía promete el traspaso y deja el resto. De noche
+// esa promesa es lo único que no se puede cumplir ("en breve le escriben" a las
+// 7 p.m. es falso), pero lo que dijo alrededor —el precio, la explicación del
+// procedimiento, la respuesta a lo que la paciente acababa de preguntar— sigue
+// siendo bueno y antes se tiraba entero a la basura junto con la promesa.
+function quitarPromesaDeTraspaso(texto) {
+  return String(texto || "")
+    .split(/\n{2,}/)
+    .map((parrafo) =>
+      parrafo
+        .split(/(?<=[.!?…])\s+/)
+        .filter((frase) => !mentionsHandoffPromise(frase))
+        .join(" ")
+        .trim()
+    )
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
+// Debajo de esto, lo que queda después de quitar la promesa ya no es una
+// respuesta: es un "con gusto" suelto. Ahí la frase de la noche va sola.
+const MINIMO_SUSTANCIA_NOCTURNA = 40;
 
 // ¿El mensaje termina pidiéndole algo a la paciente? Se mira solo el final, no
 // si hay un signo de pregunta en cualquier parte: una pregunta a mitad del
