@@ -1246,6 +1246,14 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       await claimPromise;
       if (despedida) await sendChannelMessageOrEscalate(env, prospectId, channel, despedida, { phoneHash });
       await archiveProspect(env, prospectId, "infoGeneral");
+      // Misma limpieza que en [CERRAR]: se archiva sin asesor, así que lo que
+      // hubiera en cola sobra. Sin esto el barrido se la pasa a alguien mañana.
+      if (conversationState.traspasoPendienteDesde || conversationState.escalacionEsperaDesde) {
+        await patchConversacion(env, `phone_hash=eq.${phoneHash}`, {
+          traspaso_pendiente_desde: null,
+          escalacion_espera_desde: null,
+        }, "limpiarColasAlCerrarSinAsesor");
+      }
       await saveSessionWithRetry(
         env, phoneHash, channel, session.messages, session.version,
         [{ role: "user", content: contentForHistory }, { role: "assistant", content: registro }]
@@ -1652,6 +1660,15 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     // venta, no es "no interesado", no es inactividad.
     if (shouldClose) {
       await archiveProspect(env, prospectId, "infoGeneral");
+      // Sofía decidió que esta conversación no necesita un asesor. Si traía un
+      // traspaso en cola, hay que sacarla: si no, el barrido se la asigna a
+      // alguien por la mañana, ya archivada y sin nada que hacer.
+      if (conversationState.traspasoPendienteDesde || conversationState.escalacionEsperaDesde) {
+        await patchConversacion(env, `phone_hash=eq.${phoneHash}`, {
+          traspaso_pendiente_desde: null,
+          escalacion_espera_desde: null,
+        }, "limpiarColasAlCerrar");
+      }
     }
   }
 
@@ -3748,6 +3765,11 @@ async function escalarEsperasVencidas(env) {
   const res = await fetchWithTimeout(
     `${env.SUPABASE_URL}/rest/v1/sofia_conversations` +
       `?escalacion_espera_desde=lte.${tope}&prospect_id=not.is.null` +
+      // Sin esto, una conversación que ya se transfirió por el otro camino
+      // —el barrido de la noche, o el tope de mensajes— seguía en esta lista y
+      // se transfería por segunda vez. El asesor recibía una segunda nota de un
+      // caso que ya tenía.
+      `&escalated=is.false` +
       // Las que la noche se llevó las maneja transferirTraspasosPendientes; que
       // las dos toquen la misma fila sería transferirla dos veces.
       `&traspaso_pendiente_desde=is.null` +
@@ -3863,6 +3885,10 @@ async function cerrarTraspasoPendiente(env, id, motivo) {
       },
       body: JSON.stringify({
         traspaso_pendiente_desde: null,
+        // También la otra cola: si la conversación traía una pregunta
+        // esperando respuesta y la noche se la llevó primero, dejarla marcada
+        // haría que escalarEsperasVencidas() la transfiriera de nuevo.
+        escalacion_espera_desde: null,
         escalated: true,
         escalation_reason: motivo ?? null,
       }),
