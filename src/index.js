@@ -1704,7 +1704,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     [{ role: "user", content: contentForHistory }, { role: "assistant", content: finalReply }]
   );
 
-  let agility = { procedureInterest: null, sentiment: null };
+  let agility = { procedureInterest: null, sentiment: null, tamizaje: SIN_TAMIZAJE };
 
   if (diferir) {
     // NO se transfiere y NO se marca escalated: esa bandera es la que la calla, y
@@ -1805,6 +1805,10 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       agility = {
         procedureInterest: conversationState.procedureInterest,
         sentiment: conversationState.sentiment,
+        // Se salta la reclasificación, así que no hay tamizaje nuevo que
+        // guardar. Lo que ya estaba en la fila no se pierde: upsertConversation
+        // lo conserva (es pegajoso, como el motivo de escalación).
+        tamizaje: SIN_TAMIZAJE,
         label: null,
       };
     } else {
@@ -1846,6 +1850,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     resetCounters,
     procedureInterest: agility.procedureInterest,
     sentiment: agility.sentiment,
+    tamizaje: agility.tamizaje,
     phone,
     patientName,
   });
@@ -3008,6 +3013,7 @@ async function upsertConversation(env, {
   resetCounters,
   procedureInterest,
   sentiment,
+  tamizaje,
   patientName,
   phone,
 }) {
@@ -3034,7 +3040,7 @@ async function upsertConversation(env, {
       // them. Always picking the earliest keeps every turn landing on the
       // same row.
       const existingRes = await fetchWithTimeout(
-        `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=id,message_count,escalated,escalation_reason,traspaso_pendiente_desde,escalacion_espera_desde&order=created_at.asc&limit=1`,
+        `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=id,message_count,escalated,escalation_reason,traspaso_pendiente_desde,escalacion_espera_desde,tamizaje_embarazo,tamizaje_lactancia,tamizaje_peso&order=created_at.asc&limit=1`,
         { headers }
       );
       if (!existingRes.ok) {
@@ -3063,6 +3069,17 @@ async function upsertConversation(env, {
         // El motivo es la memoria durable del traspaso: la transcripción es una
         // ventana de 20 turnos que se va corriendo, el motivo no.
         const enCola = !!(existing[0]?.traspaso_pendiente_desde || existing[0]?.escalacion_espera_desde);
+
+        // El tamizaje es PEGAJOSO. La paciente lo contesta una vez, a mitad de
+        // la conversación, y los turnos siguientes no vuelven a hablar del tema:
+        // el clasificador devuelve null y pisarlo borraría un dato clínico que
+        // ya teníamos. `??` conserva el false, que es una respuesta de verdad
+        // ("confirmó que no"), y solo deja pasar el valor nuevo cuando existe.
+        // Es la misma lección que escalation_reason el 29 de setiembre.
+        const t = tamizaje ?? {};
+        const tamizajeEmbarazo  = t.embarazo  ?? existing[0]?.tamizaje_embarazo  ?? null;
+        const tamizajeLactancia = t.lactancia ?? existing[0]?.tamizaje_lactancia ?? null;
+        const tamizajePeso      = t.peso      ?? existing[0]?.tamizaje_peso      ?? null;
         const stickyEscalationReason = resetCounters
           ? escalationReason
           : escalated
@@ -3084,6 +3101,9 @@ async function upsertConversation(env, {
               last_interaction_id: interactionId,
               procedure_interest: procedureInterest ?? null,
               sentiment: sentiment ?? null,
+              tamizaje_embarazo: tamizajeEmbarazo,
+              tamizaje_lactancia: tamizajeLactancia,
+              tamizaje_peso: tamizajePeso,
               // A diferencia de los de arriba, el nombre NO se pisa con null.
               // Esos dos los recalcula Claude en cada turno, así que un null
               // significa "no aplica ahora". El nombre viene de Zenvia y un null
@@ -3119,6 +3139,9 @@ async function upsertConversation(env, {
               last_interaction_id: interactionId,
               procedure_interest: procedureInterest ?? null,
               sentiment: sentiment ?? null,
+              tamizaje_embarazo: tamizaje?.embarazo ?? null,
+              tamizaje_lactancia: tamizaje?.lactancia ?? null,
+              tamizaje_peso: tamizaje?.peso ?? null,
               patient_name: patientName ?? null,
               phone_number: phone ?? null,
             }),
@@ -3497,6 +3520,8 @@ async function getAvailableLabels(env) {
 // sofia_conversations always has an up-to-date topic/sentiment, not just on
 // escalation. Never throws — always returns a usable (possibly all-null)
 // result.
+const SIN_TAMIZAJE = { embarazo: null, lactancia: null, peso: null };
+
 async function classifyEscalationWithHaiku(env, history, availableLabels) {
   try {
     const labelsContext = availableLabels.map((l) => `${l.key}: ${l.name}`).join("\n");
@@ -3529,7 +3554,22 @@ async function classifyEscalationWithHaiku(env, history, availableLabels) {
           'describa el interés del paciente, o null si ninguna calza bien — nunca inventes un key que no ' +
           'esté en la lista), "procedure_interest" (resumen muy corto, 2-4 palabras, del procedimiento o ' +
           'tema de interés del paciente, ej. "rinoplastia", "precio botox"), "sentiment" ("positivo", ' +
-          '"neutral" o "negativo", según el tono general del paciente en la conversación).\n\n' +
+          '"neutral" o "negativo", según el tono general del paciente en la conversación), ' +
+          'y las tres del tamizaje quirúrgico: "tamizaje_embarazo", "tamizaje_lactancia" y ' +
+          '"tamizaje_peso".\n\n' +
+          "TAMIZAJE — cada una vale true, false o null, y null es la respuesta correcta la mayoría " +
+          "de las veces:\n" +
+          "  true  = la paciente dijo que SÍ le aplica (está embarazada o planea estarlo en los " +
+          "próximos 2 años / está en lactancia o la suspendió hace menos de 6 meses / está en un " +
+          "proceso activo de pérdida o aumento de peso).\n" +
+          "  false = la paciente confirmó explícitamente que NO le aplica ESA pregunta en concreto.\n" +
+          "  null  = no se preguntó, no contestó, o contestó de forma ambigua.\n" +
+          "Regla dura: si Sofía hizo las tres preguntas juntas y la paciente respondió solo \"no\" o " +
+          "\"ninguna\", eso NO alcanza para poner false en las tres — va null en las tres, porque no " +
+          "hay forma de saber a cuál contestó. Solo pon false cuando la respuesta se pueda atribuir a " +
+          "una pregunta concreta, ya sea porque se preguntó sola o porque la paciente la nombró " +
+          "(\"no estoy embarazada\", \"no, ninguna de las tres\"). Ante la duda, null. Es un dato " +
+          "clínico: inventarlo es peor que no tenerlo.\n\n" +
           "REGLA DE PRIORIZACIÓN — muy importante: prioriza siempre el procedimiento que el PACIENTE " +
           "pidió o por el que preguntó originalmente (mira primero su primer mensaje y cualquier " +
           "contexto de origen del lead, como un anuncio de Meta/Facebook/Instagram, si aparece ahí). " +
@@ -3559,14 +3599,22 @@ async function classifyEscalationWithHaiku(env, history, availableLabels) {
     const parsed = JSON.parse(cleanedText);
 
     const label = availableLabels.some((l) => l.key === parsed.label) ? parsed.label : null;
+    // Solo true y false valen; cualquier otra cosa (undefined, "no sé", "") es
+    // sin dato. Un dato clínico inventado es peor que uno ausente.
+    const treEstado = (v) => (v === true || v === false ? v : null);
     return {
       label,
       procedureInterest: parsed.procedure_interest || null,
       sentiment: parsed.sentiment || null,
+      tamizaje: {
+        embarazo: treEstado(parsed.tamizaje_embarazo),
+        lactancia: treEstado(parsed.tamizaje_lactancia),
+        peso: treEstado(parsed.tamizaje_peso),
+      },
     };
   } catch (err) {
     console.error("classifyEscalationWithHaiku failed", err);
-    return { label: null, procedureInterest: null, sentiment: null };
+    return { label: null, procedureInterest: null, sentiment: null, tamizaje: SIN_TAMIZAJE };
   }
 }
 
@@ -3704,7 +3752,7 @@ async function runEscalationAgility(env, { prospectId, history, escalationReason
     return classification;
   } catch (err) {
     console.error("runEscalationAgility failed", err);
-    return { label: null, procedureInterest: null, sentiment: null };
+    return { label: null, procedureInterest: null, sentiment: null, tamizaje: SIN_TAMIZAJE };
   }
 }
 
