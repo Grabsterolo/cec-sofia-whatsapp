@@ -185,6 +185,8 @@ function notaNocturna(ahora = new Date()) {
     `así que no se lo repita y no prometa contacto inmediato. ` +
     `Si la conversación lo permite con naturalidad, aproveche para dejar el caso listo: qué días u horas le sirven, ` +
     `la zona o el procedimiento que le interesa, y el tamizaje si es quirúrgico. ` +
+    `Anótelo como una preferencia de la paciente, NO lo confirme: usted no tiene acceso a la agenda y no sabe si ` +
+    `hay campo ese día ni ese mes, así que nunca diga que una fecha "está bien", "es posible" ni "se puede". ` +
     `Si solo quiere información, respóndale eso y no la interrogue.)`
   );
 }
@@ -1560,7 +1562,15 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   const yaEstabaPendiente = !!conversationState.traspasoPendienteDesde;
 
   let finalReply = silenced ? silenceTag : escalated && !reply ? pickEscalationFallbackReply() : reply;
-  if (diferir && !yaEstabaPendiente) {
+
+  // El plazo se le dice una vez y no en cada turno, para no sonar a robot. Pero
+  // "una vez" resultó ser muy poco: Valeria (29 set, 8:36 p.m.) ya lo había
+  // recibido a las 8:31 y cinco minutos después Sofía cerró con "con gusto le
+  // paso esto al equipo para que le contacten", sin plazo. A esa hora eso se lee
+  // como "esta noche". Cada vez que Sofía vuelve a prometer contacto hay que
+  // volver a anclar cuándo, o la promesa nueva pisa el plazo viejo.
+  const repitePromesa = mentionsHandoffPromise(finalReply);
+  if (diferir && (!yaEstabaPendiente || repitePromesa)) {
     // Si Sofía prometió un traspaso ("le contactan a la brevedad"), esa promesa
     // es justamente lo que no se puede cumplir de noche. Antes se reemplazaba la
     // respuesta ENTERA, y con ella se perdía lo que la paciente había preguntado
