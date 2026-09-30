@@ -3738,6 +3738,12 @@ const STUCK_ESCALATION_WINDOW_HOURS = 72;
 // alcanza de sobra para los ~28 que se acumulan en una noche.
 const MAX_TRASPASOS_PENDIENTES_POR_CORRIDA = 20;
 
+// Cuántos mensajes de la conversación se le pasan al asesor en la nota. Tiene
+// que cubrir desde antes del traspaso hasta el final: de noche la conversación
+// sigue, y el motivo del traspaso queda atrás. Ver el comentario en
+// transferirTraspasosPendientes().
+const MENSAJES_DE_CONTEXTO_NOCTURNO = 14;
+
 // El otro extremo de la atención nocturna: transferir lo que Sofía difirió,
 // cuando el equipo abre. Corre en el cron de cada 20 minutos.
 //
@@ -3799,9 +3805,19 @@ async function transferirTraspasosPendientes(env) {
     // cambio pretende evitar: de noche Sofía recogió tamizaje y preferencias, y
     // esa es la información que le ahorra la llamada.
     //
-    // Se traen 6 mensajes y no 2 como en la escalación del día: acá la
-    // conversación siguió después de decidir el traspaso, así que lo valioso
-    // —el tamizaje, los días que le sirven— está en los turnos posteriores.
+    // Se traen MENSAJES_DE_CONTEXTO_NOCTURNO y no 2 como en la escalación del
+    // día: acá la conversación siguió después de decidir el traspaso, así que lo
+    // valioso —el tamizaje, los días que le sirven— está en los turnos
+    // posteriores.
+    //
+    // Eran 6, y 6 alcanzaban cuando la conversación se terminaba poco después
+    // del traspaso. Dejaron de alcanzar la misma noche que se levantó el tope de
+    // mensajes: caso real (Sonia, mastopexia, 29 de septiembre) — se difirió en
+    // el turno 12 y siguió hasta el 20 hablando de lipoescultura, así que los
+    // últimos 6 mensajes no contenían NADA del motivo del traspaso. El asesor
+    // habría abierto un caso que dice "mastopexia, en pérdida de peso, faltan
+    // confirmar embarazo y lactancia" y habría leído seis mensajes sobre precios
+    // de liposucción.
     const ses = await fetchWithTimeout(
       `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?phone_hash=eq.${fila.phone_hash}&select=messages&limit=1`,
       { headers }
@@ -3811,7 +3827,7 @@ async function transferirTraspasosPendientes(env) {
       env,
       fila.prospect_id,
       `${fila.escalation_reason || "no especificado"} — conversación de fuera de horario, Sofía siguió atendiendo`,
-      mensajes.slice(-6)
+      mensajes.slice(-MENSAJES_DE_CONTEXTO_NOCTURNO)
     );
 
     const traspaso = await transferToNextAgentInPool(env, fila.prospect_id, { phoneHash: fila.phone_hash });
