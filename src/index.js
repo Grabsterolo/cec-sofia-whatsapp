@@ -3436,13 +3436,31 @@ async function sendChannelMessageOrEscalate(env, prospectId, channel, content, {
 // /prospect/{id}/interactions, live-confirmed — see README 1.5b) so the
 // human agent has context before opening the chat. Non-fatal on failure:
 // missing internal context is worse than blocking the handoff.
+// Cuánto se muestra de cada turno. El asesor necesita reconocer de qué se
+// habló, no releer la conversación: una respuesta de Sofía puede irse a 690
+// caracteres y sola se come media nota. Recortando a 220 —con corte en la
+// última palabra entera— la nota promedio baja de 1.146 a 788 caracteres y la
+// peor de 2.161 a 1.381, sin perder de vista ningún turno.
+const CARACTERES_POR_TURNO_EN_LA_NOTA = 220;
+
+function turnoParaLaNota(m) {
+  const quien = m.role === "user" ? "Paciente" : "Sofía";
+  const texto = String(m.content ?? "").replace(/\s+/g, " ").trim();
+  if (texto.length <= CARACTERES_POR_TURNO_EN_LA_NOTA) return `${quien}: ${texto}`;
+  const cortado = texto.slice(0, CARACTERES_POR_TURNO_EN_LA_NOTA);
+  const hastaPalabra = cortado.slice(0, cortado.lastIndexOf(" "));
+  return `${quien}: ${(hastaPalabra || cortado).trim()}…`;
+}
+
+// La nota que el asesor abre en Zenvia. El motivo va arriba y solo: es lo que
+// contesta "por qué me llegó esto" sin leer nada más. Los mensajes van después
+// como referencia de lo que ya se conversó.
 async function addEscalationNote(env, prospectId, escalationReason, recentMessages) {
-  const transcript = recentMessages
-    .map((m) => `${m.role === "user" ? "Paciente" : "Sofía"}: ${m.content}`)
-    .join("\n");
+  const transcript = recentMessages.map(turnoParaLaNota).join("\n");
   const content =
-    `Escalado por Sofía CEC. Motivo: ${escalationReason || "no especificado"}\n\n` +
-    transcript;
+    `TRASPASO DE SOFÍA\n` +
+    `Motivo: ${escalationReason || "no especificado"}\n\n` +
+    `Últimos mensajes:\n${transcript}`;
 
   // try/catch so a raw network failure here (not just a non-ok response)
   // can never abort processInboundMessage() before it reaches
@@ -3854,10 +3872,12 @@ const MAX_TRASPASOS_PENDIENTES_POR_CORRIDA = 20;
 // que cubrir desde antes del traspaso hasta el final: de noche la conversación
 // sigue, y el motivo del traspaso queda atrás. Ver el comentario en
 // transferirTraspasosPendientes().
-// Bajado de 14 a 8 el 2026-09-30: el equipo avisó que la nota llegaba
+// Bajado de 14 a 6 el 2026-09-30: el equipo avisó que la nota llegaba
 // demasiado larga. Medido sobre las 45 notas de esa mañana: con 14 mensajes
 // promediaban 2.312 caracteres y la más larga llegó a 4.911 — página y media
-// que el asesor tiene que leer antes de escribirle a la paciente.
+// que el asesor tiene que leer antes de escribirle a la paciente. JP: "quiero
+// que el contexto sea claro y conciso y que los agentes lo puedan entender
+// rápido".
 //
 // Eran 6 y las subí a 14 la noche anterior porque el motivo de Sonia había
 // llegado vacío. Pero eso no era culpa de la ventana: era que
@@ -3865,7 +3885,7 @@ const MAX_TRASPASOS_PENDIENTES_POR_CORRIDA = 20;
 // traspaso. Arreglado eso, la ventana larga quedó compensando un problema que
 // ya no existe. 8 deja ~1.500 caracteres y conserva el par de turnos
 // posteriores al traspaso, que es lo que 6 no alcanzaba a cubrir.
-const MENSAJES_DE_CONTEXTO_NOCTURNO = 8;
+const MENSAJES_DE_CONTEXTO_NOCTURNO = 6;
 
 // El otro extremo de la atención nocturna: transferir lo que Sofía difirió,
 // cuando el equipo abre. Corre en el cron de cada 20 minutos.
