@@ -141,11 +141,36 @@ function esUrgente(motivo) {
 // ("Cualquier otra cosa que necesite mientras tanto, con gusto le ayudo"). Al
 // conservar su respuesta en vez de reemplazarla, pegarle el nuestro encima deja
 // la misma frase dos veces seguidas — ver yaOfreceSeguirAyudando().
-const NOCTURNO_ENTRE_SEMANA = "El equipo le va a escribir mañana: atienden de 8 de la mañana a 6 de la tarde.";
+const DIAS_CR = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
 
-const NOCTURNO_FIN_DE_SEMANA =
-  "El equipo le va a escribir el lunes: atienden de lunes a viernes de 8 a 6, y los " +
-  "sábados hasta las 4 de la tarde.";
+// Cuándo abre el equipo la próxima vez, dicho como se lo diría una persona.
+//
+// Arreglado el 2026-09-30 (JP): "le va a escribir mañana" estaba fijo en el
+// texto. A las 6 de la mañana de un día hábil eso es falso — el equipo abre a
+// las 8, o sea HOY, en dos horas, y la frase le prometía a la paciente esperar
+// hasta el día siguiente. El mismo texto fijo traía un segundo error: un
+// viernes por la noche decía "atienden de 8 de la mañana a 6 de la tarde",
+// pero el sábado cierran a las 4.
+//
+// Se calcula de EQUIPO_HORARIO_CR en vez de escribirse a mano, así que si
+// cambia el horario del equipo, cambia la frase.
+function proximaApertura(ahora = new Date()) {
+  const cr = new Date(ahora.getTime() - 6 * 3600_000);
+  const diaHoy = cr.getUTCDay();
+  const horaAhora = cr.getUTCHours();
+
+  for (let salto = 0; salto <= 7; salto++) {
+    const dia = (diaHoy + salto) % 7;
+    const franja = EQUIPO_HORARIO_CR[dia];
+    if (!franja) continue;                      // domingo, cerrado
+    if (salto === 0 && horaAhora >= franja[0]) continue; // hoy ya abrieron
+    const cuando = salto === 0 ? "hoy" : salto === 1 ? "mañana" : `el ${DIAS_CR[dia]}`;
+    const cierre = franja[1] === 18 ? "6 de la tarde" : `${franja[1] - 12} de la tarde`;
+    return { cuando, horario: `de ${franja[0]} de la mañana a ${cierre}` };
+  }
+  // Inalcanzable mientras EQUIPO_HORARIO_CR tenga al menos un día.
+  return { cuando: "pronto", horario: "en horario de oficina" };
+}
 
 const NOCTURNO_OFRECIMIENTO = "Mientras tanto, con gusto le sigo ayudando con lo que necesite.";
 
@@ -175,10 +200,7 @@ const NOCTURNO_OFRECIMIENTO = "Mientras tanto, con gusto le sigo ayudando con lo
 const MARCA_NOTA_NOCTURNA = "Nota interna del sistema";
 
 function notaNocturna(ahora = new Date()) {
-  const cr = new Date(ahora.getTime() - 6 * 3600_000);
-  const dia = cr.getUTCDay();
-  const hora = cr.getUTCHours();
-  const cuando = dia === 0 || (dia === 6 && hora >= 16) ? "el lunes" : "mañana";
+  const { cuando } = proximaApertura(ahora);
   return (
     `(${MARCA_NOTA_NOCTURNA}, no es un mensaje de la paciente y no debe mencionarse ni repetirse: ` +
     `el equipo de asesores no está disponible a esta hora. A la paciente ya se le avisó que le escriben ${cuando}, ` +
@@ -233,12 +255,9 @@ function yaOfreceSeguirAyudando(texto) {
 // ¿Cuál de las dos toca? El sábado después de las 4 y el domingo esperan al
 // lunes; cualquier otra noche espera a la mañana siguiente.
 function fraseDeEspera(ahora = new Date(), { conOfrecimiento = true } = {}) {
-  const cr = new Date(ahora.getTime() - 6 * 3600_000);
-  const dia = cr.getUTCDay();
-  const hora = cr.getUTCHours();
-  const esperaAlLunes = dia === 0 || (dia === 6 && hora >= 16);
-  const cuando = esperaAlLunes ? NOCTURNO_FIN_DE_SEMANA : NOCTURNO_ENTRE_SEMANA;
-  return conOfrecimiento ? `${cuando} ${NOCTURNO_OFRECIMIENTO}` : cuando;
+  const { cuando, horario } = proximaApertura(ahora);
+  const aviso = `El equipo le va a escribir ${cuando}: atienden ${horario}.`;
+  return conOfrecimiento ? `${aviso} ${NOCTURNO_OFRECIMIENTO}` : aviso;
 }
 
 // Images/audio: cap at 8MB (Claude's per-image limit is smaller, but this
@@ -1574,7 +1593,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     // Si Sofía prometió un traspaso ("le contactan a la brevedad"), esa promesa
     // es justamente lo que no se puede cumplir de noche. Antes se reemplazaba la
     // respuesta ENTERA, y con ella se perdía lo que la paciente había preguntado
-    // — ver el caso de María en el comentario de NOCTURNO_ENTRE_SEMANA. Ahora se
+    // — ver el caso de María en el comentario de proximaApertura(). Ahora se
     // quita solo la promesa y se conserva el resto.
     const sustancia = quitarPromesaDeTraspaso(finalReply);
     finalReply =
