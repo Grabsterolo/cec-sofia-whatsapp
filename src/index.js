@@ -95,6 +95,14 @@ function equipoDisponible(ahora = new Date()) {
 // correcto: más vale asignado y esperando que invisible).
 const TRASPASO_PENDIENTE_TOPE_HORAS = 14;
 
+// Cuánto se le da a la paciente para contestar la pregunta que dejó Sofía antes
+// de pasar el caso igual. Es un freno de seguridad, no el camino normal: lo
+// normal es que conteste y se escale en ese mismo turno. Treinta minutos porque
+// el cron corre cada veinte: en la práctica el traspaso sale entre 30 y 50
+// minutos tarde en el peor caso, contra el riesgo de perder la conversación.
+const ESPERA_RESPUESTA_MINUTOS = 30;
+const MAX_ESPERAS_VENCIDAS_POR_CORRIDA = 10;
+
 // Lo que NO se difiere nunca, a ninguna hora. Mismo vocabulario que la columna
 // `urgente` de la vista sofia_followup_queue, que lleva meses en uso.
 const MOTIVO_URGENTE =
@@ -621,6 +629,10 @@ export default {
       ctx.waitUntil(
         verificarHandoffs(env)
           .catch((err) => console.error("HANDOFFS_VERIFICADOS falló", err))
+      );
+      ctx.waitUntil(
+        escalarEsperasVencidas(env)
+          .catch((err) => console.error("ESPERAS_VENCIDAS falló", err))
       );
       return;
     }
@@ -1370,6 +1382,8 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // no gastar un request en cada mensaje del día.
   const diferible = escalated && !equipoDisponible() && !esUrgente(escalation_reason);
   const diferir = diferible && (await atencionNocturnaActiva(env));
+  // ¿Veníamos esperando que contestara una pregunta? Ver el bloque de abajo.
+  const esperabaRespuesta = !!conversationState.escalacionEsperaDesde;
   // Si ya venía pendiente de antes, no se le repite la promesa en cada turno:
   // se le contesta normal y ya está.
   const yaEstabaPendiente = !!conversationState.traspasoPendienteDesde;
@@ -1383,6 +1397,45 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       ? fraseDeEspera()
       : `${finalReply}\n\n${fraseDeEspera()}`.trim();
   }
+
+  // -------------------------------------------------------------------------
+  // Escalar dejando una pregunta colgando (2026-09-29)
+  // -------------------------------------------------------------------------
+  //
+  // escalated pone a Sofía muda para siempre. Cuando su mensaje de traspaso
+  // TERMINA preguntando algo —el nombre completo, el tamizaje quirúrgico— la
+  // paciente contesta y ya no hay nadie del otro lado. Medido sobre 7 días:
+  // 611 escalaciones, 100 (16%) terminaban con una pregunta. En la red de
+  // seguridad (mentionsHandoffPromise) eran 19 de 23, el 83% — lógico, porque
+  // ahí Sofía está anunciando lo que VA a hacer mientras sigue recogiendo
+  // datos, y la red lo lee como si ya lo hubiera hecho.
+  //
+  // Detrás hay un choque de reglas del propio prompt: le ordena preguntar por
+  // embarazo, lactancia y peso ANTES de coordinar una valoración quirúrgica, y
+  // al mismo tiempo escalar cuando dice que pasa el caso. Las dos cosas caen en
+  // el mismo mensaje y solo una puede ganar.
+  //
+  // Se aplaza un turno: el mensaje sale, la conversación NO se marca escalada,
+  // y cuando la paciente contesta se escala de verdad — con su respuesta ya
+  // dentro de la nota que recibe el asesor, que es más de lo que recibe hoy.
+  //
+  // No se aplaza si es urgente (dolor, fiebre, postoperatorio: ahí la pregunta
+  // espera y el equipo no), ni si ya veníamos esperando (una sola vez, o se
+  // aplazaría indefinidamente), ni de noche (eso ya lo maneja el diferimiento).
+  // Y si la paciente nunca contesta, escalarEsperasVencidas() lo rescata a los
+  // ESPERA_RESPUESTA_MINUTOS.
+  const esperar =
+    escalated &&
+    !diferir &&
+    !esperabaRespuesta &&
+    !esUrgente(escalation_reason) &&
+    terminaEnPregunta(finalReply);
+
+  // Si veníamos esperando, este turno escala sí o sí: la paciente ya contestó.
+  const escalarAhora = !diferir && !esperar && (escalated || esperabaRespuesta);
+  // Sofía puede no haber vuelto a etiquetar nada en el turno de la respuesta;
+  // el motivo bueno es el que quedó guardado cuando se aplazó.
+  const motivoEscalacion = escalation_reason ?? (esperabaRespuesta ? conversationState.escalationReason : null);
 
   const updatedHistory = await saveSessionWithRetry(
     env, phoneHash, channel, session.messages, session.version,
@@ -1403,9 +1456,26 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     console.log("SOFIA_TRASPASO_DIFERIDO", JSON.stringify({
       prospectId, motivo: escalation_reason, yaEstabaPendiente,
     }));
-  } else if (escalated) {
+  } else if (esperar) {
+    // Sale el mensaje con la pregunta, pero NO se transfiere ni se marca
+    // escalada: esa bandera es la que la deja muda, y acá hace falta que pueda
+    // recibir la respuesta. El traspaso queda anotado para el turno siguiente.
+    await sendChannelMessageOrEscalate(env, prospectId, channel, finalReply, { phoneHash });
+    // Se clasifica igual que en cualquier turno de escalación, para que el
+    // tratamiento y el sentimiento queden guardados desde ya.
+    const availableLabels = await getAvailableLabels(env);
+    agility = await classifyEscalationWithHaiku(env, updatedHistory, availableLabels);
+    if (agility.label) await addLabelToProspect(env, prospectId, agility.label);
+    console.log("SOFIA_ESCALACION_EN_ESPERA", JSON.stringify({ prospectId, motivo: escalation_reason }));
+  } else if (escalarAhora) {
     // Give the human agent context before they open the chat cold.
-    await addEscalationNote(env, prospectId, escalation_reason, updatedHistory.slice(-2));
+    // Si veníamos de una espera, se mandan 4 mensajes y no 2: la respuesta de
+    // la paciente (el nombre, el tamizaje) está en los turnos de en medio, y es
+    // justamente lo que el asesor no tendría que volver a preguntar.
+    await addEscalationNote(
+      env, prospectId, motivoEscalacion,
+      updatedHistory.slice(esperabaRespuesta ? -4 : -2)
+    );
 
     // Send the transition line before handing off, so the patient isn't left
     // hanging. finalReply is never empty here: it's either what Sofía wrote
@@ -1415,13 +1485,16 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     agility = await runEscalationAgility(env, {
       prospectId,
       history: updatedHistory,
-      escalationReason: escalation_reason,
+      escalationReason: motivoEscalacion,
     });
     const traspaso = await transferToNextAgentInPool(env, prospectId, { phoneHash });
     await registrarHandoff(env, {
-      prospectId, phoneHash, motivo: escalation_reason,
+      prospectId, phoneHash, motivo: motivoEscalacion,
       agenteAsignado: traspaso.agentId, traspasoOk: traspaso.ok,
     });
+    if (esperabaRespuesta) {
+      console.log("SOFIA_ESCALACION_TRAS_ESPERA", JSON.stringify({ prospectId, motivo: motivoEscalacion }));
+    }
   } else {
     if (silenced) {
       console.log("SOFIA_SILENCIO", JSON.stringify({ prospectId, etiqueta: silenceTag }));
@@ -1497,9 +1570,10 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     prospectId,
     channel,
     lastMessage: finalReply,
-    // Al diferir va false a propósito: la conversación sigue siendo de Sofía.
-    escalated: diferir ? false : escalated,
-    escalationReason: diferir ? null : escalation_reason,
+    // Al diferir y al esperar va false a propósito: en los dos casos la
+    // conversación sigue siendo de Sofía y tiene que poder seguir contestando.
+    escalated: escalarAhora,
+    escalationReason: escalarAhora ? motivoEscalacion : null,
     interactionId,
     resetCounters,
     procedureInterest: agility.procedureInterest,
@@ -1511,6 +1585,13 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // Después del upsert, porque puede ser el que crea la fila.
   if (diferir && !yaEstabaPendiente) {
     await marcarTraspasoPendiente(env, phoneHash, escalation_reason);
+  }
+  if (esperar) {
+    await marcarEsperaDeRespuesta(env, phoneHash, escalation_reason);
+  } else if (esperabaRespuesta) {
+    // Ya sea porque escaló o porque la noche se lo llevó: deja de estar en la
+    // lista del barrido.
+    await limpiarEsperaDeRespuesta(env, phoneHash);
   }
 }
 
@@ -1541,6 +1622,21 @@ const HANDOFF_PROMISE_PATTERNS = [
 
 function mentionsHandoffPromise(text) {
   return HANDOFF_PROMISE_PATTERNS.some((re) => re.test(text));
+}
+
+// ¿El mensaje termina pidiéndole algo a la paciente? Se mira solo el final, no
+// si hay un signo de pregunta en cualquier parte: una pregunta a mitad del
+// mensaje casi siempre ya viene respondida por lo que sigue, y la que de verdad
+// deja a alguien esperando es la última. Medido sobre 7 días de escalaciones:
+// 118 mensajes contienen una pregunta, 100 terminan con ella.
+//
+// Se limpian los signos de cierre que WhatsApp deja después (emoji, comillas,
+// espacios) para no perder una pregunta por un detalle de puntuación.
+function terminaEnPregunta(texto) {
+  const limpio = String(texto || "")
+    .trim()
+    .replace(/[\s"'”’)\]]+$/u, "");
+  return /\?$/.test(limpio);
 }
 
 function parseEscalation(rawText) {
@@ -2538,7 +2634,7 @@ async function saveSessionWithRetry(env, phoneHash, channel, baseMessages, baseV
 
 async function getConversationState(env, phoneHash) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count,escalated,last_interaction_id,procedure_interest,sentiment,traspaso_pendiente_desde&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count,escalated,escalation_reason,last_interaction_id,procedure_interest,sentiment,traspaso_pendiente_desde,escalacion_espera_desde&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -2546,11 +2642,14 @@ async function getConversationState(env, phoneHash) {
       },
     }
   );
-  if (!res.ok) return { messageCount: 0, escalated: false, lastInteractionId: null, procedureInterest: null, sentiment: null, traspasoPendienteDesde: null };
+  if (!res.ok) return { messageCount: 0, escalated: false, escalationReason: null, lastInteractionId: null, procedureInterest: null, sentiment: null, traspasoPendienteDesde: null, escalacionEsperaDesde: null };
   const rows = await res.json();
   return {
     messageCount: rows[0]?.message_count ?? 0,
     escalated: rows[0]?.escalated ?? false,
+    // El motivo con el que se aplazó el traspaso: cuando la paciente contesta,
+    // se escala con ESE motivo, no con uno nuevo — ver escalacionEsperaDesde.
+    escalationReason: rows[0]?.escalation_reason ?? null,
     lastInteractionId: rows[0]?.last_interaction_id ?? null,
     // Se leen para poder saltarse la reclasificación cuando ya se sabe el
     // procedimiento — ver classifyEscalationWithHaiku en la rama sin escalar.
@@ -2559,6 +2658,9 @@ async function getConversationState(env, phoneHash) {
     // Si ya hay un traspaso pendiente, no se le vuelve a prometer nada en cada
     // turno — ver el diferimiento en processInboundMessage.
     traspasoPendienteDesde: rows[0]?.traspaso_pendiente_desde ?? null,
+    // Traspaso aplazado porque Sofía dejó una pregunta abierta — ver
+    // terminaEnPregunta() y el bloque de espera en processInboundMessage.
+    escalacionEsperaDesde: rows[0]?.escalacion_espera_desde ?? null,
   };
 }
 
@@ -3513,6 +3615,123 @@ async function transferirTraspasosPendientes(env) {
   }
 
   console.log("TRASPASOS_PENDIENTES", JSON.stringify(resultado));
+}
+
+// El rescate de las escalaciones aplazadas: si la paciente nunca contestó la
+// pregunta que Sofía le dejó, el caso se pasa igual. Corre en el mismo cron de
+// cada 20 minutos que los traspasos pendientes de la noche.
+//
+// Lo normal es que esta función no encuentre nada: cuando la paciente contesta,
+// processInboundMessage escala en ese mismo turno y limpia la marca. Esto es
+// para la que se fue a dormir con la pregunta sin leer.
+async function escalarEsperasVencidas(env) {
+  const headers = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+  };
+  const tope = new Date(Date.now() - ESPERA_RESPUESTA_MINUTOS * 60_000).toISOString();
+
+  const res = await fetchWithTimeout(
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations` +
+      `?escalacion_espera_desde=lte.${tope}&prospect_id=not.is.null` +
+      // Las que la noche se llevó las maneja transferirTraspasosPendientes; que
+      // las dos toquen la misma fila sería transferirla dos veces.
+      `&traspaso_pendiente_desde=is.null` +
+      `&order=escalacion_espera_desde.asc` +
+      `&select=id,phone_hash,prospect_id,escalation_reason` +
+      `&limit=${MAX_ESPERAS_VENCIDAS_POR_CORRIDA}`,
+    { headers }
+  );
+  if (!res.ok) {
+    console.error("escalarEsperasVencidas: no se pudo leer la lista", res.status);
+    return;
+  }
+  const filas = await res.json();
+  if (!filas.length) return;
+
+  const resultado = { encontradas: filas.length, escaladas: 0, yaTeniaHumano: 0, fallidas: 0 };
+
+  for (const fila of filas) {
+    // Misma regla de siempre: si un humano ya la tomó, no se toca. Falla cerrado.
+    const { agentId, failed } = await getCurrentProspectAgentId(env, fila.prospect_id);
+    if (failed) { resultado.fallidas++; continue; }
+    if (agentId && HUMAN_AGENT_IDS.has(agentId)) {
+      resultado.yaTeniaHumano++;
+      await cerrarEsperaDeRespuesta(env, fila.id, fila.escalation_reason);
+      continue;
+    }
+
+    const ses = await fetchWithTimeout(
+      `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?phone_hash=eq.${fila.phone_hash}&select=messages&limit=1`,
+      { headers }
+    ).catch(() => null);
+    const mensajes = ses?.ok ? ((await ses.json())[0]?.messages ?? []) : [];
+    await addEscalationNote(
+      env,
+      fila.prospect_id,
+      `${fila.escalation_reason || "no especificado"} — la paciente no contestó la última pregunta de Sofía`,
+      mensajes.slice(-4)
+    );
+
+    const traspaso = await transferToNextAgentInPool(env, fila.prospect_id, { phoneHash: fila.phone_hash });
+    if (!traspaso.ok) { resultado.fallidas++; continue; }
+    await registrarHandoff(env, {
+      prospectId: fila.prospect_id, phoneHash: fila.phone_hash,
+      motivo: fila.escalation_reason, agenteAsignado: traspaso.agentId, traspasoOk: true,
+    });
+    await cerrarEsperaDeRespuesta(env, fila.id, fila.escalation_reason);
+    resultado.escaladas++;
+  }
+
+  console.log("ESPERAS_VENCIDAS", JSON.stringify(resultado));
+}
+
+// Marca que hay un traspaso esperando a que la paciente conteste. PATCH aparte
+// y no dentro de upsertConversation por el mismo motivo que
+// marcarTraspasoPendiente: ahí escalated y escalation_reason son pegajosos.
+async function marcarEsperaDeRespuesta(env, phoneHash, motivo) {
+  await patchConversacion(env, `phone_hash=eq.${phoneHash}`, {
+    escalacion_espera_desde: new Date().toISOString(),
+    escalation_reason: motivo ?? null,
+  }, "marcarEsperaDeRespuesta");
+}
+
+// La paciente contestó (o la noche se llevó el caso): sale de la lista del
+// barrido. No toca escalated — de eso ya se encargó el upsert del turno.
+async function limpiarEsperaDeRespuesta(env, phoneHash) {
+  await patchConversacion(env, `phone_hash=eq.${phoneHash}`, {
+    escalacion_espera_desde: null,
+  }, "limpiarEsperaDeRespuesta");
+}
+
+// Cierra la espera desde el barrido: acá sí se marca escalada, porque el
+// traspaso ya se hizo y a partir de ahora Sofía se calla, que es lo correcto.
+async function cerrarEsperaDeRespuesta(env, id, motivo) {
+  await patchConversacion(env, `id=eq.${id}`, {
+    escalacion_espera_desde: null,
+    escalated: true,
+    escalation_reason: motivo ?? null,
+  }, "cerrarEsperaDeRespuesta");
+}
+
+async function patchConversacion(env, filtro, cambios, quien) {
+  try {
+    const res = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_conversations?${filtro}`, {
+      method: "PATCH",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify(cambios),
+    });
+    if (!res.ok) console.error(`${quien} falló`, res.status, filtro);
+    return res.ok;
+  } catch (err) {
+    console.error(`${quien} threw`, err);
+    return false;
+  }
 }
 
 // Cierra el pendiente: la conversación pasa a escalada de verdad y deja de
