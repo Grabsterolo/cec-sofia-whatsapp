@@ -149,6 +149,72 @@ const NOCTURNO_FIN_DE_SEMANA =
 
 const NOCTURNO_OFRECIMIENTO = "Mientras tanto, con gusto le sigo ayudando con lo que necesite.";
 
+// -----------------------------------------------------------------------------
+// Lo que Sofía sabe de la noche (2026-09-29)
+// -----------------------------------------------------------------------------
+//
+// Hasta acá, el aviso del horario se le PEGABA a su respuesta después de que ya
+// la había escrito. Ella seguía conversando como si fueran las dos de la tarde:
+// no sabía que el equipo no estaba, ni que ya se le había avisado a la paciente.
+//
+// Eso desperdicia justo lo que la atención nocturna compró. El diseño decía que
+// Sofía iba a dejar el caso listo para que el asesor llegara a las 8 con los
+// días y el tamizaje resueltos; sin saber que es de noche, no tiene por qué
+// hacerlo.
+//
+// La nota va pegada al ÚLTIMO MENSAJE DE LA PACIENTE, no al system_prompt: el
+// prompt va cacheado y meterle un campo que cambia lo rompería (ver SOFIA_USAGE).
+// El turno del paciente no se cachea nunca, así que esto no cuesta nada.
+//
+// Hay precedente en la propia base: el primer mensaje de una conversación que
+// llega de un anuncio trae un bloque "Source: Meta - ID:..." que el system_prompt
+// le enseña a reconocer y a no repetir. Este es el mismo mecanismo.
+//
+// La nota NO se guarda en el historial — igual que el bloque de imagen, se arma
+// solo para la llamada a Claude.
+const MARCA_NOTA_NOCTURNA = "Nota interna del sistema";
+
+function notaNocturna(ahora = new Date()) {
+  const cr = new Date(ahora.getTime() - 6 * 3600_000);
+  const dia = cr.getUTCDay();
+  const hora = cr.getUTCHours();
+  const cuando = dia === 0 || (dia === 6 && hora >= 16) ? "el lunes" : "mañana";
+  return (
+    `(${MARCA_NOTA_NOCTURNA}, no es un mensaje de la paciente y no debe mencionarse ni repetirse: ` +
+    `el equipo de asesores no está disponible a esta hora. A la paciente ya se le avisó que le escriben ${cuando}, ` +
+    `así que no se lo repita y no prometa contacto inmediato. ` +
+    `Si la conversación lo permite con naturalidad, aproveche para dejar el caso listo: qué días u horas le sirven, ` +
+    `la zona o el procedimiento que le interesa, y el tamizaje si es quirúrgico. ` +
+    `Si solo quiere información, respóndale eso y no la interrogue.)`
+  );
+}
+
+// Pega la nota al último turno del paciente. El contenido puede ser texto o un
+// arreglo de bloques cuando la paciente mandó una foto.
+function conNotaNocturna(history) {
+  if (!history.length) return history;
+  const ultimo = history[history.length - 1];
+  if (ultimo.role !== "user") return history;
+  const nota = notaNocturna();
+  const contenido = Array.isArray(ultimo.content)
+    ? [...ultimo.content, { type: "text", text: nota }]
+    : `${ultimo.content}\n\n${nota}`;
+  return [...history.slice(0, -1), { ...ultimo, content: contenido }];
+}
+
+// Red por si el modelo repite la nota en vez de actuar sobre ella. Saca
+// cualquier párrafo que la contenga. Barata y sin falsos positivos: la frase no
+// aparece en ninguna respuesta legítima.
+function quitarNotaFiltrada(texto) {
+  if (!String(texto || "").includes(MARCA_NOTA_NOCTURNA)) return { texto, filtrada: false };
+  const limpio = String(texto)
+    .split(/\n{2,}/)
+    .filter((parrafo) => !parrafo.includes(MARCA_NOTA_NOCTURNA))
+    .join("\n\n")
+    .trim();
+  return { texto: limpio, filtrada: true };
+}
+
 // ¿Sofía ya cerró ofreciéndose a seguir ayudando? Entonces el ofrecimiento
 // nuestro sobra.
 const YA_OFRECE = [
@@ -1346,7 +1412,16 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     ? [...history.slice(0, -1), { ...history[history.length - 1], content: contentForClaude }]
     : history;
 
-  const claudeData = await callClaude(env, systemBlocks, historyForClaude);
+  // La conversación ya viene con un traspaso diferido de una noche anterior o de
+  // un turno anterior de esta misma noche — ver notaNocturna(). Solo entonces:
+  // en el turno en que se difiere, el aviso se lo pega el bloque de `diferir`.
+  const enTraspasoDiferido = !!conversationState.traspasoPendienteDesde;
+  const historyConNota = enTraspasoDiferido ? conNotaNocturna(historyForClaude) : historyForClaude;
+  // Se registra para poder separar estos turnos de los demás al revisar la
+  // noche: si algo se lee raro mañana, hay que saber cuáles llevaban la nota.
+  if (enTraspasoDiferido) console.log("SOFIA_NOTA_NOCTURNA", JSON.stringify({ prospectId }));
+
+  const claudeData = await callClaude(env, systemBlocks, historyConNota);
 
   // Lo único que demuestra que el caching y el RAG están funcionando. Es el
   // modo de falla más caro que existe porque es silencioso: si alguien mete un
@@ -1435,7 +1510,11 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // often a {type: "thinking"} block rather than the reply — find the text
   // block explicitly instead of assuming it's first.
   const textBlock = (claudeData?.content || []).find((b) => b.type === "text");
-  const rawText = textBlock?.text ?? "";
+  // Red por si repitió la nota en vez de actuar sobre ella — ver
+  // quitarNotaFiltrada(). Antes de parseEscalation para que las etiquetas se
+  // sigan leyendo igual.
+  const { texto: rawText, filtrada: notaFiltrada } = quitarNotaFiltrada(textBlock?.text ?? "");
+  if (notaFiltrada) console.log("SOFIA_NOTA_NOCTURNA_FILTRADA", JSON.stringify({ prospectId }));
   const { reply, escalated: taggedEscalated, escalation_reason: taggedReason, shouldClose, silenced, silenceTag } =
     parseEscalation(rawText);
 
