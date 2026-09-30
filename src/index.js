@@ -3854,7 +3854,18 @@ const MAX_TRASPASOS_PENDIENTES_POR_CORRIDA = 20;
 // que cubrir desde antes del traspaso hasta el final: de noche la conversación
 // sigue, y el motivo del traspaso queda atrás. Ver el comentario en
 // transferirTraspasosPendientes().
-const MENSAJES_DE_CONTEXTO_NOCTURNO = 14;
+// Bajado de 14 a 8 el 2026-09-30: el equipo avisó que la nota llegaba
+// demasiado larga. Medido sobre las 45 notas de esa mañana: con 14 mensajes
+// promediaban 2.312 caracteres y la más larga llegó a 4.911 — página y media
+// que el asesor tiene que leer antes de escribirle a la paciente.
+//
+// Eran 6 y las subí a 14 la noche anterior porque el motivo de Sonia había
+// llegado vacío. Pero eso no era culpa de la ventana: era que
+// upsertConversation borraba escalation_reason en cada turno posterior al
+// traspaso. Arreglado eso, la ventana larga quedó compensando un problema que
+// ya no existe. 8 deja ~1.500 caracteres y conserva el par de turnos
+// posteriores al traspaso, que es lo que 6 no alcanzaba a cubrir.
+const MENSAJES_DE_CONTEXTO_NOCTURNO = 8;
 
 // El otro extremo de la atención nocturna: transferir lo que Sofía difirió,
 // cuando el equipo abre. Corre en el cron de cada 20 minutos.
