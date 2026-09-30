@@ -1734,10 +1734,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     // Si veníamos de una espera, se mandan 4 mensajes y no 2: la respuesta de
     // la paciente (el nombre, el tamizaje) está en los turnos de en medio, y es
     // justamente lo que el asesor no tendría que volver a preguntar.
-    await addEscalationNote(
-      env, prospectId, motivoEscalacion,
-      updatedHistory.slice(esperabaRespuesta ? -4 : -2)
-    );
+    await addEscalationNote(env, prospectId, motivoEscalacion);
 
     // Send the transition line before handing off, so the patient isn't left
     // hanging. finalReply is never empty here: it's either what Sofía wrote
@@ -3436,31 +3433,23 @@ async function sendChannelMessageOrEscalate(env, prospectId, channel, content, {
 // /prospect/{id}/interactions, live-confirmed — see README 1.5b) so the
 // human agent has context before opening the chat. Non-fatal on failure:
 // missing internal context is worse than blocking the handoff.
-// Cuánto se muestra de cada turno. El asesor necesita reconocer de qué se
-// habló, no releer la conversación: una respuesta de Sofía puede irse a 690
-// caracteres y sola se come media nota. Recortando a 220 —con corte en la
-// última palabra entera— la nota promedio baja de 1.146 a 788 caracteres y la
-// peor de 2.161 a 1.381, sin perder de vista ningún turno.
-const CARACTERES_POR_TURNO_EN_LA_NOTA = 220;
-
-function turnoParaLaNota(m) {
-  const quien = m.role === "user" ? "Paciente" : "Sofía";
-  const texto = String(m.content ?? "").replace(/\s+/g, " ").trim();
-  if (texto.length <= CARACTERES_POR_TURNO_EN_LA_NOTA) return `${quien}: ${texto}`;
-  const cortado = texto.slice(0, CARACTERES_POR_TURNO_EN_LA_NOTA);
-  const hastaPalabra = cortado.slice(0, cortado.lastIndexOf(" "));
-  return `${quien}: ${(hastaPalabra || cortado).trim()}…`;
-}
-
-// La nota que el asesor abre en Zenvia. El motivo va arriba y solo: es lo que
-// contesta "por qué me llegó esto" sin leer nada más. Los mensajes van después
-// como referencia de lo que ya se conversó.
-async function addEscalationNote(env, prospectId, escalationReason, recentMessages) {
-  const transcript = recentMessages.map(turnoParaLaNota).join("\n");
-  const content =
-    `TRASPASO DE SOFÍA\n` +
-    `Motivo: ${escalationReason || "no especificado"}\n\n` +
-    `Últimos mensajes:\n${transcript}`;
+// La nota que el asesor abre en Zenvia. SOLO el motivo, a propósito.
+//
+// Llevaba también los últimos mensajes de la conversación. El equipo avisó el
+// 2026-09-30 de que llegaba demasiado larga, y JP decidió quitarlos enteros:
+// "el agente puede verlo si lo necesita". Tiene razón — la conversación está
+// completa en Zenvia, en la misma pantalla, a un clic. Copiarla en la nota no
+// agregaba información, solo ponía algo que leer antes de poder actuar.
+//
+// El motivo lo escribe Sofía en cada escalación y suele ser específico
+// ("mastopexia, en proceso activo de pérdida de peso; faltan confirmar embarazo
+// y lactancia"), así que una línea contesta "por qué me llegó esto".
+//
+// Efecto secundario: los dos barridos ya no tienen que ir a buscar la sesión a
+// Supabase solo para armar la nota. Un subrequest menos por caso, en lotes que
+// están limitados justamente por subrequests.
+async function addEscalationNote(env, prospectId, escalationReason) {
+  const content = `TRASPASO DE SOFÍA\nMotivo: ${escalationReason || "no especificado"}`;
 
   // try/catch so a raw network failure here (not just a non-ok response)
   // can never abort processInboundMessage() before it reaches
@@ -3872,20 +3861,6 @@ const MAX_TRASPASOS_PENDIENTES_POR_CORRIDA = 20;
 // que cubrir desde antes del traspaso hasta el final: de noche la conversación
 // sigue, y el motivo del traspaso queda atrás. Ver el comentario en
 // transferirTraspasosPendientes().
-// Bajado de 14 a 6 el 2026-09-30: el equipo avisó que la nota llegaba
-// demasiado larga. Medido sobre las 45 notas de esa mañana: con 14 mensajes
-// promediaban 2.312 caracteres y la más larga llegó a 4.911 — página y media
-// que el asesor tiene que leer antes de escribirle a la paciente. JP: "quiero
-// que el contexto sea claro y conciso y que los agentes lo puedan entender
-// rápido".
-//
-// Eran 6 y las subí a 14 la noche anterior porque el motivo de Sonia había
-// llegado vacío. Pero eso no era culpa de la ventana: era que
-// upsertConversation borraba escalation_reason en cada turno posterior al
-// traspaso. Arreglado eso, la ventana larga quedó compensando un problema que
-// ya no existe. 8 deja ~1.500 caracteres y conserva el par de turnos
-// posteriores al traspaso, que es lo que 6 no alcanzaba a cubrir.
-const MENSAJES_DE_CONTEXTO_NOCTURNO = 6;
 
 // El otro extremo de la atención nocturna: transferir lo que Sofía difirió,
 // cuando el equipo abre. Corre en el cron de cada 20 minutos.
@@ -3943,34 +3918,14 @@ async function transferirTraspasosPendientes(env) {
       continue;
     }
 
-    // La nota de contexto, ANTES de transferir — igual que en la escalación
-    // normal. Sin esto el asesor abre el caso en frío, que es justo lo que este
-    // cambio pretende evitar: de noche Sofía recogió tamizaje y preferencias, y
-    // esa es la información que le ahorra la llamada.
-    //
-    // Se traen MENSAJES_DE_CONTEXTO_NOCTURNO y no 2 como en la escalación del
-    // día: acá la conversación siguió después de decidir el traspaso, así que lo
-    // valioso —el tamizaje, los días que le sirven— está en los turnos
-    // posteriores.
-    //
-    // Eran 6, y 6 alcanzaban cuando la conversación se terminaba poco después
-    // del traspaso. Dejaron de alcanzar la misma noche que se levantó el tope de
-    // mensajes: caso real (Sonia, mastopexia, 29 de septiembre) — se difirió en
-    // el turno 12 y siguió hasta el 20 hablando de lipoescultura, así que los
-    // últimos 6 mensajes no contenían NADA del motivo del traspaso. El asesor
-    // habría abierto un caso que dice "mastopexia, en pérdida de peso, faltan
-    // confirmar embarazo y lactancia" y habría leído seis mensajes sobre precios
-    // de liposucción.
-    const ses = await fetchWithTimeout(
-      `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?phone_hash=eq.${fila.phone_hash}&select=messages&limit=1`,
-      { headers }
-    ).catch(() => null);
-    const mensajes = ses?.ok ? ((await ses.json())[0]?.messages ?? []) : [];
+    // La nota, ANTES de transferir — igual que en la escalación normal. Lleva
+    // solo el motivo (ver addEscalationNote), más la coletilla de que esta
+    // conversación venía de fuera de horario: eso le explica al asesor por qué
+    // le llega a las 8 de la mañana algo que se decidió de madrugada.
     await addEscalationNote(
       env,
       fila.prospect_id,
-      `${fila.escalation_reason || "no especificado"} — conversación de fuera de horario, Sofía siguió atendiendo`,
-      mensajes.slice(-MENSAJES_DE_CONTEXTO_NOCTURNO)
+      `${fila.escalation_reason || "no especificado"} — conversación de fuera de horario, Sofía siguió atendiendo`
     );
 
     const traspaso = await transferToNextAgentInPool(env, fila.prospect_id, { phoneHash: fila.phone_hash });
@@ -4037,16 +3992,10 @@ async function escalarEsperasVencidas(env) {
       continue;
     }
 
-    const ses = await fetchWithTimeout(
-      `${env.SUPABASE_URL}/rest/v1/sofia_whatsapp_sessions?phone_hash=eq.${fila.phone_hash}&select=messages&limit=1`,
-      { headers }
-    ).catch(() => null);
-    const mensajes = ses?.ok ? ((await ses.json())[0]?.messages ?? []) : [];
     await addEscalationNote(
       env,
       fila.prospect_id,
-      `${fila.escalation_reason || "no especificado"} — la paciente no contestó la última pregunta de Sofía`,
-      mensajes.slice(-4)
+      `${fila.escalation_reason || "no especificado"} — la paciente no contestó la última pregunta de Sofía`
     );
 
     const traspaso = await transferToNextAgentInPool(env, fila.prospect_id, { phoneHash: fila.phone_hash });
