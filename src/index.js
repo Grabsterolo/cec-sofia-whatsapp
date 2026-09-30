@@ -199,8 +199,23 @@ const NOCTURNO_OFRECIMIENTO = "Mientras tanto, con gusto le sigo ayudando con lo
 // solo para la llamada a Claude.
 const MARCA_NOTA_NOCTURNA = "Nota interna del sistema";
 
-function notaNocturna(ahora = new Date()) {
-  const { cuando } = proximaApertura(ahora);
+function notaNocturna(ahora = new Date(), { yaAvisado = false } = {}) {
+  const { cuando, horario } = proximaApertura(ahora);
+  // Todavía no se le ha dicho nada: si Sofía decide pasar el caso en este turno,
+  // el plazo lo escribe ELLA, con sus palabras y dentro de su respuesta. Antes
+  // se lo pegábamos como una frase fija al final, y esa frase ya causó tres
+  // errores en una noche — ver proximaApertura(). El código comprueba después
+  // que el plazo salió y que salió bien: yaDiceElPlazo().
+  if (!yaAvisado) {
+    return (
+      `(${MARCA_NOTA_NOCTURNA}, no es un mensaje de la paciente y no debe mencionarse: ` +
+      `el equipo de asesores no está disponible a esta hora; vuelven ${cuando} y atienden ${horario}. ` +
+      `Si en esta respuesta decide pasarle el caso al equipo, dígale usted misma cuándo le escriben — ` +
+      `con sus palabras, dentro de su mensaje, diciendo "${cuando}" y el horario. ` +
+      `No prometa contacto inmediato ni una hora exacta, y no confirme fechas ni disponibilidad: ` +
+      `usted no tiene acceso a la agenda. Si la paciente propone un día, anótelo como preferencia suya.)`
+    );
+  }
   return (
     `(${MARCA_NOTA_NOCTURNA}, no es un mensaje de la paciente y no debe mencionarse ni repetirse: ` +
     `el equipo de asesores no está disponible a esta hora. A la paciente ya se le avisó que le escriben ${cuando}, ` +
@@ -215,15 +230,41 @@ function notaNocturna(ahora = new Date()) {
 
 // Pega la nota al último turno del paciente. El contenido puede ser texto o un
 // arreglo de bloques cuando la paciente mandó una foto.
-function conNotaNocturna(history) {
+function conNotaNocturna(history, opciones) {
   if (!history.length) return history;
   const ultimo = history[history.length - 1];
   if (ultimo.role !== "user") return history;
-  const nota = notaNocturna();
+  const nota = notaNocturna(new Date(), opciones);
   const contenido = Array.isArray(ultimo.content)
     ? [...ultimo.content, { type: "text", text: nota }]
     : `${ultimo.content}\n\n${nota}`;
   return [...history.slice(0, -1), { ...ultimo, content: contenido }];
+}
+
+const PALABRAS_DE_PLAZO = ["hoy", "mañana", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"];
+
+// ¿Sofía dijo ella misma cuándo le escribe el equipo, y dijo el día correcto?
+//
+// Es la comprobación que permite soltarle la redacción sin soltar la garantía.
+// Esa línea es la única que NO puede estar mal: es lo que evita que la paciente
+// se quede esperando una llamada que hoy no va a llegar. Si no la dijo, o dijo
+// otro día, el código le pega la frase calculada y no se pierde nada.
+//
+// Estricto a propósito: si nombra cualquier otro día además del correcto, se
+// trata como que no lo dijo. Prefiere pegar la frase de más (redundante pero
+// cierta) a dejar pasar un "mañana" que en realidad es hoy.
+function yaDiceElPlazo(texto, cuando) {
+  // "a partir de las 8 DE LA MAÑANA" no es el día de mañana. Sin quitarlo, la
+  // frase correcta más común —"le escriben hoy a partir de las 8 de la
+  // mañana"— se leía como si nombrara dos días y se descartaba siempre.
+  const t = String(texto || "")
+    .toLowerCase()
+    .replace(/\b(de|por|en|a)\s+la\s+mañana\b/g, " ");
+  if (!/equipo|asesor/.test(t)) return false;
+  const correcta = cuando.replace(/^el /, "");
+  const nombra = (palabra) => new RegExp(`\\b${palabra}\\b`, "i").test(t);
+  if (!nombra(correcta)) return false;
+  return !PALABRAS_DE_PLAZO.some((p) => p !== correcta && nombra(p));
 }
 
 // Red por si el modelo repite la nota en vez de actuar sobre ella. Saca
@@ -1305,7 +1346,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     topeAlcanzado &&
     conversationState.messageCount < MAX_CONVERSATION_TURNS_NOCHE &&
     !equipoDisponible() &&
-    (await atencionNocturnaActiva(env));
+    sofiaConfig.atencion_nocturna_enabled === true;
   if (diferirTope && !conversationState.traspasoPendienteDesde) {
     // Que el barrido de la mañana la recoja igual: la conversación ya es larga y
     // necesita un asesor, solo que todavía no hay ninguno.
@@ -1437,10 +1478,18 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // un turno anterior de esta misma noche — ver notaNocturna(). Solo entonces:
   // en el turno en que se difiere, el aviso se lo pega el bloque de `diferir`.
   const enTraspasoDiferido = !!conversationState.traspasoPendienteDesde;
-  const historyConNota = enTraspasoDiferido ? conNotaNocturna(historyForClaude) : historyForClaude;
-  // Se registra para poder separar estos turnos de los demás al revisar la
-  // noche: si algo se lee raro mañana, hay que saber cuáles llevaban la nota.
-  if (enTraspasoDiferido) console.log("SOFIA_NOTA_NOCTURNA", JSON.stringify({ prospectId }));
+  // La nota va en CADA mensaje de la noche, no solo en los de una conversación
+  // ya diferida. Antes empezaba un turno tarde: en el turno en que Sofía decide
+  // el traspaso todavía no sabía que el equipo no estaba, así que el plazo se lo
+  // pegaba el código como frase fija. Ahora lo sabe antes de escribir y lo dice
+  // ella; yaDiceElPlazo() comprueba después que salió y que salió bien.
+  const nocturnaActiva = !equipoDisponible() && sofiaConfig.atencion_nocturna_enabled === true;
+  const historyConNota = nocturnaActiva
+    ? conNotaNocturna(historyForClaude, { yaAvisado: enTraspasoDiferido })
+    : historyForClaude;
+  if (nocturnaActiva) {
+    console.log("SOFIA_NOTA_NOCTURNA", JSON.stringify({ prospectId, yaAvisado: enTraspasoDiferido }));
+  }
 
   const claudeData = await callClaude(env, systemBlocks, historyConNota);
 
@@ -1573,7 +1622,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // interruptor se hace únicamente cuando las tres primeras ya se cumplen, para
   // no gastar un request en cada mensaje del día.
   const diferible = escalated && !equipoDisponible() && !esUrgente(escalation_reason);
-  const diferir = diferible && (await atencionNocturnaActiva(env));
+  const diferir = diferible && sofiaConfig.atencion_nocturna_enabled === true;
   // ¿Veníamos esperando que contestara una pregunta? Ver el bloque de abajo.
   const esperabaRespuesta = !!conversationState.escalacionEsperaDesde;
   // Si ya venía pendiente de antes, no se le repite la promesa en cada turno:
@@ -1589,7 +1638,11 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // como "esta noche". Cada vez que Sofía vuelve a prometer contacto hay que
   // volver a anclar cuándo, o la promesa nueva pisa el plazo viejo.
   const repitePromesa = mentionsHandoffPromise(finalReply);
-  if (diferir && (!yaEstabaPendiente || repitePromesa)) {
+  const { cuando: aperturaCuando } = proximaApertura();
+  // ¿Lo dijo ella, con sus palabras y con el día correcto? Entonces no se toca:
+  // su versión se lee mejor que cualquier frase fija y dice lo mismo.
+  const loDijoElla = yaDiceElPlazo(finalReply, aperturaCuando);
+  if (diferir && (!yaEstabaPendiente || repitePromesa) && !loDijoElla) {
     // Si Sofía prometió un traspaso ("le contactan a la brevedad"), esa promesa
     // es justamente lo que no se puede cumplir de noche. Antes se reemplazaba la
     // respuesta ENTERA, y con ella se perdía lo que la paciente había preguntado
@@ -1602,6 +1655,9 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
             conOfrecimiento: !yaOfreceSeguirAyudando(sustancia),
           })}`.trim()
         : fraseDeEspera();
+  }
+  if (diferir) {
+    console.log("SOFIA_PLAZO", JSON.stringify({ prospectId, loDijoElla, cuando: aperturaCuando }));
   }
 
   // -------------------------------------------------------------------------
@@ -1973,7 +2029,7 @@ async function elEquipoLaDescarto(env, phoneHash) {
 
 async function loadSofiaConfig(env) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_config?select=system_prompt,knowledge_base,whatsapp_enabled,followup_enabled&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_config?select=system_prompt,knowledge_base,whatsapp_enabled,followup_enabled,atencion_nocturna_enabled&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1981,7 +2037,7 @@ async function loadSofiaConfig(env) {
       },
     }
   );
-  if (!res.ok) return { system: "", knowledge_base: "", whatsapp_enabled: true, followup_enabled: false };
+  if (!res.ok) return { system: "", knowledge_base: "", whatsapp_enabled: true, followup_enabled: false, atencion_nocturna_enabled: false };
   const data = await res.json();
   return {
     system: data[0]?.system_prompt || "",
@@ -1991,6 +2047,10 @@ async function loadSofiaConfig(env) {
     // viene rara, lo seguro es NO escribirle a nadie. Al revés que
     // whatsapp_enabled, donde lo seguro es seguir contestando.
     followup_enabled: data[0]?.followup_enabled ?? false,
+    // Se lee acá, junto con lo demás, en vez de con un request propio: la nota
+    // nocturna la necesita en CADA mensaje de la noche, no solo cuando Sofía ya
+    // decidió escalar. Ver notaNocturna().
+    atencion_nocturna_enabled: data[0]?.atencion_nocturna_enabled ?? false,
   };
 }
 
@@ -5244,42 +5304,6 @@ async function upsertCleanupRowClosed(env, { prospectId, groupId }) {
 function estaEnHorarioDeSeguimiento(ahora = new Date()) {
   const horaCR = (ahora.getUTCHours() - 6 + 24) % 24;
   return horaCR >= FOLLOWUP_HOUR_START_CR && horaCR < FOLLOWUP_HOUR_END_CR;
-}
-
-// Conversaciones de Sofía que quedaron calladas dentro de la ventana útil.
-//
-// No hace falta comprobar "el último mensaje es de Sofía": si la conversación
-// no está escalada, siempre lo es. Sofía contesta todos los mensajes que
-// recibe, y eso está confirmado en los datos — las 12.099 sesiones tienen
-// exactamente la misma cantidad de mensajes `user` y `assistant`, cero
-// desbalanceadas.
-// El interruptor del primer mensaje se lee APARTE y no dentro de
-// loadSofiaConfig(), a propósito. PostgREST responde 400 —no un campo vacío—
-// cuando se le pide una columna que no existe, y loadSofiaConfig() ante un
-// error devuelve system: "" con whatsapp_enabled: true. O sea que sumar la
-// columna a ese select haría que, si la migración todavía no se aplicó, Sofía
-// siguiera contestando pero SIN prompt ni base de conocimiento. Leerlo acá deja
-// ese riesgo en cero: lo peor que puede pasar es que el interruptor se lea como
-// apagado, que es justo el valor seguro.
-// Aparte de loadSofiaConfig() por la misma razón que
-// seguimientoPrimerMensajeActivo(): PostgREST devuelve 400 al pedir una columna
-// inexistente, y ante un error esa función devuelve system:"" con
-// whatsapp_enabled:true — Sofía contestaría SIN PROMPT si faltara la migración.
-async function atencionNocturnaActiva(env) {
-  try {
-    const res = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/sofia_config?id=eq.1&select=atencion_nocturna_enabled`,
-      { headers: { apikey: env.SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}` } }
-    );
-    if (!res.ok) {
-      console.log(`atencionNocturnaActiva: no se pudo leer (http ${res.status}) — se asume apagada`);
-      return false;
-    }
-    return (await res.json())[0]?.atencion_nocturna_enabled === true;
-  } catch (err) {
-    console.error("atencionNocturnaActiva falló — se asume apagada", err);
-    return false;
-  }
 }
 
 // Marca el traspaso como pendiente. PATCH aparte y no dentro de
