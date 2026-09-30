@@ -2948,7 +2948,7 @@ async function upsertConversation(env, {
       // them. Always picking the earliest keeps every turn landing on the
       // same row.
       const existingRes = await fetchWithTimeout(
-        `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=id,message_count,escalated,escalation_reason&order=created_at.asc&limit=1`,
+        `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=id,message_count,escalated,escalation_reason,traspaso_pendiente_desde,escalacion_espera_desde&order=created_at.asc&limit=1`,
         { headers }
       );
       if (!existingRes.ok) {
@@ -2959,12 +2959,30 @@ async function upsertConversation(env, {
         const previousEscalated = existing[0]?.escalated ?? false;
         const previousEscalationReason = existing[0]?.escalation_reason ?? null;
         const stickyEscalated = resetCounters ? escalated : previousEscalated || escalated;
+
+        // Una conversación en cola —traspaso diferido de la noche, o esperando
+        // que la paciente conteste— lleva escalated=false A PROPÓSITO, para que
+        // Sofía pueda seguir contestando. El efecto secundario es que el motivo
+        // no era pegajoso: cada turno posterior lo pisaba con null, porque
+        // ninguna de las dos condiciones de abajo se cumplía.
+        //
+        // Encontrado el 2026-09-29 con la conversación de Sonia (mastopexia, en
+        // pérdida de peso). Se difirió con el motivo bien escrito y después
+        // siguió hablando ocho mensajes de lipoescultura: para cuando terminó,
+        // escalation_reason era NULL. Mañana el asesor habría recibido "Motivo:
+        // no especificado" y el único registro de POR QUÉ había que pasarle el
+        // caso se habría perdido. Las otras tres de esa noche lo conservaban
+        // solo porque nadie volvió a escribir después de diferirlas.
+        //
+        // El motivo es la memoria durable del traspaso: la transcripción es una
+        // ventana de 20 turnos que se va corriendo, el motivo no.
+        const enCola = !!(existing[0]?.traspaso_pendiente_desde || existing[0]?.escalacion_espera_desde);
         const stickyEscalationReason = resetCounters
           ? escalationReason
           : escalated
             ? escalationReason
-            : previousEscalated
-              ? previousEscalationReason
+            : previousEscalated || enCola
+              ? previousEscalationReason ?? escalationReason
               : escalationReason;
 
         let writeRes;
