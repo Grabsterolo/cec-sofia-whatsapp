@@ -36,6 +36,10 @@ const HUMAN_AGENT_IDS = new Set(HUMAN_AGENTS.map((a) => a.id));
 
 const MAX_HISTORY_MESSAGES = 20; // ~10 user/assistant turns
 const MAX_CONVERSATION_TURNS = 10; // sofia_conversations.message_count ceiling before forcing escalation
+// De noche el tope no corta (ver el bloque del tope en processInboundMessage):
+// no hay a quién pasarle la conversación. Este es el techo de verdad, el que
+// evita que una conversación nocturna se vaya a cincuenta mensajes.
+const MAX_CONVERSATION_TURNS_NOCHE = 20;
 
 // Bug found 2026-08-20 (JP, número +50661130913): once escalated=true, the
 // only reset path was "the CURRENT prospectId's Zenvia status is literally
@@ -1188,7 +1192,41 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     -MAX_HISTORY_MESSAGES
   );
 
-  if (conversationState.messageCount >= MAX_CONVERSATION_TURNS) {
+  // -------------------------------------------------------------------------
+  // El tope de mensajes contra la atención nocturna (2026-09-29)
+  // -------------------------------------------------------------------------
+  //
+  // Caso real (María, lifting facial). A las 7:15 p.m. Sofía difirió el traspaso
+  // y le dijo que el equipo le escribe mañana — correcto. A las 7:24 p.m. María
+  // preguntó "¿y tiene más detalles del lifting facial?", una pregunta que Sofía
+  // contesta todo el día, y recibió el mensaje del tope: "le voy a pasar con
+  // nuestro equipo — EN BREVE LE ESCRIBEN". A las 7:24 de la noche eso es falso,
+  // y además la dejó muda, que es exactamente lo que la atención nocturna existe
+  // para evitar.
+  //
+  // El fallo es de diseño mío: esta rama corta y retorna mucho antes de que se
+  // calcule `diferir`, así que el tope nunca supo que era de noche. Y encima la
+  // atención nocturna empuja hacia acá — como Sofía sigue conversando en vez de
+  // callarse, las conversaciones de noche llegan al tope MÁS rápido.
+  //
+  // De noche el tope no tiene a quién pasarle nada, así que no corta: marca el
+  // traspaso como pendiente (si no lo estaba ya) y deja que Sofía siga
+  // atendiendo hasta que el equipo abra. El techo de la noche existe para que
+  // una conversación no se vaya a cincuenta mensajes sin que nadie la mire.
+  const topeAlcanzado = conversationState.messageCount >= MAX_CONVERSATION_TURNS;
+  const diferirTope =
+    topeAlcanzado &&
+    conversationState.messageCount < MAX_CONVERSATION_TURNS_NOCHE &&
+    !equipoDisponible() &&
+    (await atencionNocturnaActiva(env));
+  if (diferirTope && !conversationState.traspasoPendienteDesde) {
+    // Que el barrido de la mañana la recoja igual: la conversación ya es larga y
+    // necesita un asesor, solo que todavía no hay ninguno.
+    await marcarTraspasoPendiente(env, phoneHash, "conversación larga fuera de horario");
+    conversationState.traspasoPendienteDesde = new Date().toISOString();
+  }
+
+  if (topeAlcanzado && !diferirTope) {
     // Antes de pasársela a un asesor: ¿es un paciente? El tope existe para que
     // una conversación larga no se quede en manos de Sofía, no para mandarle
     // al equipo a quien nunca preguntó por un tratamiento. Caso real
@@ -1234,7 +1272,14 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     }
 
     const limitReasonText = "límite de mensajes alcanzado";
-    const limitReply = pickMessageLimitReply();
+    // Los tres textos del tope prometen contacto inmediato ("en breve le
+    // escriben", "en un momentito le contactan"). Fuera de horario eso es
+    // falso, con el interruptor de la noche encendido o apagado. Acá Sofía sí
+    // se calla después —el tope escala de verdad— así que va la frase sin el
+    // ofrecimiento de seguir ayudando, que sería otra promesa que no se cumple.
+    const limitReply = equipoDisponible()
+      ? pickMessageLimitReply()
+      : fraseDeEspera(new Date(), { conOfrecimiento: false });
     await claimPromise;
     await sendChannelMessageOrEscalate(env, prospectId, channel, limitReply, { phoneHash });
     const limitAgility = await runEscalationAgility(env, {
@@ -1247,6 +1292,16 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       prospectId, phoneHash, motivo: limitReasonText,
       agenteAsignado: traspasoTope.agentId, traspasoOk: traspasoTope.ok,
     });
+    // Esta conversación ya se transfirió. Si venía en alguna de las dos colas
+    // —el traspaso diferido de la noche o la espera de una respuesta— hay que
+    // sacarla, o el barrido la vuelve a transferir mañana y el asesor recibe
+    // una segunda nota de un caso que ya tiene. Le pasó a María el 2026-09-29.
+    if (conversationState.traspasoPendienteDesde || conversationState.escalacionEsperaDesde) {
+      await patchConversacion(env, `phone_hash=eq.${phoneHash}`, {
+        traspaso_pendiente_desde: null,
+        escalacion_espera_desde: null,
+      }, "limpiarColasAlTope");
+    }
 
     const updatedHistory = await saveSessionWithRetry(
       env, phoneHash, channel, session.messages, session.version,
