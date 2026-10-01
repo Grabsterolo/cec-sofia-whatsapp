@@ -1609,8 +1609,38 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // sigan leyendo igual.
   const { texto: rawText, filtrada: notaFiltrada } = quitarNotaFiltrada(textBlock?.text ?? "");
   if (notaFiltrada) console.log("SOFIA_NOTA_NOCTURNA_FILTRADA", JSON.stringify({ prospectId }));
-  const { reply, escalated: taggedEscalated, escalation_reason: taggedReason, shouldClose, silenced, silenceTag } =
+  let { reply, escalated: taggedEscalated, escalation_reason: taggedReason, shouldClose, silenced, silenceTag } =
     parseEscalation(rawText);
+
+  // Cuando Sofía decide no contestarle a alguien (coqueteo, mensajes sin
+  // intención real de consulta), el system_prompt le dice que su única respuesta
+  // sea EXACTAMENTE la etiqueta [NO_RESPONDER], sin una palabra más: ni una
+  // aclaración, ni un límite, ni un "este canal es para consultas médicas".
+  //
+  // El 2026-10-01 se la saltó. Un hombre mandó nueve mensajes de coqueteo, Sofía
+  // se calló las nueve veces bien, y a la décima —un simple "Ola buenos dias"—
+  // contestó: "¡Buenos días! Dado el contexto previo de la conversación, lo más
+  // adecuado es no continuar." Eso salió al paciente. Nueve silencios correctos y
+  // una explicación de por qué se callaba, que es justo lo que la regla prohíbe:
+  // le dice a esa persona que hay un juicio sobre ella y le da con qué discutir.
+  //
+  // La regla ya estaba escrita y clarísima en el prompt, así que reforzarla ahí
+  // no es el arreglo — el arreglo es no depender de que el modelo la cumpla
+  // siempre. Esta red solo mira dos cosas y es deliberadamente estrecha:
+  //   1. Sofía YA venía en silencio en esta conversación, y
+  //   2. lo que acaba de escribir es una explicación de por qué no va a seguir.
+  // Las frases salen del caso real. Si en vez de eso contesta una consulta de
+  // verdad —el prompt obliga a atender a quien pregunta por un tratamiento
+  // aunque antes haya coqueteado— nada de esto aplica y la respuesta sale normal.
+  if (!silenced && esSilencio(ultimoMensajeDeSofia(session.messages)) && explicaQueNoVaAContestar(reply)) {
+    console.log("SOFIA_SILENCIO_FORZADO", JSON.stringify({ prospectId, texto: reply.slice(0, 120) }));
+    silenced = true;
+    silenceTag = "[NO_RESPONDER: insistió sin consulta real y Sofía ya venía en silencio]";
+    reply = "";
+    taggedEscalated = false;
+    taggedReason = null;
+    shouldClose = false;
+  }
 
   // Sofía sometimes tells the patient she's passing their case to the team
   // ("le voy a pasar la información al equipo", "le voy a transferir...")
@@ -1919,6 +1949,25 @@ const HANDOFF_PROMISE_PATTERNS = [
 
 function mentionsHandoffPromise(text) {
   return HANDOFF_PROMISE_PATTERNS.some((re) => re.test(text));
+}
+
+// Frases con las que Sofía explica que no va a seguir la conversación, en vez de
+// simplemente no contestar. Ver la red en processInboundMessage. La lista nace
+// del caso del 2026-10-01 ("lo más adecuado es no continuar") más las formas
+// vecinas, incluida la que el propio prompt prohíbe textualmente ("este canal es
+// para consultas médicas").
+const NO_VOY_A_CONTESTAR_PATTERNS = [
+  /lo m[áa]s (adecuado|apropiado|sano|prudente) es no (continuar|seguir)/i,
+  /prefiero no (continuar|seguir)/i,
+  /no (es|ser[íi]a) (adecuado|apropiado|oportuno) (continuar|seguir)/i,
+  /dado el contexto (previo )?de (la|esta) conversaci[óo]n/i,
+  /no voy a (continuar|seguir)( con)? (esta|la) conversaci[óo]n/i,
+  /(este|nuestro) canal es (solo|[úu]nicamente|exclusivamente) para/i,
+  /no puedo (continuar|seguir)( con)? (esta|la) conversaci[óo]n/i,
+];
+
+function explicaQueNoVaAContestar(texto) {
+  return NO_VOY_A_CONTESTAR_PATTERNS.some((re) => re.test(String(texto || "")));
 }
 
 // Saca las oraciones donde Sofía promete el traspaso y deja el resto. De noche
