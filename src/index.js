@@ -1632,6 +1632,10 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // Las frases salen del caso real. Si en vez de eso contesta una consulta de
   // verdad —el prompt obliga a atender a quien pregunta por un tratamiento
   // aunque antes haya coqueteado— nada de esto aplica y la respuesta sale normal.
+  // Antes de cualquier otra cosa: sacarle las rayas largas. Va acá para que lo
+  // limpio sea lo que se envía Y lo que se guarda en el historial.
+  reply = quitarRayasLargas(reply);
+
   if (!silenced && esSilencio(ultimoMensajeDeSofia(session.messages)) && explicaQueNoVaAContestar(reply)) {
     console.log("SOFIA_SILENCIO_FORZADO", JSON.stringify({ prospectId, texto: reply.slice(0, 120) }));
     silenced = true;
@@ -1968,6 +1972,39 @@ const NO_VOY_A_CONTESTAR_PATTERNS = [
 
 function explicaQueNoVaAContestar(texto) {
   return NO_VOY_A_CONTESTAR_PATTERNS.some((re) => re.test(String(texto || "")));
+}
+
+// La raya larga (—) a media frase es un tic de escritura del modelo, no de una
+// persona escribiendo por WhatsApp. JP lo notó el 2026-10-01: "creo que es una
+// costumbre de Claude hablar con guiones en la mitad". Medido sobre 3 días:
+// aparece en el 3,1% de las respuestas (112 de 3.619).
+//
+// Se arregla al enviar y no en el prompt a propósito: es una transformación
+// mecánica y sin ambigüedad, así que no tiene sentido depender de que el modelo
+// se acuerde en cada mensaje. Hoy mismo vimos que una regla explícita del prompt
+// —la del silencio— se cumple el 90% de las veces y falla el 10%.
+//
+// Dos usos distintos, dos reemplazos:
+//   "full face —frente, entrecejo y patas de gallo— este mes" -> paréntesis,
+//     porque el inciso ya trae comas adentro y meterle más lo vuelve ilegible.
+//   "no es un monto fijo — se define según su caso" -> coma, que es como lo
+//     escribiría una persona.
+// El texto limpio es el que se guarda en el historial, no solo el que se envía:
+// si se guardara el original, Sofía volvería a copiar la raya al repetirse.
+function quitarRayasLargas(texto) {
+  return String(texto || "")
+    // Primero los incisos cerrados (—texto—), que son los que necesitan paréntesis.
+    .replace(/\s—(\S[^—\n]*?)—(\s|[.,;:!?])/g, " ($1)$2")
+    // Después la raya explicativa suelta, con espacios a los dos lados.
+    .replace(/\s+—\s+/g, ", ")
+    // Y la que queda pegada a una palabra por un lado, que es la misma idea.
+    .replace(/\s+—(?=\S)/g, ", ")
+    .replace(/(?<=\S)—\s+/g, ", ")
+    // Y la pegada por los dos lados ("tolerable—de hecho"), que en español nunca
+    // es tipografía correcta: siempre es el tic.
+    .replace(/(?<=\p{L})—(?=\p{L})/gu, ", ")
+    .replace(/ ,/g, ",")
+    .replace(/,\s*,/g, ",");
 }
 
 // Saca las oraciones donde Sofía promete el traspaso y deja el resto. De noche
