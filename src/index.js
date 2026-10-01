@@ -212,6 +212,10 @@ function notaNocturna(ahora = new Date(), { yaAvisado = false } = {}) {
       `el equipo de asesores no está disponible a esta hora; vuelven ${cuando} y atienden ${horario}. ` +
       `Si en esta respuesta decide pasarle el caso al equipo, dígale usted misma cuándo le escriben — ` +
       `con sus palabras, dentro de su mensaje, diciendo "${cuando}" y el horario. ` +
+      `PERO no las dos cosas a la vez: si en este mismo mensaje le está preguntando algo a la paciente, ` +
+      `NO anuncie el traspaso todavía. Una pregunta y una despedida juntas la dejan sin saber si contestar ` +
+      `o esperar. Primero termine de conversar lo que está preguntando; el aviso de cuándo le escribe el ` +
+      `equipo va cuando ya no le esté pidiendo nada. ` +
       `No prometa contacto inmediato ni una hora exacta, y no confirme fechas ni disponibilidad: ` +
       `usted no tiene acceso a la agenda. Si la paciente propone un día, anótelo como preferencia suya.)`
     );
@@ -222,6 +226,8 @@ function notaNocturna(ahora = new Date(), { yaAvisado = false } = {}) {
     `así que no se lo repita y no prometa contacto inmediato. ` +
     `Si la conversación lo permite con naturalidad, aproveche para dejar el caso listo: qué días u horas le sirven, ` +
     `la zona o el procedimiento que le interesa, y el tamizaje si es quirúrgico. ` +
+    `No vuelva a despedirse ni a repetir que el equipo le escribe mientras le siga preguntando cosas: ` +
+    `mezclar una pregunta con una despedida deja a la paciente sin saber si contestar o esperar. ` +
     `Anótelo como una preferencia de la paciente, NO lo confirme: usted no tiene acceso a la agenda y no sabe si ` +
     `hay campo ese día ni ese mes, así que nunca diga que una fecha "está bien", "es posible" ni "se puede". ` +
     `Si solo quiere información, respóndale eso y no la interrogue.)`
@@ -1342,30 +1348,48 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // atendiendo hasta que el equipo abra. El techo de la noche existe para que
   // una conversación no se vaya a cincuenta mensajes sin que nadie la mire.
   const topeAlcanzado = conversationState.messageCount >= MAX_CONVERSATION_TURNS;
+
+  // ¿Es un paciente? El tope existe para que una conversación larga no se quede
+  // en manos de Sofía, no para mandarle al equipo a quien nunca preguntó por un
+  // tratamiento. Caso real (2026-09-10, "Alejandro"): 11 mensajes sobre un premio
+  // de $400, un pie lastimado y falta de plata; el tope se lo asignó a Jordan, y
+  // el equipo ya lo había marcado Descartado seis días antes.
+  //
+  // Este filtro corre SIEMPRE que se llega al tope, de día y de noche. Hasta el
+  // 2026-10-01 el diferimiento nocturno lo saltaba entero: entraba antes y
+  // encolaba para la mañana sin preguntarse si valía la pena. Caso real de esa
+  // madrugada: un hombre mandó nueve mensajes de coqueteo, Sofía se calló las
+  // nueve veces como corresponde, y a las 8:20 el caso aterrizó igual en la
+  // bandeja de Angie. Justo lo que este filtro existe para frenar.
+  const motivoCierre = topeAlcanzado
+    ? await motivoParaCerrarSinAsesor(env, {
+        phoneHash,
+        messages: session.messages,
+        procedureInterest: conversationState.procedureInterest,
+      })
+    : null;
+
+  // De noche no hay a quién pasarle la conversación, así que el tope no corta —
+  // pero solo para quien de verdad va a necesitar un asesor.
   const diferirTope =
     topeAlcanzado &&
+    !motivoCierre &&
     conversationState.messageCount < MAX_CONVERSATION_TURNS_NOCHE &&
     !equipoDisponible() &&
     sofiaConfig.atencion_nocturna_enabled === true;
   if (diferirTope && !conversationState.traspasoPendienteDesde) {
     // Que el barrido de la mañana la recoja igual: la conversación ya es larga y
-    // necesita un asesor, solo que todavía no hay ninguno.
-    await marcarTraspasoPendiente(env, phoneHash, "conversación larga fuera de horario");
+    // necesita un asesor, solo que todavía no hay ninguno. El motivo nombra el
+    // tratamiento cuando se sabe, porque "conversación larga" no le dice NADA al
+    // asesor que abre el caso a las 8 de la mañana.
+    const motivoTope = yaSabemosElProcedimiento(conversationState.procedureInterest)
+      ? `conversación larga fuera de horario sobre ${conversationState.procedureInterest}`
+      : "conversación larga fuera de horario, sin tratamiento definido todavía";
+    await marcarTraspasoPendiente(env, phoneHash, motivoTope);
     conversationState.traspasoPendienteDesde = new Date().toISOString();
   }
 
   if (topeAlcanzado && !diferirTope) {
-    // Antes de pasársela a un asesor: ¿es un paciente? El tope existe para que
-    // una conversación larga no se quede en manos de Sofía, no para mandarle
-    // al equipo a quien nunca preguntó por un tratamiento. Caso real
-    // (2026-09-10, "Alejandro"): 11 mensajes sobre un premio de $400, un pie
-    // lastimado y falta de plata; el tope se lo asignó a Jordan, y el equipo
-    // ya lo había marcado Descartado seis días antes.
-    const motivoCierre = await motivoParaCerrarSinAsesor(env, {
-      phoneHash,
-      messages: session.messages,
-      procedureInterest: conversationState.procedureInterest,
-    });
     if (motivoCierre) {
       // Si Sofía ya venía callada, sigue callada: una despedida sería
       // contestarle a quien decidió no contestarle.
@@ -3973,7 +3997,13 @@ async function transferirTraspasosPendientes(env) {
     await addEscalationNote(
       env,
       fila.prospect_id,
-      `${fila.escalation_reason || "no especificado"} — conversación de fuera de horario, Sofía siguió atendiendo`
+      // El sufijo solo si el motivo no dice ya que viene de la noche: si no,
+      // sale "conversación larga fuera de horario — conversación de fuera de
+      // horario, Sofía siguió atendiendo", que fue lo que vio el equipo el
+      // 2026-10-01.
+      /fuera de horario/i.test(fila.escalation_reason || "")
+        ? fila.escalation_reason
+        : `${fila.escalation_reason || "no especificado"} — conversación de fuera de horario, Sofía siguió atendiendo`
     );
 
     const traspaso = await transferToNextAgentInPool(env, fila.prospect_id, { phoneHash: fila.phone_hash });
