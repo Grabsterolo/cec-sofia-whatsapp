@@ -728,6 +728,10 @@ export default {
       return handleProspectPhones(request, env);
     }
 
+    if (request.method === "GET" && url.pathname === "/stats/handoff-threads") {
+      return handleHandoffThreads(request, env);
+    }
+
     if (request.method === "POST" && url.pathname === "/sync/phones") {
       return handleSyncPhones(request, env);
     }
@@ -4925,6 +4929,228 @@ async function handleProspectPhones(request, env) {
     porOrigen,
     prospectos: filas,
   }), { status: 200, headers: { "content-type": "application/json" } });
+}
+
+// GET /stats/handoff-threads — los hilos completos de una muestra de casos ya
+// traspasados, para poder auditar qué hizo el asesor DESPUÉS del traspaso.
+//
+// Por qué tiene que vivir acá y no en el dashboard: el texto de las respuestas
+// de los asesores no está en Supabase. Cuando el caso se traspasa, Sofía queda
+// muda y sofia_whatsapp_sessions deja de actualizarse, así que de esa parte de
+// la conversación la base solo guarda la hora y el ID del asesor
+// (sofia_handoffs.respondido_en / respondido_por). El texto existe únicamente en
+// Zenvia, y la ZENVIA_API_KEY solo la tiene este Worker — en Cloudflare los
+// secretos son de solo escritura, no se pueden leer de vuelta para usarlos
+// desde otro lado.
+//
+// Devuelve conversaciones de pacientes y el desempeño de personas con nombre y
+// apellido, así que exige el mismo secreto que /stats/conversion.
+//
+//   ?desde=YYYY-MM-DD&hasta=YYYY-MM-DD   ventana por asignado_en, en hora CR
+//   ?por_asesor=10                       cuántos casos por asesor en la muestra
+//   ?lote=0                              qué tanda de hilos traer
+//
+// La ventana filtra por `asignado_en` y no por `escalado_en` a propósito: lo que
+// se audita es la conducta del asesor desde que el caso le llegó, y con la
+// atención nocturna un caso puede decidirse el sábado y asignarse el lunes.
+//
+// Sale en lotes porque cada hilo cuesta un subrequest a Zenvia y el techo de
+// Cloudflare por invocación ronda los 60 (ver CLEANUP_BATCH_LIMIT y
+// FOLLOWUP_MAX_PER_RUN, limitados por lo mismo). Con 20 hilos más las lecturas
+// de Supabase se queda cómodo; una muestra de 40 son dos llamadas.
+const HILOS_POR_LOTE = 20;
+
+// La muestra tiene que ser la MISMA en la llamada del lote 0 y en la del lote 1,
+// o las dos tandas se solapan y faltan casos. Un Math.random() por llamada no
+// sirve. Se ordena por un hash del id del traspaso: es un orden arbitrario
+// —ningún asesor puede predecirlo ni influirlo— pero estable, así que la muestra
+// se puede reconstruir y la auditoría se puede repetir.
+function ordenEstable(texto) {
+  let h = 2166136261;
+  for (let i = 0; i < texto.length; i++) {
+    h ^= texto.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+async function handleHandoffThreads(request, env) {
+  if (!env.STATS_TRIGGER_SECRET || request.headers.get("x-stats-secret") !== env.STATS_TRIGGER_SECRET) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const url = new URL(request.url);
+  const porAsesor = Math.min(parseInt(url.searchParams.get("por_asesor") || "10", 10) || 10, 25);
+  const lote = Math.max(parseInt(url.searchParams.get("lote") || "0", 10) || 0, 0);
+  const desde = url.searchParams.get("desde");
+  const hasta = url.searchParams.get("hasta");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(desde ?? "") || !/^\d{4}-\d{2}-\d{2}$/.test(hasta ?? "")) {
+    return new Response(JSON.stringify({ error: "Faltan desde y hasta en formato YYYY-MM-DD." }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  // Las fechas son horas de Costa Rica, no UTC. Si se tomaran como UTC, "la
+  // semana pasada" se corre seis horas y entran casos del domingo en la noche.
+  const desdeUtc = `${desde}T06:00:00Z`;
+  const hastaUtc = `${hasta}T06:00:00Z`;
+
+  const headers = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+  };
+
+  // Una semana son ~370 traspasos, muy por debajo del tope de 1.000 filas que
+  // PostgREST devuelve sin avisar. El límite va explícito y la respuesta reporta
+  // si se alcanzó, que es el error que se pagó caro en /stats/conversion.
+  const TOPE_FILAS = 1000;
+  const resH = await fetchWithTimeout(
+    `${env.SUPABASE_URL}/rest/v1/sofia_handoffs` +
+      `?asignado_en=gte.${desdeUtc}&asignado_en=lt.${hastaUtc}` +
+      `&agente_asignado=not.is.null&prospect_id=not.is.null` +
+      `&select=id,prospect_id,phone_hash,agente_asignado,motivo,estado,escalado_en,asignado_en,respondido_en` +
+      `&order=asignado_en.asc&limit=${TOPE_FILAS}`,
+    { headers }
+  );
+  if (!resH.ok) {
+    return new Response(JSON.stringify({ error: `Error leyendo sofia_handoffs: ${resH.status}` }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const traspasos = await resH.json();
+
+  // Solo los cuatro asesores conocidos. Los bots y cualquier otro agente quedan
+  // fuera: la auditoría es de las personas del equipo.
+  const nombreDe = Object.fromEntries(HUMAN_AGENTS.map((a) => [a.id, a.name]));
+  const porId = new Map();
+  for (const h of traspasos) {
+    if (!nombreDe[h.agente_asignado]) continue;
+    if (!porId.has(h.agente_asignado)) porId.set(h.agente_asignado, []);
+    porId.get(h.agente_asignado).push(h);
+  }
+
+  // Se toman los primeros `porAsesor` de cada uno en el orden estable. Entran
+  // tanto los contestados como los que nadie tocó, en la proporción real de cada
+  // asesor: elegir a propósito los peores casos haría la auditoría indefendible
+  // frente al equipo.
+  const muestra = [];
+  const resumen = [];
+  for (const [agente, casos] of [...porId.entries()].sort((a, b) => nombreDe[a[0]].localeCompare(nombreDe[b[0]]))) {
+    const ordenados = [...casos].sort((a, b) => ordenEstable(a.id) - ordenEstable(b.id));
+    const elegidos = ordenados.slice(0, porAsesor);
+    muestra.push(...elegidos);
+    resumen.push({ asesor: nombreDe[agente], casos_en_la_ventana: casos.length, en_la_muestra: elegidos.length });
+  }
+
+  const tanda = muestra.slice(lote * HILOS_POR_LOTE, (lote + 1) * HILOS_POR_LOTE);
+  if (!tanda.length) {
+    return new Response(JSON.stringify({
+      desde, hasta, por_asesor: porAsesor, lote,
+      total_en_la_muestra: muestra.length,
+      resumen,
+      casos: [],
+      nota: muestra.length
+        ? "Ese lote está vacío: la muestra ya se entregó completa."
+        : "No hay traspasos en esa ventana.",
+    }, null, 2), { status: 200, headers: { "content-type": "application/json" } });
+  }
+
+  // Contexto que ya tenemos en la base: qué venía buscando la paciente y si el
+  // tamizaje quirúrgico estaba resuelto antes del traspaso. Es lo que permite
+  // juzgar si el asesor retomó el caso donde Sofía lo dejó o lo empezó de cero.
+  const hashes = [...new Set(tanda.map((h) => h.phone_hash).filter(Boolean))];
+  const contexto = new Map();
+  if (hashes.length) {
+    const resC = await fetchWithTimeout(
+      `${env.SUPABASE_URL}/rest/v1/sofia_conversations` +
+        `?phone_hash=in.(${hashes.map((h) => `"${h}"`).join(",")})` +
+        `&select=phone_hash,procedure_interest,patient_name,channel,message_count,tamizaje_embarazo,tamizaje_lactancia,tamizaje_peso`,
+      { headers }
+    );
+    if (resC.ok) for (const c of await resC.json()) contexto.set(c.phone_hash, c);
+  }
+
+  const casos = [];
+  for (const h of tanda) {
+    const res = await fetchWithTimeout(
+      `${ZENVIA_API_BASE}/prospect/${h.prospect_id}/interactions?api-key=${env.ZENVIA_API_KEY}`
+    ).catch(() => null);
+    const interacciones = res?.ok ? await res.json().catch(() => null) : null;
+    const ctx = contexto.get(h.phone_hash) ?? {};
+
+    const base = {
+      handoff_id: h.id,
+      asesor: nombreDe[h.agente_asignado],
+      estado: h.estado,
+      escalado_en: h.escalado_en,
+      asignado_en: h.asignado_en,
+      respondido_en: h.respondido_en,
+      motivo_del_traspaso: h.motivo,
+      interes: ctx.procedure_interest ?? null,
+      canal: ctx.channel ?? null,
+      tamizaje: {
+        embarazo: ctx.tamizaje_embarazo ?? null,
+        lactancia: ctx.tamizaje_lactancia ?? null,
+        peso: ctx.tamizaje_peso ?? null,
+      },
+    };
+
+    if (!Array.isArray(interacciones)) {
+      // Sin poder mirar no se concluye nada — mismo criterio que
+      // buscarRespuestaHumana(): un fallo de Zenvia no es un asesor que no
+      // contestó, y contarlo como tal sería acusar a alguien por un 502.
+      casos.push({ ...base, error: "no se pudo leer el hilo en Zenvia" });
+      continue;
+    }
+
+    const corte = Date.parse(h.asignado_en ?? h.escalado_en);
+    const hilo = interacciones
+      .map((it) => {
+        // Las asignaciones y las notas internas no traen output.message y quedan
+        // fuera — mismo filtro que usa el resto del archivo.
+        const m = it.output?.message;
+        if (!m) return null;
+        const id = it.agentId ?? it.agent?.id ?? null;
+        const t = Date.parse(it.createdAt);
+        const de =
+          m.performer === "integration"
+            ? "paciente"
+            : id === SOFIA_AGENT_ID
+              ? "Sofía"
+              : nombreDe[id] ||
+                [it.agent?.firstName, it.agent?.lastName].filter(Boolean).join(" ") ||
+                `agente ${id ?? "desconocido"}`;
+        return {
+          cuando: it.createdAt,
+          de,
+          es_asesor: m.performer !== "integration" && id !== SOFIA_AGENT_ID,
+          despues_del_traspaso: Number.isFinite(t) && Number.isFinite(corte) && t > corte,
+          texto: String(m.content || m.body || "").trim() || (m.attachment ? "[adjunto]" : "[vacío]"),
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => Date.parse(a.cuando) - Date.parse(b.cuando));
+
+    casos.push({
+      ...base,
+      mensajes_del_asesor: hilo.filter((m) => m.es_asesor && m.despues_del_traspaso).length,
+      hilo,
+    });
+  }
+
+  return new Response(JSON.stringify({
+    desde, hasta, por_asesor: porAsesor, lote,
+    total_en_la_muestra: muestra.length,
+    hilos_en_este_lote: casos.length,
+    faltan_lotes: (lote + 1) * HILOS_POR_LOTE < muestra.length,
+    truncado: traspasos.length === TOPE_FILAS,
+    resumen,
+    casos,
+  }, null, 2), { status: 200, headers: { "content-type": "application/json" } });
 }
 
 // POST /sync/phones — rellena sofia_conversations.phone_number con los
