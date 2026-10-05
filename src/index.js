@@ -92,12 +92,28 @@ function equipoDisponible(ahora = new Date()) {
 }
 
 // Tope de seguridad: si algo lleva más de esto pendiente, se transfiere aunque
-// el equipo no esté. Un trabajo que falle no puede dejar pacientes en el limbo —
+// el equipo no esté. Un trabajo que falle no puede dejar pacientes en el limbo:
 // es exactamente el error que se encontró el 2026-09-29 en retryStuckEscalations.
-// 14 h cubre la noche más larga (sábado 4 p.m. a domingo… no: ahí son 40 h, y
-// justamente por eso el domingo dispara el tope y se transfiere igual, que es lo
-// correcto: más vale asignado y esperando que invisible).
-const TRASPASO_PENDIENTE_TOPE_HORAS = 14;
+//
+// Era 14 h, con el razonamiento de que un caso del sábado por la tarde se
+// disparara el domingo porque "más vale asignado y esperando que invisible". Ese
+// razonamiento estaba incompleto: transferir marca la conversación como escalada,
+// y eso DEJA A SOFÍA MUDA el resto del domingo. O sea que el tope compraba
+// visibilidad para el equipo pagándola con silencio para la paciente, justo el
+// día de espera más largo de la semana y justo lo que la atención nocturna existe
+// para evitar.
+//
+// Medido el primer fin de semana con la atención nocturna encendida (3-4 oct
+// 2026): 20 conversaciones diferidas el sábado por la tarde se transfirieron el
+// domingo entre las 6:20 y las 9:01 a.m., todas con exactamente 14 h. Ninguna
+// volvió a escribir, así que no costó nada — pero por suerte, no por diseño.
+//
+// 48 h: la espera normal más larga es sábado 4 p.m. → lunes 8 a.m., que son 40 h.
+// Con 48 el tope no se activa nunca en un fin de semana normal y sigue atrapando
+// lo que de verdad quedó atascado. No se quita, porque sin él un caso puede
+// quedar invisible para siempre; y no se condiciona a que el equipo esté, porque
+// entonces no haría nada: si el equipo está, el barrido ya transfiere igual.
+const TRASPASO_PENDIENTE_TOPE_HORAS = 48;
 
 // Cuánto se le da a la paciente para contestar la pregunta que dejó Sofía antes
 // de pasar el caso igual. Es un freno de seguridad, no el camino normal: lo
