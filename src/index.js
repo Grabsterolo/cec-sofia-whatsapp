@@ -728,6 +728,10 @@ export default {
       return handleProspectPhones(request, env);
     }
 
+    if (request.method === "GET" && url.pathname === "/stats/ctwa-shape") {
+      return handleCtwaShape(request, env);
+    }
+
     if (request.method === "GET" && url.pathname === "/stats/handoff-threads") {
       return handleHandoffThreads(request, env);
     }
@@ -896,6 +900,12 @@ async function handleWebhook(request, env, ctx) {
   // Zenvia, same as before) and logged (visible via `wrangler tail`).
   ctx.waitUntil(
     (async () => {
+      // Paso 0 de la atribución de anuncios (2026-10-06). Va DENTRO del
+      // waitUntil a propósito: el ack de arriba ya salió, así que esto no le
+      // suma ni un milisegundo a lo que Zenvia está esperando — justo lo que
+      // el bug del 2026-08-20 documentado arriba enseñó a cuidar.
+      await capturarPayloadDeAnuncio(body, inboundMessages, env);
+
       for (const inbound of inboundMessages) {
         try {
           await processInboundMessage(inbound, env);
@@ -1013,6 +1023,74 @@ async function extractInboundFromInteraction(interaction, env) {
   }
 
   return { text, phone, prospectId, interactionId: interaction.id, agentId, channel, attachment };
+}
+
+// ---------------------------------------------------------------------------
+// Captura del paquete crudo de Zenvia — paso 0 de la atribución de anuncios
+// (2026-10-06). TEMPORAL Y DE DIAGNÓSTICO: ver el bloque de abajo.
+// ---------------------------------------------------------------------------
+//
+// El problema: extractInboundFromInteraction() lee SEIS campos de lo que manda
+// Zenvia y bota el resto sin abrirlo, así que en toda la vida del Worker nadie
+// ha visto el paquete completo.
+//
+// Para cerrarle el circuito a Meta hace falta el `ctwa_clid`: el identificador
+// que Meta le pega a quien hace clic en un anuncio de clic-a-WhatsApp, y que
+// viaja en un objeto `referral` junto al PRIMER mensaje de esa conversación.
+// Con él se le puede decir después a Meta "esta persona compró"; sin él, Meta
+// solo sabe que alguien escribió y sigue optimizando hacia gente que conversa.
+//
+// Sabemos que Zenvia SÍ recibe el contexto del anuncio, porque pega un bloque
+// "Source: Meta - ID:..." dentro del TEXTO del primer mensaje (ver README, el
+// bug de atribución del 2026-07-27). Lo que no sabemos es si además nos lo
+// reenvía como campo. Si lo hace, ya lo estamos botando. Si no lo hace, hay que
+// reclamárselo — pero con el paquete en la mano, no preguntando a ciegas.
+//
+// Esto NO toca nada de lo que ve la paciente ni de cómo contesta Sofía. Solo
+// guarda una copia del paquete en sofia_reliability_events para poder mirarlo
+// con GET /stats/ctwa-shape. Se quita —o se convierte en la lectura real del
+// campo— apenas la pregunta esté contestada.
+
+// Dos redes, no una. La primera atrapa el bloque de texto que ya conocemos; la
+// segunda, los nombres que usa Meta cuando el dato viene como campo. Así cae
+// igual si Zenvia lo reenvía estructurado SIN el bloque de texto, que es justo
+// el caso que nos interesa y el que una sola red se perdería.
+const MARCAS_DE_ANUNCIO = /"(referral|ctwa_clid|ctwaClid|clid|source_id|sourceId|source_type|sourceType|source_url|sourceUrl|ad_id|adId|campaign_id|campaignId)"\s*:|Source:\s*Meta/i;
+
+// Muestra ciega: 2% de TODO el tráfico, venga o no de anuncio. Es la guarda
+// contra el error más probable de este diagnóstico — que las dos redes de
+// arriba estén mal pensadas y capturemos cero, y que leamos ese cero como
+// "Zenvia no lo manda" cuando en realidad era "no supimos buscarlo". Con ~165
+// conversaciones nuevas al día esto son 3 o 4 filas, y nos deja ver cómo es un
+// paquete normal.
+const PROPORCION_MUESTRA_CIEGA = 0.02;
+
+// El paquete entero va a una columna de texto. Si se pasa, se guarda recortado
+// pero envuelto en un JSON válido y marcado, en vez de dejar una cadena rota
+// que después no se puede ni parsear.
+const TOPE_PAYLOAD = 12000;
+
+async function capturarPayloadDeAnuncio(body, inboundMessages, env) {
+  try {
+    const crudo = JSON.stringify(body);
+    const esDeAnuncio = MARCAS_DE_ANUNCIO.test(crudo);
+    if (!esDeAnuncio && Math.random() >= PROPORCION_MUESTRA_CIEGA) return;
+
+    const primero = inboundMessages[0] ?? null;
+    const detail = crudo.length > TOPE_PAYLOAD
+      ? JSON.stringify({ __truncado: true, __largoReal: crudo.length, muestra: crudo.slice(0, TOPE_PAYLOAD) })
+      : crudo;
+
+    await logReliabilityEvent(env, {
+      eventType: esDeAnuncio ? "ctwa_payload_anuncio" : "ctwa_payload_muestra",
+      prospectId: primero?.prospectId ?? null,
+      phoneHash: primero?.phone ? await sha256Hex(primero.phone) : null,
+      detail,
+    });
+  } catch (err) {
+    // Nunca puede tumbar el mensaje de una paciente: es diagnóstico, no función.
+    console.error("capturarPayloadDeAnuncio falló", err);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4820,6 +4898,133 @@ async function handleConversionStats(request, env) {
     truncated,
     detail,
   }), { status: 200, headers: { "content-type": "application/json" } });
+}
+
+// GET /stats/ctwa-shape — leer lo que capturó capturarPayloadDeAnuncio().
+//
+// Modo seguro por defecto, igual que el ?shape=1 de /stats/prospect-phones: se
+// devuelven NOMBRES de campo, no valores. La única excepción son los campos de
+// atribución, que son justo lo que venimos a leer y no son datos personales —
+// un ctwa_clid identifica un clic, no a una persona.
+//
+//   ?desde=ISO   ventana a mirar (por defecto, 3 días)
+//   ?crudo=1     devuelve los paquetes completos. Esos SÍ traen el mensaje y el
+//                teléfono de la paciente, así que hay que pedirlo a propósito.
+//
+// Auth: x-stats-secret == STATS_TRIGGER_SECRET.
+const LLAVE_DE_ATRIBUCION = /ctwa|clid|^referral$|^(source|ad|campaign)_?(id|type|url)$/i;
+
+function recorrerLlaves(valor, prefijo, acc) {
+  if (valor === null || typeof valor !== "object") return;
+  if (Array.isArray(valor)) {
+    // Los índices se colapsan a []: si no, un arreglo de 50 mensajes produce 50
+    // rutas distintas que dicen lo mismo y la lista se vuelve ilegible.
+    for (const v of valor) recorrerLlaves(v, `${prefijo}[]`, acc);
+    return;
+  }
+  for (const [k, v] of Object.entries(valor)) {
+    const ruta = prefijo ? `${prefijo}.${k}` : k;
+    acc.add(ruta);
+    recorrerLlaves(v, ruta, acc);
+  }
+}
+
+function buscarAtribucion(valor, prefijo, acc) {
+  if (valor === null || typeof valor !== "object") return;
+  if (Array.isArray(valor)) {
+    for (const v of valor) buscarAtribucion(v, `${prefijo}[]`, acc);
+    return;
+  }
+  for (const [k, v] of Object.entries(valor)) {
+    const ruta = prefijo ? `${prefijo}.${k}` : k;
+    if (LLAVE_DE_ATRIBUCION.test(k)) {
+      const esPrimitivo = v === null || typeof v !== "object";
+      acc.set(ruta, esPrimitivo ? String(v).slice(0, 200) : "(objeto — ver las rutas hijas)");
+    }
+    buscarAtribucion(v, ruta, acc);
+  }
+}
+
+async function handleCtwaShape(request, env) {
+  if (!env.STATS_TRIGGER_SECRET || request.headers.get("x-stats-secret") !== env.STATS_TRIGGER_SECRET) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const url = new URL(request.url);
+  const desde = url.searchParams.get("desde")
+    || new Date(Date.now() - 3 * 24 * 3600 * 1000).toISOString();
+  const crudo = url.searchParams.get("crudo") === "1";
+
+  const consulta = `${env.SUPABASE_URL}/rest/v1/sofia_reliability_events`
+    + `?select=event_type,detail,created_at`
+    + `&event_type=in.(ctwa_payload_anuncio,ctwa_payload_muestra)`
+    + `&created_at=gte.${encodeURIComponent(desde)}`
+    + `&order=created_at.desc&limit=200`;
+
+  const res = await fetch(consulta, {
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    },
+  });
+  if (!res.ok) {
+    return new Response(JSON.stringify({ error: `Supabase respondió ${res.status}` }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const filas = await res.json();
+  const llaves = new Set();
+  const atribucion = new Map();
+  const paquetes = [];
+  let truncados = 0;
+  let noParseables = 0;
+
+  for (const fila of filas) {
+    let paquete;
+    try {
+      paquete = JSON.parse(fila.detail);
+    } catch {
+      noParseables++;
+      continue;
+    }
+    if (paquete?.__truncado) truncados++;
+    recorrerLlaves(paquete, "", llaves);
+    buscarAtribucion(paquete, "", atribucion);
+    if (crudo) paquetes.push({ tipo: fila.event_type, cuando: fila.created_at, paquete });
+  }
+
+  const deAnuncio = filas.filter((f) => f.event_type === "ctwa_payload_anuncio").length;
+  const campos = [...atribucion].map(([ruta, valor]) => ({ ruta, valor }));
+  const hayClid = campos.some(({ ruta }) => /ctwa|clid/i.test(ruta));
+
+  // El veredicto va escrito, no deducido: quien abre esto no tiene por qué
+  // interpretar un arreglo vacío. Un cero de filas NO es lo mismo que un "no
+  // llega" — puede ser que no hubo tráfico de anuncios en la ventana, y eso se
+  // contrasta contra `messagingStarted` de /api/meta-metrics en el dashboard.
+  let veredicto;
+  if (filas.length === 0) {
+    veredicto = "Sin capturas en esta ventana. No concluye nada todavía: revisar en el dashboard si hubo conversaciones iniciadas desde anuncios en estas fechas.";
+  } else if (hayClid) {
+    veredicto = "El identificador del clic SÍ llega. Ver `atribucion.campos` para la ruta exacta y guardarlo desde ahí.";
+  } else if (deAnuncio > 0) {
+    veredicto = "Llegaron paquetes de anuncio pero NINGUNO trae el identificador del clic. Esto es la prueba que hay que mandarle a Zenvia.";
+  } else {
+    veredicto = "Solo hay muestra ciega, sin paquetes de anuncio. Revisar `llaves` por si el anuncio viene marcado de una forma que las redes no contemplan.";
+  }
+
+  return new Response(JSON.stringify({
+    ventana: { desde, hasta: new Date().toISOString() },
+    filas: { total: filas.length, deAnuncio, muestraCiega: filas.length - deAnuncio, truncados, noParseables },
+    veredicto,
+    atribucion: { encontrada: hayClid, campos },
+    llaves: [...llaves].sort(),
+    ...(crudo ? { paquetes } : {}),
+  }, null, 2), { status: 200, headers: { "content-type": "application/json" } });
 }
 
 // GET /stats/prospect-phones — de dónde sacar los teléfonos.

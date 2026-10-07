@@ -2682,3 +2682,98 @@ from r;
   Corporal a $600 por área o $1.650 por tres sesiones: no está en la sección 6,
   ni en el resto de la base, ni en el `system_prompt`. No se sabe en qué rama
   pasó.
+
+---
+
+## 5v. Atribución de anuncios — paso 0: ver el paquete crudo de Zenvia (2026-10-06)
+
+**TEMPORAL Y DE DIAGNÓSTICO.** Esto no es una función del producto: es una
+pregunta que no se puede contestar de otra forma. Apenas esté contestada, se
+quita o se convierte en la lectura real del campo.
+
+### Qué se quiere saber y por qué
+
+Meta optimiza las campañas de clic-a-WhatsApp con lo que uno le reporta. Hoy lo
+único que le llega es "alguien abrió una conversación", así que optimiza hacia
+gente que conversa y no compra. Para poder decirle "**esta** persona compró"
+hace falta el `ctwa_clid`: el identificador que Meta le pega a quien hace clic
+en el anuncio y que viaja en un objeto `referral` junto al **primer** mensaje
+de esa conversación.
+
+De la cadena completa ya tenemos dos de cuatro piezas construidas:
+
+| Pieza | Estado |
+|---|---|
+| Capturar el `ctwa_clid` | **Desconocido** — esto es lo que mide el paso 0 |
+| Guardarlo pegado al prospecto | Falta (ver la trampa de abajo) |
+| Saber quién compró | **Ya está** — `handleConversionStats` |
+| Mandarle el evento a Meta | Falta; `META_ACCESS_TOKEN` ya existe en Pages |
+
+### Por qué no lo sabemos ya
+
+`extractInboundFromInteraction()` lee **seis campos** de lo que manda Zenvia y
+bota el resto sin abrirlo. En toda la vida del Worker nadie ha visto el paquete
+completo.
+
+Lo que sí sabemos: Zenvia **recibe** el contexto del anuncio, porque pega un
+bloque `Source: Meta - ID:...` dentro del **texto** del primer mensaje (ver el
+bug de atribución del 2026-07-27 en la sección 2). Lo que no sabemos es si
+además lo reenvía como campo.
+
+### Cómo se captura
+
+`capturarPayloadDeAnuncio()`, llamada desde `handleWebhook()` **dentro del
+`ctx.waitUntil`** — el ack a Zenvia ya salió, así que no le suma latencia (ver
+5l para por qué eso importa). Guarda en `sofia_reliability_events`:
+
+- `ctwa_payload_anuncio` — cuando el paquete trae el bloque `Source: Meta` **o**
+  cualquiera de los nombres de campo de Meta (`referral`, `ctwa_clid`,
+  `source_id`, `ad_id`…). Son **dos redes**: si Zenvia reenvía el dato
+  estructurado *sin* el bloque de texto —que es justo el caso que interesa— una
+  sola red se lo perdería.
+- `ctwa_payload_muestra` — **2% ciego de todo el tráfico**, venga o no de
+  anuncio. Es la guarda contra el error más probable del diagnóstico: que las
+  dos redes estén mal pensadas, capturemos cero, y leamos ese cero como "Zenvia
+  no lo manda" cuando era "no supimos buscarlo".
+
+Paquetes de más de 12.000 caracteres se guardan recortados pero envueltos en un
+JSON válido y marcado (`__truncado`), no como cadena rota.
+
+### Cómo se lee — `GET /stats/ctwa-shape`
+
+Auth: `x-stats-secret` == `STATS_TRIGGER_SECRET`.
+
+- `?desde=ISO` — ventana (por defecto, 3 días).
+- `?crudo=1` — devuelve los paquetes completos. **Traen mensaje y teléfono de
+  la paciente**, por eso hay que pedirlo a propósito; el default devuelve solo
+  nombres de campo, igual que el `?shape=1` de `/stats/prospect-phones`.
+
+Devuelve un `veredicto` **escrito**, no deducido, porque quien lo abre no tiene
+por qué interpretar un arreglo vacío. En particular: **cero filas no significa
+"no llega"** — puede ser que no hubo tráfico de anuncios en la ventana. Eso se
+contrasta contra `messagingStarted` de `/api/meta-metrics` en el dashboard, que
+es el conteo que da Meta de conversaciones iniciadas desde anuncios.
+
+### La trampa para cuando toque guardarlo
+
+El `ctwa_clid` llega **solo en el primer mensaje** de la conversación. Si se
+escribe en `upsertConversation()` como un campo normal, el segundo turno lo
+pisa con `null` y se pierde. Hay que usar el patrón de `patient_name`:
+escribir solo si viene, nunca pisar con vacío.
+
+### Decisiones ya tomadas para las fases siguientes
+
+- **Dos eventos, no uno.** "Calificado" al pasar el caso al equipo (cae dentro
+  de la ventana de atribución de 7 días del `ctwa_clid`, y es el que de verdad
+  entrena a Meta) y "venta" cuando Zenvia archiva como convertido. El ciclo de
+  venta del CEC es más largo que 7 días, así que mandar solo la venta dejaría
+  fuera buena parte.
+- **"Agendó" no entra en la primera versión.** Hoy la cita solo se cuenta a
+  mano, leyendo el tramo del asesor con un día de retraso. Las frases de cierre
+  son formulaicas, así que detectarlas es una fase posterior plausible — pero
+  no se le promete a Meta un evento que todavía no se produce solo.
+- **Va solo en este repo.** El chat web no tiene clic de anuncio, así que es
+  excepción deliberada a la regla de replicar los cambios de comportamiento en
+  `cecmarketing/functions/api/chat.js`.
+- Al dashboard hay que pedirle los insights de Meta a `level=ad`, no
+  `level=campaign` como hoy, para tener IDs de anuncio.
