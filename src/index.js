@@ -1757,12 +1757,41 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // spirit as the finalReply fallback above (2026-08-10 fix) for the
   // opposite gap (tagged but wrote nothing).
   const impliedHandoff = !taggedEscalated && mentionsHandoffPromise(reply);
-  const escalated = taggedEscalated || impliedHandoff;
+  // La otra mitad del problema: la paciente pidió la cita y Sofía no escaló.
+  // Acá no hay frase de Sofía que detectar —el fallo es justamente que no dijo
+  // nada— así que se mira lo que escribió LA PACIENTE. Ver el comentario largo
+  // de pidioCitaExplicitamente().
+  //
+  // No se aplica si Sofía decidió callarse ([NO_RESPONDER]), cerrar ([CERRAR])
+  // o programar por tamizaje ([PROGRAMAR]): en esos tres casos ya tomó una
+  // decisión deliberada sobre el caso y pisarla sería peor que el bug.
+  const pedidoDeCitaSinTraspaso =
+    !taggedEscalated &&
+    !impliedHandoff &&
+    !silenced &&
+    !shouldClose &&
+    !programacion &&
+    pidioCitaExplicitamente(text);
+  if (pedidoDeCitaSinTraspaso) {
+    console.log(
+      "SOFIA_PEDIDO_DE_CITA_SIN_TRASPASO",
+      JSON.stringify({ prospectId, pidio: String(text || "").slice(0, 120) })
+    );
+  }
+  const escalated = taggedEscalated || impliedHandoff || pedidoDeCitaSinTraspaso;
+  // El motivo lo lee un asesor que no vio la conversación. Se cita textualmente
+  // lo que pidió la paciente, recortado: es su propia frase, así que no inventa
+  // ningún dato que ella no haya dado (regla del prompt sobre los motivos).
   const escalation_reason = taggedEscalated
     ? taggedReason
     : impliedHandoff
       ? "frase de traspaso detectada sin etiqueta [ESCALAR]"
-      : null;
+      : pedidoDeCitaSinTraspaso
+        ? `pidió cita y Sofía no la escaló — la paciente escribió: "${String(text || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 160)}"`
+        : null;
 
   // Sofía usually writes a transition line before [ESCALAR] (see
   // system_prompt "Cómo escalar"), but not always — when she doesn't, reply
@@ -2048,10 +2077,114 @@ const HANDOFF_PROMISE_PATTERNS = [
   /(d[ée]jeme|perm[íi]tame|deje que) (consultar|averiguar|verificar|confirmar)/i,
   /le (paso|traslado|comparto) (su|esta) (caso|consulta|duda|informaci[óo]n|pregunta)/i,
   /le aviso (apenas|en cuanto|ni bien)/i,
+  // Agregadas el 2026-10-07 por el caso de Diana Rivera (lipo con transferencia
+  // a glúteos, 6-oct 23:13): Sofía escribió "Nuestro equipo le va a estar
+  // ESCRIBIENDO mañana, en horario de 8 de la mañana a 6 de la tarde" —con día
+  // y plazo— y la lista solo cubría "estar contactando"/"contactar", así que
+  // pasó de largo y nadie la recibió. La variante con relleno ("nuestro equipo
+  // DE ASESORES le va a...") también se escapaba por la misma razón.
+  //
+  // Medido sobre las conversaciones nacidas en los 7 días al 7-oct: de 325 en
+  // las que Sofía prometió contacto, 324 llegaron a un asesor y esta fue la
+  // única que no. O sea que la lista funcionaba; esto cierra el último hueco.
+  //
+  // Importa el modo verbal: se exige el futuro afirmativo ("le va a contactar")
+  // y nunca el subjuntivo del ofrecimiento ("¿le gustaría que el equipo le
+  // CONTACTE?"), que aparece 18 veces al mes y no es una promesa sino una
+  // pregunta. Verificado: con estas reglas esos 18 no entran.
+  /(el |nuestro )?equipo[^.?!]{0,20}(le|la) va a (estar )?(contact|escrib|llam|comunic)/i,
+  /(lo|la) voy a poner en contacto/i,
+  // "le paso LA información al equipo": la regla de arriba exige "su"/"esta" y
+  // Sofía dice "la información" casi siempre. Se exige el destino ("al equipo")
+  // porque "le comparto la información" sin destino es Sofía informándole a la
+  // paciente — inocente y muy frecuente (sin el destino, esta sola regla
+  // sumaba 220 personas en un mes).
+  /le (paso|traslado|comparto) (la |su |esta )?(informaci[óo]n|caso|consulta|duda|pregunta)[^.?!]{0,25} al (equipo|asesor|departamento|m[ée]dico|[áa]rea)/i,
 ];
 
 function mentionsHandoffPromise(text) {
   return HANDOFF_PROMISE_PATTERNS.some((re) => re.test(text));
+}
+
+// ---------------------------------------------------------------------------
+// La paciente pidió la cita y Sofía no la escaló (2026-10-07)
+// ---------------------------------------------------------------------------
+//
+// La red de arriba solo atrapa los casos en que Sofía DIJO que iba a pasar el
+// caso. El agujero más grande es el contrario: la paciente pide la cita con
+// todas las palabras, Sofía le contesta bien y no escala nunca — así que no hay
+// ninguna frase que detectar.
+//
+// Revisadas a mano las 32 horas del 6-oct al 7-oct a las 8:00: 8 pacientes
+// pidieron cita y no llegaron a ningún asesor. Los motivos no eran uno sino
+// tres, y ninguno es un error técnico:
+//   1. Se quedó esperando un dato. Dice "con gusto le coordino, pero antes
+//      necesito confirmarle un par de cosas" y la paciente no contesta. Para
+//      Sofía el traspaso es el ÚLTIMO paso, después de recoger todo.
+//   2. Creyó que ya la había pasado (eso lo cubre la red de promesas).
+//   3. Siguió vendiendo como si pudiera cerrar ella: contestó el precio y cerró
+//      con otra pregunta, sin ofrecer pasarla a nadie.
+//
+// El caso que decidió construir esto: una paciente de Ultherapy dejó dos notas
+// de voz, acordó el martes 20 de octubre a las 8:00 a.m., Sofía le confirmó día
+// y dirección y acto seguido le hizo el tamizaje quirúrgico —prohibido en no
+// quirúrgico— copiando el ejemplo del propio prompt sin la palabra
+// "quirúrgica". La paciente no contestó y el traspaso nunca ocurrió. Esa señora
+// tiene una cita por escrito, con recordatorio, que no existe en ninguna
+// agenda.
+//
+// Por qué va acá y no en el prompt: el prompt YA lo prohíbe, y por la frase
+// exacta ("necesito confirmarle un par de cosas rápidas" está citada
+// literalmente en la sección del tamizaje desde el 30-sep). Aun así se usó 24
+// veces en conversaciones no quirúrgicas en 7 días. Mismo razonamiento que la
+// red de [NO_RESPONDER] más arriba: la regla está escrita y clarísima, así que
+// reforzarla ahí no es el arreglo.
+//
+// Se exige un pedido EXPLÍCITO de que alguien ejecute el proceso, que es la
+// línea que el prompt ya traza ("quiero agendar una valoración", "¿me pueden
+// agendar?" → se escalan) frente a las preguntas SOBRE el proceso ("¿cuánto
+// cuesta la cita?", "¿qué días hay citas?" → no se escalan). Esas últimas van
+// en EXCLUSIONES y se revisan primero: son la pregunta más común de todas y
+// escalarlas inundaría al equipo.
+//
+// Costo medido sobre los 7 días al 7-oct: 10 conversaciones que hoy no escalan
+// y pasarían a escalar, ~1,4 por día.
+const PEDIDO_DE_CITA_EXCLUSIONES = [
+  /(cu[áa]nto|qu[ée]) (cuesta|vale|precio|costo)[^.?!]{0,30}(cita|valoraci|consulta)/i,
+  /(cita|valoraci[óo]n|consulta)[^.?!]{0,20}(tiene|cuesta|vale)[^.?!]{0,15}(costo|precio)/i,
+  /cobran[^.?!]{0,25}(cita|valoraci|consulta)/i,
+  /qu[ée] d[íi]as? (hay|tienen|atienden)/i,
+  /(d[óo]nde|c[óo]mo) (es|queda|est[áa])[^.?!]{0,15}(la cita|la valoraci)/i,
+  /cu[áa]nto dura[^.?!]{0,20}(la cita|la valoraci|la consulta)/i,
+  /qu[ée] necesito para[^.?!]{0,20}(la cita|la valoraci)/i,
+];
+
+// Dos detalles que costaron un falso positivo cada uno al probar la lista
+// contra mensajes reales, y los dos importan más de lo que parece:
+//
+//   - \b alrededor de "cita". Sin los límites de palabra, "soliCITAr" contiene
+//     "cita", y entonces "Me gustaría solicitar más información" —que es el
+//     mensaje AUTOMÁTICO del anuncio de Meta, el más frecuente de todos—
+//     entraba como pedido de cita. Eso habría escalado cientos de clics de
+//     anuncio por día.
+//   - (?<!\bno ) antes del verbo. "No quisiera agendar una cita sin antes tener
+//     un panorama de precios" es exactamente lo contrario de un pedido: esa
+//     paciente dijo que NO quiere agendar todavía. Caso real del 6-oct.
+const PEDIDO_DE_CITA_PATTERNS = [
+  /(?<!\bno )(quiero|quisiera|me gustar[íi]a|deseo|necesito)[^.?!]{0,25}(una |la |)\b(citas?|valoraci[óo]n)\b/i,
+  /(?<!\bno )(quiero|quisiera|me gustar[íi]a|deseo|necesito) (agendar|coordinar|reservar|separar)\b/i,
+  /(puedo|podr[íi]a|se puede)[^.?!]{0,15}(sacar|reservar|tener|hacer|agendar|separar)[^.?!]{0,10}(una |la )?\b(citas?|valoraci[óo]n)\b/i,
+  /(me pueden|pueden|podr[íi]an) agendar\b/i,
+  /ag[eé]ndeme\b|ag[eé]nde?nme\b/i,
+  /cu[áa]ndo puedo (tener|ir|pasar|venir|agendar)\b/i,
+  /quiero que me contacten\b/i,
+];
+
+function pidioCitaExplicitamente(text) {
+  const t = String(text || "");
+  if (!t.trim()) return false;
+  if (PEDIDO_DE_CITA_EXCLUSIONES.some((re) => re.test(t))) return false;
+  return PEDIDO_DE_CITA_PATTERNS.some((re) => re.test(t));
 }
 
 // Frases con las que Sofía explica que no va a seguir la conversación, en vez de
