@@ -1707,7 +1707,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // sigan leyendo igual.
   const { texto: rawText, filtrada: notaFiltrada } = quitarNotaFiltrada(textBlock?.text ?? "");
   if (notaFiltrada) console.log("SOFIA_NOTA_NOCTURNA_FILTRADA", JSON.stringify({ prospectId }));
-  let { reply, escalated: taggedEscalated, escalation_reason: taggedReason, shouldClose, silenced, silenceTag } =
+  let { reply, escalated: taggedEscalated, escalation_reason: taggedReason, shouldClose, silenced, silenceTag, programacion } =
     parseEscalation(rawText);
 
   // Cuando Sofía decide no contestarle a alguien (coqueteo, mensajes sin
@@ -2009,6 +2009,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     tamizaje: agility.tamizaje,
     phone,
     patientName,
+    programacion,
   });
 
   // Después del upsert, porque puede ser el que crea la fila.
@@ -2164,13 +2165,77 @@ function parseEscalation(rawText) {
   // manda ese texto — contestarle de más a un curioso es mucho menos grave
   // que dejar callado a un paciente.
   const silenceMatch = rawText.match(NO_RESPONDER_TAG);
+  // [PROGRAMAR: motivo | fecha] — la paciente quiere operarse pero el tamizaje
+  // dio positivo, así que todavía no puede. No es un descarte: es una venta con
+  // fecha. El caso queda guardado en la cola de seguimiento con el día en que
+  // vuelve, y NO ocupa a un asesor hoy (salvo que además venga [ESCALAR],
+  // que el prompt reserva para cuando la paciente insiste o le falta poco).
+  //
+  // La fecha que manda Sofía es cuándo TERMINA la situación, no cuándo volver:
+  // el cálculo de los 6 meses se hace acá para que no dependa de que el modelo
+  // sume bien.
+  const programarMatch = rawText.match(PROGRAMAR_TAG);
+  const programacion = programarMatch ? parseProgramacion(programarMatch[1]) : null;
   const reply = rawText
     .replace(/\s*\[ESCALAR:?\s*([^\]]*)\]\s*/i, " ")
     .replace(/\s*\[CERRAR\]\s*/i, " ")
+    .replace(new RegExp(`\\s*${PROGRAMAR_TAG.source}\\s*`, "gi"), " ")
     .replace(new RegExp(`\\s*${NO_RESPONDER_TAG.source}\\s*`, "gi"), " ")
     .trim();
   const silenced = !escalated && !!silenceMatch && reply === "";
-  return { reply, escalated, escalation_reason, shouldClose, silenced, silenceTag: silenced ? silenceMatch[0] : null };
+  return { reply, escalated, escalation_reason, shouldClose, silenced, silenceTag: silenced ? silenceMatch[0] : null, programacion };
+}
+
+const PROGRAMAR_TAG = /\[PROGRAMAR:?\s*([^\]]*)\]/i;
+const MOTIVOS_PROGRAMACION = new Set(["lactancia", "embarazo", "peso"]);
+
+// Cuánto se espera desde que termina cada situación, según la base: seis meses
+// para lactancia y embarazo, y para el peso basta con que esté estable, así que
+// se revisa a los tres.
+const ESPERA_MESES = { lactancia: 6, embarazo: 6, peso: 3 };
+
+// Si la paciente no supo decir cuándo termina, no se inventa una fecha lejana:
+// se revisa en tres meses y se le vuelve a preguntar. Mejor preguntar de más
+// que perderla por haberla archivado hasta el año entrante.
+const REVISAR_SI_NO_SABE_MESES = 3;
+
+function sumarMeses(fecha, meses) {
+  const d = new Date(fecha.getTime());
+  const diaOriginal = d.getUTCDate();
+  d.setUTCMonth(d.getUTCMonth() + meses);
+  // 31 de agosto + 6 meses daría 3 de marzo; se recorta a fin de mes.
+  if (d.getUTCDate() < diaOriginal) d.setUTCDate(0);
+  return d;
+}
+
+// "lactancia | 2027-03" → { motivo, esperarHasta, fechaFin }
+// Devuelve null si el motivo no es uno de los tres: el prompt es explícito y
+// una etiqueta mal formada no debe sacar a la paciente de la cola normal.
+function parseProgramacion(contenido) {
+  const [motivoRaw, fechaRaw] = String(contenido || "").split("|").map((x) => x.trim().toLowerCase());
+  const motivo = (motivoRaw || "").replace(/[^a-záéíóúñ]/g, "");
+  if (!MOTIVOS_PROGRAMACION.has(motivo)) return null;
+
+  const m = (fechaRaw || "").match(/^(\d{4})-(\d{1,2})$/);
+  const ahora = new Date();
+  if (!m) {
+    return {
+      motivo,
+      fechaFin: null,
+      esperarHasta: sumarMeses(ahora, REVISAR_SI_NO_SABE_MESES),
+      sabeCuandoTermina: false,
+    };
+  }
+  // Día 1 del mes que dijo. Si ya pasó, se cuenta desde hoy: una paciente que
+  // dice "terminé en enero" estando en marzo no tiene que esperar más por eso.
+  const fechaFin = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, 1));
+  const base = fechaFin > ahora ? fechaFin : ahora;
+  return {
+    motivo,
+    fechaFin,
+    esperarHasta: sumarMeses(base, ESPERA_MESES[motivo]),
+    sabeCuandoTermina: true,
+  };
 }
 
 const NO_RESPONDER_TAG = /\[NO_RESPONDER:?\s*[^\]]*\]/i;
@@ -3210,6 +3275,56 @@ async function getConversationState(env, phoneHash) {
 // exhaustion — never throws, so a persistent failure here still can't abort
 // processInboundMessage() before the caller's own reply/escalation work
 // (which all happens before this is called) has already run.
+// Deja a la paciente en la cola de seguimiento con fecha de retorno, en vez de
+// pasarla a un asesor para que le repita lo que Sofía ya le dijo. Medido en
+// setiembre de 2026: de tres pacientes en lactancia traspasadas, las tres
+// recibieron del asesor el mismo "espere los seis meses" y ninguna agendó.
+//
+// La vista sofia_followup_queue hace el resto sola: mientras esperar_hasta sea
+// futuro el caso sale de pendientes y no se archiva nunca; el día que llega
+// vuelve marcado con volvio_de_programada para que el asesor sepa que esta
+// señora ya habló con nosotros y no la salude como lead nuevo.
+//
+// No pisa un estado que un humano haya puesto a mano (contactado, agendó,
+// descartado): si alguien ya trabajó el caso, su decisión manda.
+async function programarSeguimiento(env, conversationId, { motivo, esperarHasta, sabeCuandoTermina, fechaFin }) {
+  const nota = sabeCuandoTermina
+    ? `Programada por ${motivo}. La paciente indicó que termina en ${fechaFin.toISOString().slice(0, 7)}.`
+    : `Programada por ${motivo}. No supo decir cuándo termina: se revisa en esta fecha y se le vuelve a preguntar.`;
+  try {
+    const res = await fetchWithTimeout(
+      `${env.SUPABASE_URL}/rest/v1/sofia_followup_status?on_conflict=conversation_id`,
+      {
+        method: "POST",
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "resolution=merge-duplicates,return=minimal",
+        },
+        body: JSON.stringify({
+          conversation_id: conversationId,
+          estado: "programado",
+          esperar_hasta: esperarHasta.toISOString(),
+          motivo_programacion: motivo,
+          nota,
+          actualizado_por: "Sofía",
+          updated_at: new Date().toISOString(),
+        }),
+      }
+    );
+    if (!res.ok) {
+      console.log("SOFIA_PROGRAMAR_FALLO", JSON.stringify({ conversationId, motivo, status: res.status }));
+      return;
+    }
+    console.log("SOFIA_PROGRAMADA", JSON.stringify({
+      conversationId, motivo, vuelve: esperarHasta.toISOString().slice(0, 10), sabeCuandoTermina,
+    }));
+  } catch (e) {
+    console.log("SOFIA_PROGRAMAR_FALLO", JSON.stringify({ conversationId, motivo, error: String(e?.message || e) }));
+  }
+}
+
 async function upsertConversation(env, {
   phoneHash,
   prospectId,
@@ -3224,6 +3339,7 @@ async function upsertConversation(env, {
   tamizaje,
   patientName,
   phone,
+  programacion,
 }) {
   const headers = {
     apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -3297,6 +3413,9 @@ async function upsertConversation(env, {
               : escalationReason;
 
         let writeRes;
+        // Se arrastra el id de la conversación para poder programarla después:
+        // en el PATCH ya lo tenemos, en el INSERT hay que pedir que vuelva.
+        let conversationId = existing[0]?.id ?? null;
         if (existing[0]) {
           writeRes = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_conversations?id=eq.${existing[0].id}`, {
             method: "PATCH",
@@ -3335,7 +3454,10 @@ async function upsertConversation(env, {
         } else {
           writeRes = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_conversations`, {
             method: "POST",
-            headers: { ...headers, Prefer: "return=minimal" },
+            // representation en vez de minimal: la fila recién creada es la
+            // única forma de saber su id, y sin id no se puede programar a la
+            // paciente (la cola de seguimiento se indexa por conversación).
+            headers: { ...headers, Prefer: "return=representation" },
             body: JSON.stringify({
               phone_hash: phoneHash,
               prospect_id: prospectId ?? null,
@@ -3356,7 +3478,19 @@ async function upsertConversation(env, {
           });
         }
 
-        if (writeRes.ok) return;
+        if (writeRes.ok) {
+          if (!conversationId) {
+            const creada = await writeRes.json().catch(() => null);
+            conversationId = Array.isArray(creada) ? creada[0]?.id ?? null : creada?.id ?? null;
+          }
+          // La programación va después y aparte: si falla, la conversación ya
+          // quedó bien guardada y la paciente sigue en la cola normal. Perder
+          // la fecha es malo, perder el registro entero sería peor.
+          if (programacion && conversationId) {
+            await programarSeguimiento(env, conversationId, programacion);
+          }
+          return;
+        }
         lastFailure = `write failed: http ${writeRes.status}`;
       }
     } catch (err) {
