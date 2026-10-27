@@ -2864,14 +2864,30 @@ const INSTRUCCIONES_PROMOCIONES =
 //   - construirCatalogo(): la lista de nombres, siempre, en la rama del RAG.
 //   - sumarFichasNombradas(): la ficha entera cuando el paciente la nombra.
 //
-// Un tratamiento es una línea "**Nombre**" dentro de una subsección de las
-// secciones 4 y 5, o una subsección entera ("### 5.5 Ultherapy") cuando no
-// tiene nombres en negrita. Es el mismo corte con el que reindex.js (en el
-// repo cecmarketing) arma los fragmentos, así que la ficha es el mismo texto
-// que el fragmento guardado.
+// Un tratamiento es una línea "**Nombre**" dentro de una subsección numerada
+// de las secciones 4 y 5, o una subsección entera ("### 5.5 Ultherapy") cuando
+// no tiene nombres en negrita.
+//
+// Lo que se excluye y por qué: hasta el 2026-10-27 el catálogo le decía a Sofía
+// que el CEC ofrece "Lactancia.", "Cambio de peso activo." y "Embarazo o planes
+// de embarazo en los próximos 2 años" — son los párrafos en negrita de "### Por
+// qué se espera", que explican por qué una cirugía se posterga. "Lactancia."
+// encima se ganaba un cupo de ficha en 851 de los 75.383 mensajes de paciente
+// medidos, y en dos le quitó el lugar a una ficha real (en uno la paciente
+// comparaba Mia® con Preservé y Preservé quedó fuera). Entraban también las
+// subsecciones 4.0, 4.0a y 4.4, que son procedimiento interno, y la guía de
+// decisión de lifting facial, que el propio texto marca como uso interno.
+//
+// Es el mismo corte con el que reindex.js (en el repo cecmarketing) arma los
+// fragmentos, así que la ficha es el mismo texto que el fragmento guardado.
 function indexarTratamientos(knowledgeBase) {
   if (!knowledgeBase) return [];
   const esLineaDeNombre = (l) => /^\*\*[^*]+\*\*/.test(l.trim());
+  // Ningún nombre de tratamiento lleva dos puntos; los títulos que los llevan
+  // son guías de uso interno ("Guía de decisión: lifting facial quirúrgico
+  // vs. no quirúrgico", "Disponibilidad para valoración quirúrgica: solo
+  // entre semana").
+  const esNombreDeTratamiento = (n) => !n.includes(":");
   const tratamientos = [];
 
   for (const seccion of knowledgeBase.split(/(?=^## )/m)) {
@@ -2881,11 +2897,15 @@ function indexarTratamientos(knowledgeBase) {
     for (const sub of seccion.split(/(?=^### )/m).map((s) => s.trim())) {
       const lineas = sub.split("\n");
       const encabezado = lineas[0];
-      if (!encabezado.startsWith("### ")) continue;
+      // Sin número no es una subsección del catálogo: es prosa de la de arriba.
+      if (!/^### *\d/.test(encabezado)) continue;
       const grupo = encabezado.replace(/^###\s*[\d.]+[a-z]?\s*/, "").trim();
       const noSeOfrece = /no se ofrec/i.test(grupo);
 
       if (!lineas.some(esLineaDeNombre)) {
+        // En la 4 el título de una subsección sin negritas es procedimiento
+        // interno; en la 5 sí es el tratamiento.
+        if (/^## 4\.\s/.test(seccion) || !esNombreDeTratamiento(grupo)) continue;
         tratamientos.push({ nombre: grupo, grupo: tituloSeccion, noSeOfrece, ficha: sub });
         continue;
       }
@@ -2894,6 +2914,10 @@ function indexarTratamientos(knowledgeBase) {
       for (const linea of lineas.slice(1)) {
         if (esLineaDeNombre(linea)) {
           const nombre = linea.trim().match(/^\*\*([^*]+)\*\*/)[1].trim();
+          if (!esNombreDeTratamiento(nombre)) {
+            actual = null;
+            continue;
+          }
           actual = { nombre, grupo, noSeOfrece, lineas: [encabezado, linea] };
           tratamientos.push(actual);
         } else if (actual) {
