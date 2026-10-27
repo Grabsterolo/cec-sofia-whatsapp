@@ -4399,10 +4399,23 @@ const STUCK_ESCALATION_WINDOW_HOURS = 72;
 // conversation nobody replies to after the failed handoff doesn't sit
 // forever assigned to nobody real. Never archives, closes, or messages the
 // patient — the only side effect is retrying a Zenvia agent reassignment.
-// Cuántos traspasos pendientes por corrida. Cada uno gasta 2 subrequests
-// (chequeo de dueño + transferencia) más el PATCH. Con corridas cada 20 minutos
-// alcanza de sobra para los ~28 que se acumulan en una noche.
-const MAX_TRASPASOS_PENDIENTES_POR_CORRIDA = 20;
+// Cuántos traspasos pendientes por corrida. Cada uno gasta ~7 subrequests
+// (dueño + nota + round robin + transferencia + registro + cierre).
+//
+// Era 20, calculado sobre "los ~28 que se acumulan en una noche". Ese número
+// solo describe una noche de semana. El domingo el equipo no trabaja, así que la
+// cola del lunes es la del sábado desde las 4 p.m. más el domingo completo:
+// medido el 2026-10-12, 97 casos. Con 20 por corrida eso sale en cinco oleadas y
+// el último caso se asigna a las 9:20 a.m. (el 2026-10-05 fueron 57 en tres
+// oleadas, la última 8:41).
+//
+// 40: la cola del lunes sale en tres corridas y queda liberada a las 8:40. No se
+// sube más porque el tope real no es este número sino el presupuesto de
+// subrequests de la invocación —1000, compartido con retryStuckEscalations,
+// verificarHandoffs y escalarEsperasVencidas, que corren en el mismo cron—.
+// 40 × 7 = 280 deja margen de sobra; 97 de una sola vez lo agota a mitad de la
+// cola, y los que quedan afuera esperan a la corrida siguiente igual.
+const MAX_TRASPASOS_PENDIENTES_POR_CORRIDA = 40;
 
 // Cuántos mensajes de la conversación se le pasan al asesor en la nota. Tiene
 // que cubrir desde antes del traspaso hasta el final: de noche la conversación
