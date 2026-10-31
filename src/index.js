@@ -1756,7 +1756,16 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // instead of relying on the model to tag it correctly every time, same
   // spirit as the finalReply fallback above (2026-08-10 fix) for the
   // opposite gap (tagged but wrote nothing).
-  const impliedHandoff = !taggedEscalated && mentionsHandoffPromise(reply);
+  //
+  // `!programacion` desde el 2026-10-31, por el mismo motivo que ya tenía
+  // pedidoDeCitaSinTraspaso: si Sofía etiquetó [PROGRAMAR], decidió a
+  // conciencia dejar a la paciente esperando una fecha futura, y el mensaje de
+  // una programada SIEMPRE promete contacto ("nuestro equipo la contacta
+  // cuando se acerque el momento"). Sin este guardia, la red ampliada mandaba
+  // al call center 76 pacientes de octubre que están programadas para dentro
+  // de meses o años. La cola de seguimiento ya las tiene: ver
+  // programarSeguimiento() y la vista sofia_followup_queue.
+  const impliedHandoff = !taggedEscalated && !programacion && mentionsHandoffPromise(reply);
   // La otra mitad del problema: la paciente pidió la cita y Sofía no escaló.
   // Acá no hay frase de Sofía que detectar —el fallo es justamente que no dijo
   // nada— así que se mira lo que escribió LA PACIENTE. Ver el comentario largo
@@ -2100,6 +2109,50 @@ const HANDOFF_PROMISE_PATTERNS = [
   // paciente — inocente y muy frecuente (sin el destino, esta sola regla
   // sumaba 220 personas en un mes).
   /le (paso|traslado|comparto) (la |su |esta )?(informaci[óo]n|caso|consulta|duda|pregunta)[^.?!]{0,25} al (equipo|asesor|departamento|m[ée]dico|[áa]rea)/i,
+  // Agregadas el 2026-10-31 por el caso de Floria (Radiesse papada, prospecto
+  // 69d16760c513d3ffbc3faa73): Sofía le prometió contacto CINCO veces y solo la
+  // primera —"le voy a pasar"— cayó en la red. La paciente llegó a preguntar
+  // "no te comprendo, ¿quién me coordina la cita?", y la respuesta que se lo
+  // aclaró fue justamente una de las cuatro que no activaron nada.
+  //
+  // Las reglas anteriores están todas escritas sobre el mismo molde: futuro
+  // perifrástico ("le VA A contactar") y con el equipo pegado al verbo. Eso
+  // deja fuera tres formas que Sofía usa tanto o más que esa:
+  //
+  //   1. "le ESTARÁN contactando", "el equipo le CONTACTA", "le ESCRIBEN". Es
+  //      el hueco más grande: el futuro perifrástico es solo una de las maneras
+  //      de prometer, y ni siquiera la más común de noche, que es justo cuando
+  //      más se promete ("mañana a partir de las 8 le estarán contactando").
+  //   2. La ventana de 20 caracteres entre "equipo" y "le va a". "Nuestro
+  //      equipo DE ASESORES ES QUIEN le va a contactar" tiene 22 y se escapaba
+  //      por dos caracteres. Acá el futuro perifrástico ya no exige al equipo
+  //      cerca: Sofía habla en primera persona, así que un "le va a contactar"
+  //      en tercera siempre es alguien más, y ese alguien es el equipo.
+  //   3. Verbos que no son de contacto pero prometen lo mismo: "el equipo le
+  //      CONFIRMA el horario", "le va a QUEDAR COORDINADA esa cita".
+  //
+  // Medido sobre las 8.407 sesiones de octubre: entran 626 conversaciones más.
+  // De esas, 477 ya habían llegado a un asesor por otra vía (la red marca un
+  // mensaje de más y no cambia nada), 76 son pacientes programadas —que NO
+  // deben escalar, y de eso se encarga el guardia de `programacion` donde se
+  // llama a esta función— y 73 son traspasos nuevos de verdad: 2,4 por día que
+  // hasta hoy no llegaban a nadie.
+  //
+  // Ojo con el \b final: en JavaScript es ASCII, así que después de una vocal
+  // acentuada NO hay frontera de palabra y /contactar[áa]\b/ no acierta nunca
+  // sobre "contactará". Por eso estas cierran con un lookahead de letras y no
+  // con \b. Dos mediciones salieron mal por esto antes de verlo.
+  //
+  // "llaman" a secas queda fuera a propósito: "a veces LO LLAMAN Geneo X" es
+  // nombrar un tratamiento, no prometer una llamada, y eran los dos únicos
+  // falsos positivos entre los 73. Con el equipo cerca (la regla del equipo
+  // como sujeto) sí se acepta, porque ahí ya no hay ambigüedad.
+  /(le|la|lo) (va|van) a (estar )?(contact|escrib|llam|comunic)[a-záéíóú]*/i,
+  /(le|la|lo) estar[áa]n? (contactando|escribiendo|llamando|comunicando)/i,
+  /(le|la|lo) (contactan|escriben|contactar[áa]n|escribir[áa]n|llamar[áa]n)(?![a-záéíóúñ])/i,
+  /(el |nuestro |un |uno de nuestros )?(equipo|asesor[ae]?s?)[^.?!]{0,40}(le|la|lo) (contacta|escribe|llama|comunica|contactar[áa]|escribir[áa]|llamar[áa]|confirmar[áa]|confirma|coordina)(?![a-záéíóúñ])/i,
+  /(le|la|lo) (paso|conecto|pongo) con (nuestro |el |un )?(equipo|asesor[ae]?s?)/i,
+  /(va a quedar|queda|le dejo|le dejamos) (la cita |su cita |esa cita )?coordinad[ao]/i,
 ];
 
 function mentionsHandoffPromise(text) {
