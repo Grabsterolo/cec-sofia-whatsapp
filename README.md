@@ -2754,6 +2754,26 @@ por qué interpretar un arreglo vacío. En particular: **cero filas no significa
 contrasta contra `messagingStarted` de `/api/meta-metrics` en el dashboard, que
 es el conteo que da Meta de conversaciones iniciadas desde anuncios.
 
+### El primer mes no midió nada (2026-10-06 → 2026-11-05)
+
+La captura estuvo un mes escribiendo en una puerta cerrada. `event_type` tiene
+un CHECK en `sofia_reliability_events` y los dos tipos de acá nunca se
+agregaron a esa lista, así que Postgres rechazó **todos** los inserts. Y
+`logReliabilityEvent()` no miraba `res.ok`, de modo que el rechazo no dejó
+rastro en ninguna parte.
+
+Cero filas `ctwa_*` en todo ese mes, cuando la muestra ciega del 2% sobre unas
+7.000 conversaciones mensuales tenía que dar unas 140.
+
+Arreglado el 2026-11-05 por los dos lados: la migración
+`20261105140000_admitir_los_eventos_de_atribucion.sql` en `cecmarketing`, y
+`logReliabilityEvent()` acá, que ahora avisa cuando el insert no entra.
+
+**La señal de que el instrumento está roto, y no de que no hay datos, es la
+muestra de control en cero**: esa dispara con o sin anuncios. Si este
+diagnóstico vuelve a dar cero alguna vez, mirar primero el control — la
+lectura "Zenvia no lo manda" solo vale si el control trae filas.
+
 ### La trampa para cuando toque guardarlo
 
 El `ctwa_clid` llega **solo en el primer mensaje** de la conversación. Si se

@@ -3725,9 +3725,24 @@ async function upsertConversation(env, {
 // so a failure writing this row is never the reason a patient is left
 // without a reply — the caller has already sent (or attempted) its own
 // reply/escalation by the time this runs.
+//
+// ESTA ES LA ÚLTIMA RED, así que no puede tener fallas silenciosas propias.
+// Hasta el 2026-11-05 hacía el fetch y no miraba la respuesta: solo atrapaba
+// errores de red, y un rechazo de Postgres —un 400— se tragaba entero.
+//
+// Lo que costó: la tabla tiene un CHECK sobre `event_type`, y los dos tipos
+// del diagnóstico de atribución (`ctwa_payload_anuncio` y
+// `ctwa_payload_muestra`, sección 5v) nunca se agregaron a esa lista. Desde el
+// 2026-10-06, CADA insert del diagnóstico fue rechazado y ninguno dejó rastro:
+// un mes capturando nada, con el dashboard mostrando "sin capturas" como si
+// fuera un hallazgo sobre Zenvia.
+//
+// Un 400 acá casi siempre es lo mismo: alguien agregó un `eventType` nuevo y
+// se olvidó de la migración que lo admite. Por eso el mensaje lo dice con
+// todas las letras en vez de dejar el status pelado.
 async function logReliabilityEvent(env, { eventType, prospectId, phoneHash, detail }) {
   try {
-    await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_reliability_events`, {
+    const res = await fetch(`${env.SUPABASE_URL}/rest/v1/sofia_reliability_events`, {
       method: "POST",
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -3742,8 +3757,22 @@ async function logReliabilityEvent(env, { eventType, prospectId, phoneHash, deta
         detail: detail ?? null,
       }),
     });
+
+    if (!res.ok) {
+      // El cuerpo del error de PostgREST trae el nombre de la restricción que
+      // falló, no datos de la paciente. El `detail` del evento sí puede
+      // traerlos, y por eso no se imprime.
+      const cuerpo = await res.text().catch(() => "(sin cuerpo)");
+      const pista = res.status === 400
+        ? " — si es el CHECK de event_type, falta la migración que admita este tipo"
+        : "";
+      console.error(
+        `logReliabilityEvent RECHAZADO: el evento "${eventType}" no se guardó. `
+        + `HTTP ${res.status}${pista}. Respuesta: ${cuerpo.slice(0, 300)}`
+      );
+    }
   } catch (err) {
-    console.error("logReliabilityEvent failed", err);
+    console.error(`logReliabilityEvent falló en red: el evento "${eventType}" no se guardó.`, err);
   }
 }
 
