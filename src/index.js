@@ -2103,6 +2103,24 @@ const HANDOFF_PROMISE_PATTERNS = [
   // pregunta. Verificado: con estas reglas esos 18 no entran.
   /(el |nuestro )?equipo[^.?!]{0,20}(le|la) va a (estar )?(contact|escrib|llam|comunic)/i,
   /(lo|la) voy a poner en contacto/i,
+  // Agregadas el 2026-11-09. Medidas sobre los 30 días al 9-nov: entre las dos
+  // agarran 7 mensajes que la lista no veía, cada uno una paciente a la que
+  // Sofía le prometió contacto y que no quedó registrada.
+  //
+  //   - "le paso CON el equipo". La regla de abajo exige un objeto ("le paso su
+  //     caso al equipo") y Sofía también dice la forma sin objeto: "con gusto le
+  //     paso con nuestro equipo". Se incluye el futuro ("le pasaré con") porque
+  //     así apareció en producción.
+  //   - "el equipo SE PONDRÁ en contacto". La lista ya tenía "le va a
+  //     contactar" y "lo voy a poner en contacto", pero no la forma reflexiva,
+  //     que es la que Sofía usa cuando habla del equipo en tercera persona.
+  //
+  // Revisados uno por uno los 7: los 7 son promesas reales. El único que podría
+  // no serlo ("cuando su peso esté estable en unos 6 meses, nuestro equipo se
+  // pondrá en contacto") es una programada, y para esas la red ya no corre por
+  // el guardia `!programacion` que se puso el 2026-10-31.
+  /\ble (paso|pasar[ée]) con (el |nuestro |mi )?(equipo|asesor|compa[ñn]er)/i,
+  /\b(el |nuestro )?equipo[^.?!]{0,25}se (va a poner|pondr[áa]) en contacto/i,
   // "le paso LA información al equipo": la regla de arriba exige "su"/"esta" y
   // Sofía dice "la información" casi siempre. Se exige el destino ("al equipo")
   // porque "le comparto la información" sin destino es Sofía informándole a la
@@ -4424,20 +4442,69 @@ async function transferToNextAgentInPool(env, prospectId, { phoneHash } = {}) {
 // normal, donde decidir y transferir es el mismo instante. Los dos barridos sí
 // lo pasan, porque ahí pueden separarse horas — ver la migración
 // handoffs_separar_decision_de_asignacion. asignado_en siempre es ahora.
+// Un traspaso por EPISODIO, no por paciente — corregido el 2026-11-09
+// ---------------------------------------------------------------------------
+//
+// Hasta hoy esto insertaba con `on_conflict=prospect_id` y
+// `resolution=ignore-duplicates` contra un índice único sobre prospect_id. Eso
+// cumplía su propósito (un reintento no duplica ni pisa la hora original) pero
+// tenía un efecto que nadie midió: una paciente que ya pasó a un asesor NO
+// podía generar una fila nueva nunca más. Medido contra producción el
+// 2026-11-09: 3.294 filas y 3.294 prospectos distintos, ni uno con dos.
+//
+// Lo que se perdía era el REGISTRO, no el traspaso: los cinco sitios que llaman
+// a esta función ya corrieron transferToNextAgentInPool() antes, así que la
+// paciente sí llegó a un asesor en Zenvia. Pero el informe diario, la
+// verificación y los barridos no veían ese segundo traspaso. En el fin de
+// semana del 6 al 9 de noviembre fueron 4 sobre 150 registrados.
+//
+// Ahora la exclusión es por episodio: si ya hay un traspaso ABIERTO de este
+// prospecto, este es un reintento y no se registra; si el anterior está cerrado
+// (respondido o sin_respuesta), esta es una vuelta nueva y sí se registra. La
+// consulta previa es la que decide; el índice parcial de la migración
+// 20261109160000 es solo la red por si dos invocaciones coinciden, y por eso un
+// 409 no es un error sino exactamente ese caso.
+//
+// Mientras la migración no esté aplicada sigue vivo el unique viejo, y entonces
+// el 409 lo da la vuelta legítima. Se registra aparte para que se vea en el log
+// que falta aplicarla, en vez de confundirse con un reintento normal.
+async function hayTraspasoAbierto(env, prospectId) {
+  try {
+    const res = await fetchWithTimeout(
+      `${env.SUPABASE_URL}/rest/v1/sofia_handoffs` +
+        `?select=id&prospect_id=eq.${encodeURIComponent(prospectId)}` +
+        `&estado=eq.pendiente&limit=1`,
+      {
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        },
+      }
+    );
+    if (!res.ok) return null; // no se pudo saber: que decida el índice
+    const filas = await res.json();
+    return Array.isArray(filas) && filas.length > 0;
+  } catch (err) {
+    console.error("hayTraspasoAbierto threw", err);
+    return null;
+  }
+}
+
 async function registrarHandoff(env, { prospectId, phoneHash, motivo, agenteAsignado, traspasoOk, escaladoEn }) {
   if (!prospectId) return;
   try {
-    // `on_conflict=prospect_id` no es opcional: sin él, PostgREST ignora el
-    // Prefer y devuelve 409 al chocar con el índice único. Probado contra
-    // producción el 2026-09-29 — el código "funcionaba" igual, pero cada
-    // reintento habría dejado un error en el log.
-    const res = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_handoffs?on_conflict=prospect_id`, {
+    if (await hayTraspasoAbierto(env, prospectId)) {
+      // Reintento de un traspaso que ya está esperando respuesta. No se toca la
+      // fila: su escalado_en es el que hay que medir.
+      return;
+    }
+    const res = await fetchWithTimeout(`${env.SUPABASE_URL}/rest/v1/sofia_handoffs`, {
       method: "POST",
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
         Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
         "Content-Type": "application/json",
-        Prefer: "return=minimal,resolution=ignore-duplicates",
+        Prefer: "return=minimal",
       },
       body: JSON.stringify({
         prospect_id: prospectId,
@@ -4448,6 +4515,16 @@ async function registrarHandoff(env, { prospectId, phoneHash, motivo, agenteAsig
         ...(escaladoEn ? { escalado_en: escaladoEn } : {}),
       }),
     });
+    if (res.status === 409) {
+      console.log(
+        "SOFIA_HANDOFF_409",
+        JSON.stringify({
+          prospectId,
+          nota: "choque con un índice único: o dos invocaciones a la vez, o falta aplicar la migración 20261109160000",
+        })
+      );
+      return;
+    }
     if (!res.ok) console.error("registrarHandoff falló", res.status, prospectId);
   } catch (err) {
     console.error("registrarHandoff threw", err);
