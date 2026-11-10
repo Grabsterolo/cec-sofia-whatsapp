@@ -398,6 +398,26 @@ conversaciones al mes y se cerró hoy, reabierto por la puerta de al lado.
 
 Si la v1 agrega preguntas, **tiene que agregarlas a esa lista en el mismo commit**.
 
+### 6.6b La marca de la tercera cola se queda pegada (revisión del 2026-11-10, 17:30)
+
+Encontrado revisando la salud de lo que se desplegó hoy, no en la auditoría.
+
+El barrido `escalarOfrecimientosSinRespuesta()` (`:4952`) filtra por
+`escalated=is.false`, con razón: si el caso ya escaló por otro camino, ya tiene
+dueño. Pero entonces **la marca de esa fila nunca se limpia**, porque lo único que
+la borra es `limpiarOfrecimientoSinRespuesta()`, que corre desde el barrido o
+cuando la paciente vuelve a escribir — y después de escalar, Sofía está muda.
+
+Caso vivo de hoy: una conversación de rinoplastia con 11 mensajes, marcada a las
+18:33 UTC, escalada después por el tope de mensajes, y a las 23:30 UTC seguía
+marcada. Es 1 de 6 marcas vivas.
+
+No hace daño hoy: la guarda impide el traspaso doble y nadie cuenta esas marcas.
+Lo que deja es una columna que no se puede contar, y este trabajo pensaba
+apoyarse en ella. El arreglo es una línea: limpiar la marca en los caminos que
+escalan por otro motivo, igual que ya se limpian `traspaso_pendiente_desde` y
+`escalacion_espera_desde` (`:1577`, `:2070`).
+
 ### 6.7 El clasificador se saltea a partir del tercer mensaje
 
 Esto es lo más importante de la sección 2.6 del diseño y no está en el planteo.
