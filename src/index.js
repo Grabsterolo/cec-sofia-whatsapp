@@ -2233,10 +2233,24 @@ const HANDOFF_PROMISE_PATTERNS = [
 // Se exige la pregunta entera (de "¿" a "?") para no confundir el ofrecimiento
 // con una mención cualquiera de la palabra coordinar, y el verbo de coordinar
 // o agendar: "¿le cuento más?" no es un ofrecimiento del paso siguiente.
+// Las colas de 40 y 30 caracteres eran mías y estaban mal medidas (2026-11-10,
+// corregido el mismo día por la auditoría de las tres capas). Las saqué de los
+// ejemplos cortos que tenía a mano, pero Sofía casi siempre explica PARA QUÉ es
+// la valoración, y esa explicación va después del verbo: "¿Le gustaría
+// coordinar su valoración para definir el plan con el médico?" son 51
+// caracteres de cola y se escapaba.
+//
+// Se ensancha solo la COLA, a 140. La cabeza se queda en 60 a propósito: con
+// 140 de los dos lados se enlazaría un "¿Le gustaría" con un "coordinar" que
+// esté en otra parte de la frase y no sea el ofrecimiento.
+//
+// Medido sobre las conversaciones creadas entre el 11-oct y el 10-nov: de 95 a
+// 147 conversaciones, +52. Las 52 se revisaron una por una y las 52 son
+// ofrecimientos del paso siguiente, sin un solo falso positivo.
 const OFRECIMIENTO_DE_COORDINAR = [
-  /¿(le gustar[íi]a|quiere|desea|gusta)[^?]{0,60}(coordin|agend|aparta|reserv)[^?]{0,40}\?/i,
-  /¿(coordinamos|agendamos|avanzamos)[^?]{0,40}\?/i,
-  /¿le ayudo a (coordinar|agendar)[^?]{0,30}\?/i,
+  /¿(le gustar[íi]a|quiere|desea|gusta)[^?]{0,60}(coordin|agend|aparta|reserv)[^?]{0,140}\?/i,
+  /¿(coordinamos|agendamos|avanzamos)[^?]{0,140}\?/i,
+  /¿le ayudo a (coordinar|agendar)[^?]{0,140}\?/i,
 ];
 function ofrecioCoordinar(text) {
   return OFRECIMIENTO_DE_COORDINAR.some((re) => re.test(String(text || "")));
