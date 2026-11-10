@@ -1776,7 +1776,27 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // al call center 76 pacientes de octubre que están programadas para dentro
   // de meses o años. La cola de seguimiento ya las tiene: ver
   // programarSeguimiento() y la vista sofia_followup_queue.
-  const impliedHandoff = !taggedEscalated && !programacion && mentionsHandoffPromise(reply);
+  const promesaDeContacto = !taggedEscalated && !programacion && mentionsHandoffPromise(reply);
+  // El cuarto agujero (2026-11-10). Acá Sofía no promete contacto: difiere el
+  // DATO. "El precio exacto se lo confirma el equipo" es la frase que el propio
+  // prompt le enseña para no hablar de lo que ella no tiene, y dos párrafos más
+  // abajo le ordena escalar en ese mismo caso. Lo primero se cumple siempre; lo
+  // segundo, en 120 de 167 conversaciones del mes. Las otras 47 recibieron "eso
+  // se lo confirma el equipo" y ningún equipo recibió nada.
+  //
+  // Va en su propia lista y NO en HANDOFF_PROMISE_PATTERNS, aunque la tentación
+  // sea obvia: esa lista también alimenta quitarPromesaDeTraspaso(), que de
+  // noche BORRA la oración del mensaje. Medido sobre 30 días: de los 125
+  // mensajes que esta lista agarra, 124 perderían de noche justamente la frase
+  // que contesta la pregunta del precio, y 1 se quedaría sin respuesta entera.
+  // Es el bug que la atención nocturna vino a arreglar —el caso de María en
+  // proximaApertura()— entrando por la puerta de atrás.
+  //
+  // Tampoco entra en repitePromesa(): no promete contacto, así que no hay plazo
+  // que volver a anclar. Lo único que hace es escalar.
+  const difirioElPrecio =
+    !taggedEscalated && !programacion && !promesaDeContacto && difiereAlEquipo(reply);
+  const impliedHandoff = promesaDeContacto || difirioElPrecio;
   // La otra mitad del problema: la paciente pidió la cita y Sofía no escaló.
   // Acá no hay frase de Sofía que detectar —el fallo es justamente que no dijo
   // nada— así que se mira lo que escribió LA PACIENTE. Ver el comentario largo
@@ -1802,16 +1822,25 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // El motivo lo lee un asesor que no vio la conversación. Se cita textualmente
   // lo que pidió la paciente, recortado: es su propia frase, así que no inventa
   // ningún dato que ella no haya dado (regla del prompt sobre los motivos).
+  // Los dos motivos mecánicos van separados a propósito, y no por prolijidad:
+  // la vista sofia_followup_queue puntúa la intención leyendo este texto. "frase
+  // de traspaso" vale 40 puntos (rinde 22,7% de citas, medido el 5-oct); una
+  // palabra con "precio" cae en el tramo de 6, que es el que de verdad le
+  // corresponde a quien solo preguntó cuánto cuesta. Si este caso se colara con
+  // el motivo del otro, 47 consultas de precio al mes entrarían a la cola
+  // valoradas como si hubieran pedido la cita.
   const escalation_reason = taggedEscalated
     ? taggedReason
-    : impliedHandoff
+    : promesaDeContacto
       ? "frase de traspaso detectada sin etiqueta [ESCALAR]"
-      : pedidoDeCitaSinTraspaso
-        ? `pidió cita y Sofía no la escaló — la paciente escribió: "${String(text || "")
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 160)}"`
-        : null;
+      : difirioElPrecio
+        ? "difirió el precio al equipo sin etiqueta [ESCALAR]"
+          : pedidoDeCitaSinTraspaso
+            ? `pidió cita y Sofía no la escaló — la paciente escribió: "${String(text || "")
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, 160)}"`
+            : null;
 
   // Sofía usually writes a transition line before [ESCALAR] (see
   // system_prompt "Cómo escalar"), but not always — when she doesn't, reply
@@ -2071,20 +2100,47 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // escribir, lo primero es borrar la marca anterior — contestó, aunque sea para
   // decir que no. Que su respuesta escale o no lo decide Sofía en este mismo
   // turno, como siempre; esta cola no opina.
+  // Desde el 2026-11-10 esta cola cubre DOS formas de dejar algo pendiente, no
+  // una. La segunda es la pregunta del tamizaje quirúrgico: medido sobre los 30
+  // días al 10-nov, 130 conversaciones mueren con Sofía preguntando por
+  // embarazo, lactancia o peso, y 59 de ellas no llegan a nadie — 2,0 al día.
+  //
+  // Hoy no hay red detrás de esas 59, y no por descuido: la cola de la espera
+  // (escalacion_espera_desde) solo se arma si Sofía YA decidió escalar, y acá
+  // está recogiendo datos antes de decidir. La de promesas no las ve porque no
+  // prometió nada. Se mueren solas.
+  //
+  // POR QUÉ ESTA COLUMNA Y NO escalacion_espera_desde, que es la que parecía:
+  // esa la leen cuatro pantallas del dashboard (MetricsSection,
+  // SofiaMetricsSection, DashboardHome) más daily-analysis, y las cuatro la
+  // cuentan como "escaló". Usarla subiría el porcentaje de traspasos sin que
+  // nadie hubiera llegado a nadie. Esta columna se creó justamente para no
+  // contaminar esas lecturas (ver la migración 20261110170000), su barrido ya
+  // tiene las tres guardas correctas, y sus 2 horas de espera le quedan bien a
+  // una pregunta de tamizaje: media hora es poco para que una señora conteste si
+  // está embarazada.
+  //
+  // Costo medido: 975 conversaciones al mes recibirían la marca, vence en 130,
+  // la guarda de `escalated` descarta 69, y quedan 59 traspasos nuevos — 1,9 al
+  // día netos sobre los 80 que ya entran. Solo 2 de esas 59 las agarraba ya la
+  // mitad de ofrecimiento de esta misma cola.
   const yaEsperabaOfrecimiento = !!conversationState.ofrecimientoSinRespuestaDesde;
-  const ofreceCoordinar =
+  const dejoAlgoPendiente =
     !escalarAhora &&
     !esperar &&
     !diferir &&
     !silenced &&
     !shouldClose &&
     !programacion &&
-    ofrecioCoordinar(finalReply);
-  if (yaEsperabaOfrecimiento && !ofreceCoordinar) {
+    (ofrecioCoordinar(finalReply) || preguntoElTamizaje(finalReply));
+  if (yaEsperabaOfrecimiento && !dejoAlgoPendiente) {
     await limpiarOfrecimientoSinRespuesta(env, phoneHash);
-  } else if (ofreceCoordinar && !yaEsperabaOfrecimiento) {
+  } else if (dejoAlgoPendiente && !yaEsperabaOfrecimiento) {
     await marcarOfrecimientoSinRespuesta(env, phoneHash);
-    console.log("SOFIA_OFRECIMIENTO_SIN_RESPUESTA", JSON.stringify({ prospectId }));
+    console.log(
+      "SOFIA_OFRECIMIENTO_SIN_RESPUESTA",
+      JSON.stringify({ prospectId, tamizaje: preguntoElTamizaje(finalReply) })
+    );
   }
 
   if (esperar) {
@@ -2256,8 +2312,73 @@ function ofrecioCoordinar(text) {
   return OFRECIMIENTO_DE_COORDINAR.some((re) => re.test(String(text || "")));
 }
 
+// La otra mitad de la tercera cola (2026-11-10): Sofía deja a la paciente con
+// una de las tres preguntas del tamizaje y la paciente no vuelve. Ver el
+// comentario largo donde se usa, en processInboundMessage.
+//
+// Las frases son las que Sofía usa de verdad, medidas sobre 995 conversaciones
+// con tamizaje en 30 días: 103 de las 116 que se mueren empiezan por "¿Está
+// embarazada", el resto son la de lactancia y la de peso.
+//
+// Se exige ADEMÁS que el mensaje TERMINE en pregunta, con el mismo criterio de
+// terminaEnPregunta(): si Sofía preguntó por el embarazo a mitad del mensaje y
+// después siguió explicando, la pregunta no es lo último que la paciente leyó y
+// no es eso lo que la dejó esperando. Medido sobre 7 días de escalaciones en
+// setiembre: de 118 mensajes con una pregunta, 100 terminan con ella.
+const PREGUNTAS_DEL_TAMIZAJE = [
+  /est[áa] embarazada/i,
+  /planes de (quedar )?(embarazada|estarlo)|planes de embarazo/i,
+  /per[íi]odo de lactancia|est[áa] (en |dando )?lactancia|suspendi[óo] (la )?lactancia|amamantando/i,
+  /proceso activo de (p[ée]rdida|aumento) de peso|cambio de peso activo/i,
+];
+
+function preguntoElTamizaje(text) {
+  const t = String(text || "");
+  if (!terminaEnPregunta(t)) return false;
+  return PREGUNTAS_DEL_TAMIZAJE.some((re) => re.test(t));
+}
+
 function mentionsHandoffPromise(text) {
   return HANDOFF_PROMISE_PATTERNS.some((re) => re.test(text));
+}
+
+// ---------------------------------------------------------------------------
+// Difiere el dato al equipo, sin prometer contacto (2026-11-10)
+// ---------------------------------------------------------------------------
+//
+// "El precio exacto se lo confirma el equipo." No es una promesa de contacto:
+// es la frase que el prompt le enseña en "Regla crítica — nunca inventar" para
+// que no hable de lo que ella no tiene ("ese dato se lo confirma el médico en la
+// valoración", "eso se lo confirma el equipo"). Dos párrafos más abajo el mismo
+// prompt le ordena escalar en ese caso: "Dile que ese precio se define con el
+// equipo y pasa el caso con [ESCALAR]".
+//
+// Medido sobre las 6.631 conversaciones creadas en los 30 días al 10-nov: 167
+// tienen la frase, 120 escalan, y en 47 no hay nada — ni traspaso, ni escalada,
+// ni programada. La paciente preguntó un precio, recibió "eso se lo confirma el
+// equipo", y ningún equipo recibió nada. Casi todas son tratamientos sin
+// promoción vigente ese mes: BodyFX, Liftera, QuantumRF, Dermapen, ácido
+// hialurónico por zona.
+//
+// Las 47 revisadas una por una antes de subir esto: las 47 son diferimientos
+// reales. 6 son de financiamiento ("el detalle de meses y requisitos se lo
+// confirma el equipo") y en ninguna de esas 6 Sofía le había dado el número de
+// finanzas, así que tampoco tenían salida por ese lado.
+//
+// POR QUÉ ESTA LISTA ESTÁ APARTE Y NO DENTRO DE HANDOFF_PROMISE_PATTERNS:
+// ver el comentario de difirioElPrecio en processInboundMessage. En resumen,
+// esa lista también la usa quitarPromesaDeTraspaso() para borrar la oración de
+// noche, y acá la oración es la respuesta a la pregunta de la paciente.
+//
+// Se exige el verbo reflexivo con el dato como sujeto ("se lo confirma el
+// equipo") y no cualquier mención del equipo: "el equipo la contacta" ya la
+// agarra la red de promesas, y meterla dos veces no agrega nada.
+const DIFIERE_AL_EQUIPO = [
+  /\bse l[oa] (confirma|confirman|confirmar[áa]n?|indica|indican|brinda|brindan)\b[^.?!¿]{0,30}\b(el |nuestro |directamente |mi )*(equipo|asesor[ae]?s?|concierge|departamento)/i,
+];
+
+function difiereAlEquipo(text) {
+  return DIFIERE_AL_EQUIPO.some((re) => re.test(String(text || "")));
 }
 
 // ---------------------------------------------------------------------------
@@ -4868,10 +4989,24 @@ async function escalarOfrecimientosSinRespuesta(env) {
       continue;
     }
 
-    const ofrecimiento = String(fila.last_message || "").replace(/\s+/g, " ").trim().slice(-200);
-    const motivo = ofrecimiento
-      ? `Sofía ofreció coordinar y la paciente no contestó — Sofía le escribió: "${ofrecimiento}"`
-      : "Sofía ofreció coordinar la valoración y la paciente no contestó";
+    // Dos motivos, porque la cola cubre dos casos distintos y el asesor que lo
+    // lee tiene que saber cuál es: en uno falta que ella diga que sí, en el otro
+    // falta un dato clínico que Sofía ya le había pedido. Se cita textualmente
+    // lo último que Sofía le escribió, sin inventarle nada a la paciente.
+    // El recorte respeta la palabra. `slice(-200)` pelado cortaba a mitad de
+    // palabra y el asesor recibía un motivo que arranca en "ado justamente para
+    // tensar y mejorar la calidad de la piel" — los tres primeros traspasos de
+    // esta cola, el 10-nov, salieron así. La frase que importa (el ofrecimiento)
+    // va al final y nunca se perdía; lo que se veía mal era el principio.
+    const crudo = String(fila.last_message || "").replace(/\s+/g, " ").trim();
+    const ultimo =
+      crudo.length > 200 ? `…${crudo.slice(-200).replace(/^\S*\s+/, "")}` : crudo;
+    const esTamizaje = preguntoElTamizaje(fila.last_message);
+    const motivo = !ultimo
+      ? "Sofía ofreció coordinar la valoración y la paciente no contestó"
+      : esTamizaje
+        ? `tamizaje quirúrgico sin contestar — Sofía le preguntó: "${ultimo}"`
+        : `Sofía ofreció coordinar y la paciente no contestó — Sofía le escribió: "${ultimo}"`;
 
     await addEscalationNote(env, fila.prospect_id, motivo);
 
@@ -4930,6 +5065,15 @@ async function limpiarEsperaDeRespuesta(env, phoneHash) {
 async function cerrarEsperaDeRespuesta(env, id, motivo) {
   await patchConversacion(env, `id=eq.${id}`, {
     escalacion_espera_desde: null,
+    // También la tercera cola, por el mismo motivo que cerrarTraspasoPendiente()
+    // limpia esta: una conversación puede traer las dos marcas, y la que queda
+    // puesta ya no se limpia nunca. El barrido no la volvería a tocar (su
+    // guarda es escalated=is.false, y acá se acaba de poner true), así que no
+    // transfiere a nadie dos veces — pero la fila queda mintiendo. Visto en
+    // producción el 10-nov: una marca de las 18:34 sobre una conversación ya
+    // escalada, sin forma de salir de ahí salvo que la paciente volviera a
+    // escribir.
+    ofrecimiento_sin_respuesta_desde: null,
     escalated: true,
     escalation_reason: motivo ?? null,
   }, "cerrarEsperaDeRespuesta");
@@ -4974,6 +5118,10 @@ async function cerrarTraspasoPendiente(env, id, motivo) {
         // esperando respuesta y la noche se la llevó primero, dejarla marcada
         // haría que escalarEsperasVencidas() la transfiriera de nuevo.
         escalacion_espera_desde: null,
+        // Y la tercera, desde el 2026-11-10. Acá no hay riesgo de transferir
+        // dos veces (ese barrido exige escalated=is.false), pero la marca se
+        // queda puesta para siempre si la paciente no vuelve a escribir.
+        ofrecimiento_sin_respuesta_desde: null,
         escalated: true,
         escalation_reason: motivo ?? null,
       }),
