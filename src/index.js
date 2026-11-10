@@ -121,6 +121,13 @@ const TRASPASO_PENDIENTE_TOPE_HORAS = 48;
 // el cron corre cada veinte: en la práctica el traspaso sale entre 30 y 50
 // minutos tarde en el peor caso, contra el riesgo de perder la conversación.
 const ESPERA_RESPUESTA_MINUTOS = 30;
+// La tercera cola (2026-11-10): Sofía OFRECIÓ coordinar y la paciente no
+// contestó. Dos horas y no 30 minutos como la de arriba, a propósito: ahí la
+// paciente venía de una escalación ya decidida y solo faltaba un dato; acá
+// todavía no dijo que sí a nada, y lo normal es que conteste al rato. Dos horas
+// de silencio después de un ofrecimiento concreto ya es una señal.
+const ESPERA_OFRECIMIENTO_MINUTOS = 120;
+const MAX_OFRECIMIENTOS_POR_CORRIDA = 10;
 const MAX_ESPERAS_VENCIDAS_POR_CORRIDA = 10;
 
 // Lo que NO se difiere nunca, a ninguna hora. Mismo vocabulario que la columna
@@ -824,6 +831,10 @@ export default {
       ctx.waitUntil(
         escalarEsperasVencidas(env)
           .catch((err) => console.error("ESPERAS_VENCIDAS falló", err))
+      );
+      ctx.waitUntil(
+        escalarOfrecimientosSinRespuesta(env)
+          .catch((err) => console.error("OFRECIMIENTOS_SIN_RESPUESTA falló", err))
       );
       return;
     }
@@ -2054,6 +2065,28 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   if (diferir && !yaEstabaPendiente) {
     await marcarTraspasoPendiente(env, phoneHash, escalation_reason);
   }
+  // La tercera cola. Se evalúa al final, cuando ya se sabe si este turno escaló,
+  // difirió, se calló o programó: en cualquiera de esos casos el caso ya tiene
+  // dueño y meterlo acá sería transferirlo dos veces. Y si la paciente acaba de
+  // escribir, lo primero es borrar la marca anterior — contestó, aunque sea para
+  // decir que no. Que su respuesta escale o no lo decide Sofía en este mismo
+  // turno, como siempre; esta cola no opina.
+  const yaEsperabaOfrecimiento = !!conversationState.ofrecimientoSinRespuestaDesde;
+  const ofreceCoordinar =
+    !escalarAhora &&
+    !esperar &&
+    !diferir &&
+    !silenced &&
+    !shouldClose &&
+    !programacion &&
+    ofrecioCoordinar(finalReply);
+  if (yaEsperabaOfrecimiento && !ofreceCoordinar) {
+    await limpiarOfrecimientoSinRespuesta(env, phoneHash);
+  } else if (ofreceCoordinar && !yaEsperabaOfrecimiento) {
+    await marcarOfrecimientoSinRespuesta(env, phoneHash);
+    console.log("SOFIA_OFRECIMIENTO_SIN_RESPUESTA", JSON.stringify({ prospectId }));
+  }
+
   if (esperar) {
     await marcarEsperaDeRespuesta(env, phoneHash, escalation_reason);
   } else if (esperabaRespuesta) {
@@ -2179,6 +2212,35 @@ const HANDOFF_PROMISE_PATTERNS = [
   /(le|la|lo) (paso|conecto|pongo) con (nuestro |el |un )?(equipo|asesor[ae]?s?)/i,
   /(va a quedar|queda|le dejo|le dejamos) (la cita |su cita |esa cita )?coordinad[ao]/i,
 ];
+
+// ---------------------------------------------------------------------------
+// Sofía ofreció coordinar y la paciente no contestó (2026-11-10)
+// ---------------------------------------------------------------------------
+//
+// El tercer agujero, después de la red de promesas y de pidioCitaExplicitamente().
+// Acá Sofía hace todo bien: explica, y cierra ofreciendo el paso siguiente
+// ("¿Le gustaría que le ayude a coordinar esa valoración?"). La paciente no
+// vuelve a escribir y la conversación se muere con el ofrecimiento sin
+// responder. Sofía escala cuando la paciente CONFIRMA, así que un ofrecimiento
+// sin respuesta no escala nunca.
+//
+// Medido sobre los 30 días al 10-nov: 157 conversaciones terminan así y 138
+// jamás llegaron a un asesor. Son 4,3 por día, +14% sobre los 31 diarios. Para
+// comparar: escalar toda pregunta por el precio de la valoración —el otro
+// candidato -- son +17 por día, seis veces más, y con mucha menos intención
+// detrás.
+//
+// Se exige la pregunta entera (de "¿" a "?") para no confundir el ofrecimiento
+// con una mención cualquiera de la palabra coordinar, y el verbo de coordinar
+// o agendar: "¿le cuento más?" no es un ofrecimiento del paso siguiente.
+const OFRECIMIENTO_DE_COORDINAR = [
+  /¿(le gustar[íi]a|quiere|desea|gusta)[^?]{0,60}(coordin|agend|aparta|reserv)[^?]{0,40}\?/i,
+  /¿(coordinamos|agendamos|avanzamos)[^?]{0,40}\?/i,
+  /¿le ayudo a (coordinar|agendar)[^?]{0,30}\?/i,
+];
+function ofrecioCoordinar(text) {
+  return OFRECIMIENTO_DE_COORDINAR.some((re) => re.test(String(text || "")));
+}
 
 function mentionsHandoffPromise(text) {
   return HANDOFF_PROMISE_PATTERNS.some((re) => re.test(text));
@@ -3443,7 +3505,7 @@ async function saveSessionWithRetry(env, phoneHash, channel, baseMessages, baseV
 
 async function getConversationState(env, phoneHash) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count,escalated,escalation_reason,last_interaction_id,procedure_interest,sentiment,traspaso_pendiente_desde,escalacion_espera_desde&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count,escalated,escalation_reason,last_interaction_id,procedure_interest,sentiment,traspaso_pendiente_desde,escalacion_espera_desde,ofrecimiento_sin_respuesta_desde&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -3451,7 +3513,7 @@ async function getConversationState(env, phoneHash) {
       },
     }
   );
-  if (!res.ok) return { messageCount: 0, escalated: false, escalationReason: null, lastInteractionId: null, procedureInterest: null, sentiment: null, traspasoPendienteDesde: null, escalacionEsperaDesde: null };
+  if (!res.ok) return { messageCount: 0, escalated: false, escalationReason: null, lastInteractionId: null, procedureInterest: null, sentiment: null, traspasoPendienteDesde: null, escalacionEsperaDesde: null, ofrecimientoSinRespuestaDesde: null };
   const rows = await res.json();
   return {
     messageCount: rows[0]?.message_count ?? 0,
@@ -3470,6 +3532,7 @@ async function getConversationState(env, phoneHash) {
     // Traspaso aplazado porque Sofía dejó una pregunta abierta — ver
     // terminaEnPregunta() y el bloque de espera en processInboundMessage.
     escalacionEsperaDesde: rows[0]?.escalacion_espera_desde ?? null,
+    ofrecimientoSinRespuestaDesde: rows[0]?.ofrecimiento_sin_respuesta_desde ?? null,
   };
 }
 
@@ -4742,6 +4805,92 @@ async function escalarEsperasVencidas(env) {
   }
 
   console.log("ESPERAS_VENCIDAS", JSON.stringify(resultado));
+}
+
+// El barrido de la tercera cola: Sofía ofreció coordinar y la paciente nunca
+// contestó. Corre con los otros reintentos, cada 20 minutos.
+//
+// A diferencia de escalarEsperasVencidas(), acá Sofía NO había decidido
+// escalar, así que no hay motivo guardado. Se arma uno citando textualmente lo
+// que ella ofreció —`last_message` es su última respuesta— para que el asesor
+// abra el chat sabiendo qué quedó pendiente, sin inventarle nada a la paciente.
+async function escalarOfrecimientosSinRespuesta(env) {
+  const headers = {
+    apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+  };
+  const tope = new Date(Date.now() - ESPERA_OFRECIMIENTO_MINUTOS * 60_000).toISOString();
+
+  const res = await fetchWithTimeout(
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations` +
+      `?ofrecimiento_sin_respuesta_desde=lte.${tope}&prospect_id=not.is.null` +
+      // Las mismas tres guardas que el barrido hermano: si ya escaló por otro
+      // camino, o está en alguna de las otras dos colas, el caso ya tiene dueño
+      // y transferirlo acá sería la segunda nota del mismo caso.
+      `&escalated=is.false` +
+      `&traspaso_pendiente_desde=is.null` +
+      `&escalacion_espera_desde=is.null` +
+      `&order=ofrecimiento_sin_respuesta_desde.asc` +
+      `&select=id,phone_hash,prospect_id,last_message,ofrecimiento_sin_respuesta_desde` +
+      `&limit=${MAX_OFRECIMIENTOS_POR_CORRIDA}`,
+    { headers }
+  );
+  if (!res.ok) {
+    console.error("escalarOfrecimientosSinRespuesta: no se pudo leer la lista", res.status);
+    return;
+  }
+  const filas = await res.json();
+  if (!filas.length) return;
+
+  const resultado = { encontradas: filas.length, escaladas: 0, yaTeniaHumano: 0, fallidas: 0 };
+
+  for (const fila of filas) {
+    // Si un humano ya la tomó, no se toca. Falla cerrado, igual que las otras.
+    const { agentId, failed } = await getCurrentProspectAgentId(env, fila.prospect_id);
+    if (failed) { resultado.fallidas++; continue; }
+    if (agentId && HUMAN_AGENT_IDS.has(agentId)) {
+      resultado.yaTeniaHumano++;
+      await limpiarOfrecimientoSinRespuesta(env, fila.phone_hash);
+      continue;
+    }
+
+    const ofrecimiento = String(fila.last_message || "").replace(/\s+/g, " ").trim().slice(-200);
+    const motivo = ofrecimiento
+      ? `Sofía ofreció coordinar y la paciente no contestó — Sofía le escribió: "${ofrecimiento}"`
+      : "Sofía ofreció coordinar la valoración y la paciente no contestó";
+
+    await addEscalationNote(env, fila.prospect_id, motivo);
+
+    const traspaso = await transferToNextAgentInPool(env, fila.prospect_id, { phoneHash: fila.phone_hash });
+    if (!traspaso.ok) { resultado.fallidas++; continue; }
+    await registrarHandoff(env, {
+      prospectId: fila.prospect_id, phoneHash: fila.phone_hash,
+      motivo, agenteAsignado: traspaso.agentId, traspasoOk: true,
+      // La paciente lleva esperando desde el ofrecimiento, no desde que el
+      // barrido corrió.
+      escaladoEn: fila.ofrecimiento_sin_respuesta_desde,
+    });
+    await limpiarOfrecimientoSinRespuesta(env, fila.phone_hash);
+    resultado.escaladas++;
+  }
+
+  console.log("OFRECIMIENTOS_SIN_RESPUESTA", JSON.stringify(resultado));
+}
+
+// Los dos ayudantes de la tercera cola. PATCH aparte y no dentro de
+// upsertConversation por el mismo motivo que los otros dos marcadores: ahí
+// escalated y escalation_reason son pegajosos, y esta cola no debe tocarlos —
+// mientras la marca está puesta todavía no hay traspaso de nada.
+async function marcarOfrecimientoSinRespuesta(env, phoneHash) {
+  await patchConversacion(env, `phone_hash=eq.${phoneHash}`, {
+    ofrecimiento_sin_respuesta_desde: new Date().toISOString(),
+  }, "marcarOfrecimientoSinRespuesta");
+}
+
+async function limpiarOfrecimientoSinRespuesta(env, phoneHash) {
+  await patchConversacion(env, `phone_hash=eq.${phoneHash}`, {
+    ofrecimiento_sin_respuesta_desde: null,
+  }, "limpiarOfrecimientoSinRespuesta");
 }
 
 // Marca que hay un traspaso esperando a que la paciente conteste. PATCH aparte
@@ -6493,7 +6642,11 @@ async function findFollowupCandidates(env, { primerMensajeActivo = false } = {})
     // recibido un "¿le quedó alguna duda?" el domingo. Encontrado leyendo las
     // reglas unas contra otras el 2026-09-29, antes de que pasara.
     `&traspaso_pendiente_desde=is.null` +
-    `&escalacion_espera_desde=is.null`;
+    `&escalacion_espera_desde=is.null` +
+    // Ni a quien está esperando que conteste un ofrecimiento de coordinar: ya
+    // tiene una pregunta de Sofía sin responder y el seguimiento le mandaría
+    // una segunda encima. Mismo motivo que las dos de arriba.
+    `&ofrecimiento_sin_respuesta_desde=is.null`;
 
   // (1) La lista de siempre: gente que sostuvo una conversación y se calló.
   const urlConversacion =
