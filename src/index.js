@@ -2121,6 +2121,13 @@ const HANDOFF_PROMISE_PATTERNS = [
   // el guardia `!programacion` que se puso el 2026-10-31.
   /\ble (paso|pasar[ée]) con (el |nuestro |mi )?(equipo|asesor|compa[ñn]er)/i,
   /\b(el |nuestro )?equipo[^.?!]{0,25}se (va a poner|pondr[áa]) en contacto/i,
+  // Agregada el 2026-11-10: "nuestro equipo ESTARÁ en contacto". La forma
+  // reflexiva de ayer ("se pondrá en contacto") no la cubre, y es la misma
+  // promesa. Encontrada leyendo las 14 conversaciones del 9 de noviembre que
+  // mostraron intención y no llegaron a nadie: una de ellas tenía esta frase.
+  // Medido sobre 30 días: 2 mensajes, 1 de ellos sin traspaso.
+  /\b(el |nuestro |mi )?equipo[^.?!]{0,25}(estar[áa]n?|estar[ée]|estaremos)\s+en contacto/i,
+  /\bestaremos en contacto\b/i,
   // "le paso LA información al equipo": la regla de arriba exige "su"/"esta" y
   // Sofía dice "la información" casi siempre. Se exige el destino ("al equipo")
   // porque "le comparto la información" sin destino es Sofía informándole a la
