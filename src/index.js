@@ -1509,12 +1509,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       await archiveProspect(env, prospectId, "infoGeneral");
       // Misma limpieza que en [CERRAR]: se archiva sin asesor, así que lo que
       // hubiera en cola sobra. Sin esto el barrido se la pasa a alguien mañana.
-      if (conversationState.traspasoPendienteDesde || conversationState.escalacionEsperaDesde) {
-        await patchConversacion(env, `phone_hash=eq.${phoneHash}`, {
-          traspaso_pendiente_desde: null,
-          escalacion_espera_desde: null,
-        }, "limpiarColasAlCerrarSinAsesor");
-      }
+      await limpiarColasDeTraspaso(env, phoneHash, conversationState, "limpiarColasAlCerrarSinAsesor");
       await saveSessionWithRetry(
         env, phoneHash, channel, session.messages, session.version,
         [{ role: "user", content: contentForHistory }, { role: "assistant", content: registro }]
@@ -1561,16 +1556,10 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       prospectId, phoneHash, motivo: limitReasonText,
       agenteAsignado: traspasoTope.agentId, traspasoOk: traspasoTope.ok,
     });
-    // Esta conversación ya se transfirió. Si venía en alguna de las dos colas
-    // —el traspaso diferido de la noche o la espera de una respuesta— hay que
-    // sacarla, o el barrido la vuelve a transferir mañana y el asesor recibe
-    // una segunda nota de un caso que ya tiene. Le pasó a María el 2026-09-29.
-    if (conversationState.traspasoPendienteDesde || conversationState.escalacionEsperaDesde) {
-      await patchConversacion(env, `phone_hash=eq.${phoneHash}`, {
-        traspaso_pendiente_desde: null,
-        escalacion_espera_desde: null,
-      }, "limpiarColasAlTope");
-    }
+    // Esta conversación ya se transfirió, así que sale de las tres colas: si no,
+    // un barrido la vuelve a transferir y el asesor recibe la segunda nota de un
+    // caso que ya tiene. Le pasó a María el 2026-09-29.
+    await limpiarColasDeTraspaso(env, phoneHash, conversationState, "limpiarColasAlTope");
 
     const updatedHistory = await saveSessionWithRetry(
       env, phoneHash, channel, session.messages, session.version,
@@ -1688,6 +1677,10 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
       prospectId, phoneHash, motivo: "falla_tecnica_claude",
       agenteAsignado: traspasoFalla.agentId, traspasoOk: traspasoFalla.ok,
     });
+    // Acá no se limpiaba nada, y este camino escala y transfiere de verdad: una
+    // conversación que venía en cualquiera de las tres colas quedaba en ella y un
+    // barrido la transfería de nuevo. Mismo razonamiento que el tope de arriba.
+    await limpiarColasDeTraspaso(env, phoneHash, conversationState, "limpiarColasAlFallarClaude");
 
     const updatedHistoryAfterFailure = await saveSessionWithRetry(
       env, phoneHash, channel, session.messages, session.version,
@@ -2059,15 +2052,10 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     // venta, no es "no interesado", no es inactividad.
     if (shouldClose) {
       await archiveProspect(env, prospectId, "infoGeneral");
-      // Sofía decidió que esta conversación no necesita un asesor. Si traía un
-      // traspaso en cola, hay que sacarla: si no, el barrido se la asigna a
-      // alguien por la mañana, ya archivada y sin nada que hacer.
-      if (conversationState.traspasoPendienteDesde || conversationState.escalacionEsperaDesde) {
-        await patchConversacion(env, `phone_hash=eq.${phoneHash}`, {
-          traspaso_pendiente_desde: null,
-          escalacion_espera_desde: null,
-        }, "limpiarColasAlCerrar");
-      }
+      // Sofía decidió que esta conversación no necesita un asesor. Si traía algo
+      // en cola, hay que sacarla: si no, el barrido se la asigna a alguien por la
+      // mañana, ya archivada y sin nada que hacer.
+      await limpiarColasDeTraspaso(env, phoneHash, conversationState, "limpiarColasAlCerrar");
     }
   }
 
@@ -5030,6 +5018,42 @@ async function escalarOfrecimientosSinRespuesta(env) {
 // upsertConversation por el mismo motivo que los otros dos marcadores: ahí
 // escalated y escalation_reason son pegajosos, y esta cola no debe tocarlos —
 // mientras la marca está puesta todavía no hay traspaso de nada.
+// Las tres colas se limpian juntas, o no se limpian (2026-11-10)
+//
+// Cada vez que un caso consigue dueño por un camino propio —el tope de mensajes,
+// [CERRAR], una falla técnica de Claude— hay que sacarlo de las colas, o un
+// barrido se lo vuelve a pasar a un asesor que ya lo tiene y recibe la segunda
+// nota del mismo caso. Le pasó a María el 2026-09-29.
+//
+// Eso ya se hacía, pero con el mismo bloque copiado en tres lugares, y los tres
+// miraban solo las dos primeras colas. Cuando se agregó la tercera —el
+// ofrecimiento (o la pregunta del tamizaje) sin respuesta— ninguno de los tres se
+// enteró, así que esa marca quedaba pegada PARA SIEMPRE: lo único que la borra es
+// su propio barrido, que descarta a las conversaciones ya escaladas, o la paciente
+// volviendo a escribir — y después de escalar Sofía está muda.
+//
+// El caso vivo que lo encontró: una rinoplastia de 11 mensajes, marcada a las
+// 18:33 UTC y escalada minutos después por el tope de mensajes, seguía marcada
+// cinco horas más tarde. No hacía daño —la guarda de `escalated` del barrido
+// evita el traspaso doble— pero dejaba una columna que no se puede contar.
+//
+// Por eso ahora es una función y no un bloque copiado: la cuarta cola que se
+// agregue se arregla acá, en un solo lugar.
+async function limpiarColasDeTraspaso(env, phoneHash, estado, quien) {
+  if (
+    !estado.traspasoPendienteDesde &&
+    !estado.escalacionEsperaDesde &&
+    !estado.ofrecimientoSinRespuestaDesde
+  ) {
+    return;
+  }
+  await patchConversacion(env, `phone_hash=eq.${phoneHash}`, {
+    traspaso_pendiente_desde: null,
+    escalacion_espera_desde: null,
+    ofrecimiento_sin_respuesta_desde: null,
+  }, quien);
+}
+
 async function marcarOfrecimientoSinRespuesta(env, phoneHash) {
   await patchConversacion(env, `phone_hash=eq.${phoneHash}`, {
     ofrecimiento_sin_respuesta_desde: new Date().toISOString(),
