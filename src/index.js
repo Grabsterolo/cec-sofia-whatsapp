@@ -2019,9 +2019,47 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     // lo que merece. Se aceptó porque el sentimiento casi nunca cambia después
     // de que el procedimiento está claro, y porque el costo de equivocarse es
     // un orden de lista, no un paciente sin atender.
+    //
+    // 2026-11-11 — LA EXCEPCIÓN: cuando hay una respuesta clínica que capturar.
+    //
+    // Medido sobre las 8.420 conversaciones con actividad de los 30 días
+    // anteriores: de las 1.415 donde Sofía preguntó algo del tamizaje, las
+    // respuestas quedaron guardadas en el 81% de las que escalaron y en el 23%
+    // de las que no. Son 306 conversaciones en un mes en las que la paciente
+    // contestó una pregunta clínica y el dato se tiró.
+    //
+    // La causa es este mismo atajo. El tamizaje se hace en el turno cinco u
+    // ocho; para entonces el procedimiento ya está claro y acá ya no se
+    // reclasifica. Lo único que se salva es lo que pasa por la rama de
+    // escalación, que sí llama al clasificador — de ahí el 81% contra el 23%.
+    //
+    // Así que no se saltea cuando se cumplen LAS DOS cosas: falta algún dato
+    // del tamizaje, Y el mensaje anterior de Sofía traía una de esas preguntas.
+    // Juntas acotan el gasto a los turnos en los que de verdad hay algo que
+    // capturar: unas 3.184 clasificaciones al mes en el peor caso, ~$4. Y el
+    // propio prompt lo acota más, porque repite una pregunta una sola vez y no
+    // una tercera: cuando Sofía deja de preguntar, esto deja de dispararse.
+    //
+    // No se comprueba que sea una cirugía de las zonas del tamizaje. Si Sofía
+    // hizo una de esas preguntas ya está en una, y si la hizo donde no debía
+    // (medido: 26 casos en tratamientos no quirúrgicos) ese es otro problema y
+    // conviene que el dato quede guardado igual. Una regex de zonas acá solo
+    // agregaría otra forma de perder el dato en silencio.
+    //
+    // Reclasificar no puede perder nada: upsertConversation arrastra el valor
+    // guardado cuando el clasificador devuelve null (`t.embarazo ?? existing`),
+    // así que este camino solo puede agregar datos, nunca borrarlos.
+    const faltaAlgunDatoDelTamizaje =
+      conversationState.tamizajeEmbarazo === null ||
+      conversationState.tamizajeLactancia === null ||
+      conversationState.tamizajePeso === null;
+    const hayRespuestaClinicaQueCapturar =
+      faltaAlgunDatoDelTamizaje && veniaDeUnaPreguntaClinica(session.messages);
+
     const yaClasificada =
       conversationState.messageCount >= 2 &&
-      yaSabemosElProcedimiento(conversationState.procedureInterest);
+      yaSabemosElProcedimiento(conversationState.procedureInterest) &&
+      !hayRespuestaClinicaQueCapturar;
 
     if (yaClasificada) {
       // OJO: hay que arrastrar los valores guardados. upsertConversation hace
@@ -2039,6 +2077,15 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
         label: null,
       };
     } else {
+      if (hayRespuestaClinicaQueCapturar) {
+        // Para poder contar lo que cuesta la excepción y comprobar que sirvió:
+        // la medición de arriba se repite en dos semanas y el 23% tiene que
+        // haber subido.
+        console.log("SOFIA_RECLASIFICA_TAMIZAJE", JSON.stringify({
+          prospectId,
+          messageCount: conversationState.messageCount,
+        }));
+      }
       const availableLabels = await getAvailableLabels(env);
       agility = await classifyEscalationWithHaiku(env, updatedHistory, availableLabels);
       if (agility.label) {
@@ -2317,12 +2364,37 @@ const PREGUNTAS_DEL_TAMIZAJE = [
   /est[áa] embarazada/i,
   /planes de (quedar )?(embarazada|estarlo)|planes de embarazo/i,
   /per[íi]odo de lactancia|est[áa] (en |dando )?lactancia|suspendi[óo] (la )?lactancia|amamantando/i,
-  /proceso activo de (p[ée]rdida|aumento) de peso|cambio de peso activo/i,
+  // 2026-11-11 — esta expresión pedía "proceso activo de pérdida DE PESO" o
+  // "proceso activo de aumento DE PESO", y la forma en que Sofía hace la
+  // pregunta de verdad —la que el propio prompt le da como ejemplo— es
+  // "¿está en un proceso activo de pérdida O AUMENTO de peso?". Ahí "pérdida"
+  // no va seguido de "de peso", así que no calzaba.
+  //
+  // Medido sobre 36.661 mensajes de Sofía de 30 días: la versión anterior
+  // reconocía 106 y hay 1.072 que hablan de pérdida o aumento de peso. Se
+  // perdía el 90% de la tercera pregunta del tamizaje, y con eso la tercera
+  // cola no veía a las pacientes que se quedaban calladas después de ella.
+  // Las otras tres expresiones sí funcionan: 1.470, 1.462 y 1.334.
+  /proceso activo de (p[ée]rdida|aumento)|p[ée]rdida o aumento de peso|cambio de peso activo/i,
 ];
 
 function preguntoElTamizaje(text) {
   const t = String(text || "");
   if (!terminaEnPregunta(t)) return false;
+  return PREGUNTAS_DEL_TAMIZAJE.some((re) => re.test(t));
+}
+
+// ¿Lo último que Sofía le dijo antes de este mensaje traía una pregunta del
+// tamizaje? Es una pregunta distinta de la de preguntoElTamizaje(), y por eso
+// no se reutiliza esa: ahí se exige que el mensaje TERMINE en pregunta, porque
+// lo que importa es qué fue lo último que la paciente leyó y la dejó esperando.
+// Acá importa otra cosa — si hay una respuesta clínica que capturar — y eso pasa
+// igual cuando Sofía preguntó a mitad del mensaje y después siguió explicando.
+function veniaDeUnaPreguntaClinica(mensajesPrevios) {
+  const ultimaDeSofia = [...(Array.isArray(mensajesPrevios) ? mensajesPrevios : [])]
+    .reverse()
+    .find((m) => m?.role === "assistant");
+  const t = String(ultimaDeSofia?.content || "");
   return PREGUNTAS_DEL_TAMIZAJE.some((re) => re.test(t));
 }
 
@@ -3628,7 +3700,7 @@ async function saveSessionWithRetry(env, phoneHash, channel, baseMessages, baseV
 
 async function getConversationState(env, phoneHash) {
   const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count,escalated,escalation_reason,last_interaction_id,procedure_interest,sentiment,traspaso_pendiente_desde,escalacion_espera_desde,ofrecimiento_sin_respuesta_desde&limit=1`,
+    `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=message_count,escalated,escalation_reason,last_interaction_id,procedure_interest,sentiment,traspaso_pendiente_desde,escalacion_espera_desde,ofrecimiento_sin_respuesta_desde,tamizaje_embarazo,tamizaje_lactancia,tamizaje_peso&limit=1`,
     {
       headers: {
         apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -3636,7 +3708,7 @@ async function getConversationState(env, phoneHash) {
       },
     }
   );
-  if (!res.ok) return { messageCount: 0, escalated: false, escalationReason: null, lastInteractionId: null, procedureInterest: null, sentiment: null, traspasoPendienteDesde: null, escalacionEsperaDesde: null, ofrecimientoSinRespuestaDesde: null };
+  if (!res.ok) return { messageCount: 0, escalated: false, escalationReason: null, lastInteractionId: null, procedureInterest: null, sentiment: null, traspasoPendienteDesde: null, escalacionEsperaDesde: null, ofrecimientoSinRespuestaDesde: null, tamizajeEmbarazo: null, tamizajeLactancia: null, tamizajePeso: null };
   const rows = await res.json();
   return {
     messageCount: rows[0]?.message_count ?? 0,
@@ -3656,6 +3728,13 @@ async function getConversationState(env, phoneHash) {
     // terminaEnPregunta() y el bloque de espera en processInboundMessage.
     escalacionEsperaDesde: rows[0]?.escalacion_espera_desde ?? null,
     ofrecimientoSinRespuestaDesde: rows[0]?.ofrecimiento_sin_respuesta_desde ?? null,
+    // Se leen para saber si queda algún dato del tamizaje por capturar — ver la
+    // excepción al atajo de la reclasificación en processInboundMessage. `??`
+    // no sirve acá: false es un dato y null es la ausencia de dato, y son
+    // justamente los dos valores que hay que distinguir.
+    tamizajeEmbarazo: rows[0]?.tamizaje_embarazo === undefined ? null : rows[0].tamizaje_embarazo,
+    tamizajeLactancia: rows[0]?.tamizaje_lactancia === undefined ? null : rows[0].tamizaje_lactancia,
+    tamizajePeso: rows[0]?.tamizaje_peso === undefined ? null : rows[0].tamizaje_peso,
   };
 }
 
