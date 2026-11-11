@@ -218,7 +218,21 @@ siendo `sofia_config.whatsapp_enabled = false`, que no necesita desplegar nada.
 
 ## 9. Evidencia
 
-Los hashes y la prueba de que están subidos van al final de este documento cuando se
-hace el push, con la salida de `git log --oneline origin/feature/preclasificacion`.
-Nada de lo de arriba se reporta como desplegado: **no se desplegó.** El Worker en
-producción corre `6c581a7`, que es `main`.
+El commit de esta fase es **`55c9ac2`**. Está en GitHub, comprobado contra el remoto
+de verdad y no contra la copia local de la referencia:
+
+```
+$ git ls-remote origin feature/preclasificacion
+55c9ac2d7112b2ea08c7c3d1a92e5921da71ae59  refs/heads/feature/preclasificacion
+
+$ git log --oneline origin/feature/preclasificacion -4
+55c9ac2 fix(captura): el tamizaje se perdía cuando la conversación no escalaba…
+32586f6 docs(preclasificación): la propuesta en ejemplos, no solo el diagnóstico
+658d656 docs(preclasificación): diseño de la v1, y el embudo pierde el 42%…
+97e0ecc docs(preclasificación): la marca de la tercera cola se queda pegada
+```
+
+**Y lo que NO está hecho, dicho con la misma claridad: no se desplegó.** El Worker en
+producción sigue corriendo `6c581a7`, que es `main`. Este repo no despliega desde git:
+hasta que alguien corra `npx wrangler deploy`, nada de esto está atendiendo a ninguna
+paciente. Tampoco hay merge a `main`.
