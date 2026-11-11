@@ -1456,7 +1456,22 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // traspaso como pendiente (si no lo estaba ya) y deja que Sofía siga
   // atendiendo hasta que el equipo abra. El techo de la noche existe para que
   // una conversación no se vaya a cincuenta mensajes sin que nadie la mire.
-  const topeAlcanzado = conversationState.messageCount >= MAX_CONVERSATION_TURNS;
+  // LAS PREGUNTAS CLÍNICAS NO CONSUMEN TOPE.
+  //
+  // El tope existe para que una conversación larga no se quede en manos de
+  // Sofía, no para castigar a la paciente que está contestando lo que Sofía le
+  // pidió. Medido el 2026-11-11 sobre 30 días: de las pacientes que llegan a
+  // contestar el tamizaje, el 15,8% toca el tope hoy, y con tres preguntas más
+  // serían el 43,4% — cerrando con el motivo "límite de mensajes alcanzado",
+  // que el dashboard cuenta como falla del sistema y la cola de Seguimiento
+  // puntúa como mecánico, justo en las conversaciones más avanzadas.
+  //
+  // No se toca message_count, que lo leen otras pantallas y tiene que seguir
+  // diciendo cuántos mensajes hubo: lo que se mueve es el techo. Y está acotado
+  // a +4 porque el tope también protege el gasto.
+  const topeEfectivo =
+    MAX_CONVERSATION_TURNS + Math.min(preguntasClinicasEnElHistorial(session.messages), 4);
+  const topeAlcanzado = conversationState.messageCount >= topeEfectivo;
 
   // ¿Es un paciente? El tope existe para que una conversación larga no se quede
   // en manos de Sofía, no para mandarle al equipo a quien nunca preguntó por un
@@ -1931,7 +1946,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     [{ role: "user", content: contentForHistory }, { role: "assistant", content: finalReply }]
   );
 
-  let agility = { procedureInterest: null, sentiment: null, tamizaje: SIN_TAMIZAJE };
+  let agility = { procedureInterest: null, sentiment: null, tamizaje: SIN_TAMIZAJE, medidas: SIN_MEDIDAS };
 
   if (diferir) {
     // NO se transfiere y NO se marca escalated: esa bandera es la que la calla, y
@@ -2074,6 +2089,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
         // guardar. Lo que ya estaba en la fila no se pierde: upsertConversation
         // lo conserva (es pegajoso, como el motivo de escalación).
         tamizaje: SIN_TAMIZAJE,
+        medidas: SIN_MEDIDAS,
         label: null,
       };
     } else {
@@ -2120,6 +2136,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     procedureInterest: agility.procedureInterest,
     sentiment: agility.sentiment,
     tamizaje: agility.tamizaje,
+    medidas: agility.medidas,
     phone,
     patientName,
     programacion,
@@ -2167,7 +2184,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
     !silenced &&
     !shouldClose &&
     !programacion &&
-    (ofrecioCoordinar(finalReply) || preguntoElTamizaje(finalReply));
+    (ofrecioCoordinar(finalReply) || preguntoAlgoClinico(finalReply));
   if (yaEsperabaOfrecimiento && !dejoAlgoPendiente) {
     await limpiarOfrecimientoSinRespuesta(env, phoneHash);
   } else if (dejoAlgoPendiente && !yaEsperabaOfrecimiento) {
@@ -2378,6 +2395,32 @@ const PREGUNTAS_DEL_TAMIZAJE = [
   /proceso activo de (p[ée]rdida|aumento)|p[ée]rdida o aumento de peso|cambio de peso activo/i,
 ];
 
+// La pregunta por el peso y la estatura (preclasificación, fase 3a). No tiene
+// texto fijo —Sofía la redacta distinta cada vez— así que se reconoce por el
+// tema, no por la frase. Entra en las mismas dos redes que el tamizaje: la
+// tercera cola, para que una paciente que se queda callada después de ella no
+// se muera sola, y la excepción al atajo del clasificador, para que su
+// respuesta quede guardada aunque la conversación no escale.
+const PREGUNTA_DE_MEDIDAS =
+  /cu[áa]nto (pesa|mide)|su peso y (su )?estatura|peso y (su )?estatura|estatura y (su )?peso|peso y (cu[áa]nto )?mide/i;
+
+const PREGUNTAS_CLINICAS = [...PREGUNTAS_DEL_TAMIZAJE, PREGUNTA_DE_MEDIDAS];
+
+function preguntoAlgoClinico(text) {
+  const t = String(text || "");
+  if (!terminaEnPregunta(t)) return false;
+  return PREGUNTAS_CLINICAS.some((re) => re.test(t));
+}
+
+// Cuántas preguntas clínicas lleva hechas esta conversación. Se usa para que
+// el tope de mensajes no castigue a la paciente por contestar lo que Sofía le
+// pidió — ver el tope en processInboundMessage.
+function preguntasClinicasEnElHistorial(mensajes) {
+  return (Array.isArray(mensajes) ? mensajes : []).filter(
+    (m) => m?.role === "assistant" && PREGUNTAS_CLINICAS.some((re) => re.test(String(m.content || "")))
+  ).length;
+}
+
 function preguntoElTamizaje(text) {
   const t = String(text || "");
   if (!terminaEnPregunta(t)) return false;
@@ -2395,7 +2438,7 @@ function veniaDeUnaPreguntaClinica(mensajesPrevios) {
     .reverse()
     .find((m) => m?.role === "assistant");
   const t = String(ultimaDeSofia?.content || "");
-  return PREGUNTAS_DEL_TAMIZAJE.some((re) => re.test(t));
+  return PREGUNTAS_CLINICAS.some((re) => re.test(t));
 }
 
 function mentionsHandoffPromise(text) {
@@ -3901,6 +3944,7 @@ async function upsertConversation(env, {
   procedureInterest,
   sentiment,
   tamizaje,
+  medidas,
   patientName,
   phone,
   programacion,
@@ -3928,7 +3972,7 @@ async function upsertConversation(env, {
       // them. Always picking the earliest keeps every turn landing on the
       // same row.
       const existingRes = await fetchWithTimeout(
-        `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=id,message_count,escalated,escalation_reason,traspaso_pendiente_desde,escalacion_espera_desde,tamizaje_embarazo,tamizaje_lactancia,tamizaje_peso&order=created_at.asc&limit=1`,
+        `${env.SUPABASE_URL}/rest/v1/sofia_conversations?phone_hash=eq.${phoneHash}&select=id,message_count,escalated,escalation_reason,traspaso_pendiente_desde,escalacion_espera_desde,tamizaje_embarazo,tamizaje_lactancia,tamizaje_peso,imc_orientativo&order=created_at.asc&limit=1`,
         { headers }
       );
       if (!existingRes.ok) {
@@ -3968,6 +4012,11 @@ async function upsertConversation(env, {
         const tamizajeEmbarazo  = t.embarazo  ?? existing[0]?.tamizaje_embarazo  ?? null;
         const tamizajeLactancia = t.lactancia ?? existing[0]?.tamizaje_lactancia ?? null;
         const tamizajePeso      = t.peso      ?? existing[0]?.tamizaje_peso      ?? null;
+        // El IMC es pegajoso por el mismo motivo que el tamizaje: la paciente da
+        // sus medidas una vez y los turnos siguientes no vuelven al tema. Y
+        // además solo puede MEJORAR: si en un turno posterior da la medida que
+        // faltaba, se recalcula; si no, se conserva la que había.
+        const imcOrientativo = calcularIMC(medidas) ?? existing[0]?.imc_orientativo ?? null;
         const stickyEscalationReason = resetCounters
           ? escalationReason
           : escalated
@@ -3995,6 +4044,7 @@ async function upsertConversation(env, {
               tamizaje_embarazo: tamizajeEmbarazo,
               tamizaje_lactancia: tamizajeLactancia,
               tamizaje_peso: tamizajePeso,
+              imc_orientativo: imcOrientativo,
               // A diferencia de los de arriba, el nombre NO se pisa con null.
               // Esos dos los recalcula Claude en cada turno, así que un null
               // significa "no aplica ahora". El nombre viene de Zenvia y un null
@@ -4033,6 +4083,7 @@ async function upsertConversation(env, {
               last_interaction_id: interactionId,
               procedure_interest: procedureInterest ?? null,
               sentiment: sentiment ?? null,
+              imc_orientativo: calcularIMC(medidas),
               tamizaje_embarazo: tamizaje?.embarazo ?? null,
               tamizaje_lactancia: tamizaje?.lactancia ?? null,
               tamizaje_peso: tamizaje?.peso ?? null,
@@ -4456,6 +4507,29 @@ async function getAvailableLabels(env) {
 // escalation. Never throws — always returns a usable (possibly all-null)
 // result.
 const SIN_TAMIZAJE = { embarazo: null, lactancia: null, peso: null };
+const SIN_MEDIDAS = { pesoKg: null, estaturaCm: null };
+
+// Una medida fuera de rango es un error de lectura, no un dato. Los límites son
+// anchos a propósito: no están para juzgar a nadie, están para descartar que el
+// modelo haya leído un precio, una edad o una talla como si fuera un peso.
+function numeroEnRango(v, min, max) {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) && n >= min && n <= max ? n : null;
+}
+
+// IMC orientativo, redondeado a un decimal. NUNCA se le menciona a la paciente:
+// se guarda para que el equipo médico pueda decidir un umbral mirando datos y
+// no impresiones. Si falta cualquiera de las dos medidas, no hay IMC y no se
+// exige — medido el 2026-11-11, hoy solo el 0,4% de las conversaciones trae las
+// dos, y por eso esta columna va a estar casi siempre vacía al principio.
+function calcularIMC(medidas) {
+  const peso = medidas?.pesoKg;
+  const estatura = medidas?.estaturaCm;
+  if (!peso || !estatura) return null;
+  const m = estatura / 100;
+  const imc = peso / (m * m);
+  return Number.isFinite(imc) && imc >= 10 && imc <= 80 ? Math.round(imc * 10) / 10 : null;
+}
 
 async function classifyEscalationWithHaiku(env, history, availableLabels) {
   try {
@@ -4491,7 +4565,16 @@ async function classifyEscalationWithHaiku(env, history, availableLabels) {
           'tema de interés del paciente, ej. "rinoplastia", "precio botox"), "sentiment" ("positivo", ' +
           '"neutral" o "negativo", según el tono general del paciente en la conversación), ' +
           'y las tres del tamizaje quirúrgico: "tamizaje_embarazo", "tamizaje_lactancia" y ' +
-          '"tamizaje_peso".\n\n' +
+          '"tamizaje_peso", más "peso_kg" y "estatura_cm".\n\n' +
+          "MEDIDAS — \"peso_kg\" y \"estatura_cm\" son números, y null la mayoría de las " +
+          "veces:\n" +
+          "  Solo se llenan si la PACIENTE dijo su peso o su estatura, con cualquier " +
+          "redacción (\"peso 72\", \"ando en 72 kilos\", \"mido 1.60\", \"1,60\", \"160 cm\").\n" +
+          "  peso_kg va en kilogramos y estatura_cm en centímetros enteros: \"1.60\" es 160.\n" +
+          "  Si habla de un peso que YA NO tiene (\"pesaba 90 y bajé a 70\"), va el actual: 70.\n" +
+          "  Si da un rango o un aproximado (\"como 70 y algo\"), va null: una medida " +
+          "inventada es peor que una ausente.\n" +
+          "  Nunca lo estimes por una foto, por la talla de ropa ni por cómo se describe.\n\n" +
           "TAMIZAJE — cada una vale true, false o null, y null es la respuesta correcta la mayoría " +
           "de las veces:\n" +
           "  true  = la paciente dijo que SÍ le aplica (está embarazada o planea estarlo en los " +
@@ -4546,10 +4629,14 @@ async function classifyEscalationWithHaiku(env, history, availableLabels) {
         lactancia: treEstado(parsed.tamizaje_lactancia),
         peso: treEstado(parsed.tamizaje_peso),
       },
+      medidas: {
+        pesoKg: numeroEnRango(parsed.peso_kg, 30, 250),
+        estaturaCm: numeroEnRango(parsed.estatura_cm, 120, 215),
+      },
     };
   } catch (err) {
     console.error("classifyEscalationWithHaiku failed", err);
-    return { label: null, procedureInterest: null, sentiment: null, tamizaje: SIN_TAMIZAJE };
+    return { label: null, procedureInterest: null, sentiment: null, tamizaje: SIN_TAMIZAJE, medidas: SIN_MEDIDAS };
   }
 }
 
@@ -4687,7 +4774,7 @@ async function runEscalationAgility(env, { prospectId, history, escalationReason
     return classification;
   } catch (err) {
     console.error("runEscalationAgility failed", err);
-    return { label: null, procedureInterest: null, sentiment: null, tamizaje: SIN_TAMIZAJE };
+    return { label: null, procedureInterest: null, sentiment: null, tamizaje: SIN_TAMIZAJE, medidas: SIN_MEDIDAS };
   }
 }
 
