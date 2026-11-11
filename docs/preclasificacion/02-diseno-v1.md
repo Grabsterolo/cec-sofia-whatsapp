@@ -13,6 +13,118 @@ y [`04-prompt-propuesto.md`](04-prompt-propuesto.md).
 
 ---
 
+## 0. La propuesta, en ejemplos
+
+Las secciones siguientes explican por qué el diseño es este. Esta explica **qué hace**.
+
+> **Los diálogos de abajo son para entender el flujo. NO son texto para el prompt.**
+> Si se le entregan escritos, Sofía los repite igual en las 300 conversaciones del día
+> y vuelve el formulario: es exactamente lo que ya pasó con *"necesito confirmarle un
+> par de cosas rápidas"*, que está en 1.162 mensajes porque el prompt se la regaló como
+> ejemplo (2.4). Al prompt va la regla; la frase la arma Sofía en cada conversación.
+
+### La v1 en una frase
+
+Que lo que la paciente cuenta de su salud **se guarde, se entienda y llegue al asesor
+y al médico** — y que cuando los cirujanos aprueben criterios, Sofía pueda preguntar lo
+que falte **pidiendo permiso primero**, sin pedirle nunca una cifra de su cuerpo.
+
+### Ejemplo A — un caso real de hoy, antes y después
+
+Conversación del 2026-11-11, 17:17. A la izquierda, lo que de verdad pasó.
+
+| hoy | con la v1 |
+|---|---|
+| **Paciente:** Para saber cuándo tienen espacio para una valoración | *(igual)* |
+| **Sofía:** ¿Me podría contar para qué procedimiento sería? | *(igual)* |
+| **Paciente:** Para abdominoplastia | *(igual)* |
+| **Sofía:** Antes de pasarla con el equipo, **necesito confirmarle un par de cosas rápidas**… ¿Está embarazada o tiene planes de estarlo en los próximos dos años? | **Sofía:** *(una pregunta de contexto, con sus palabras)* ¿Desde cuándo lo nota? ¿Apareció después de un embarazo o de un cambio de peso? |
+| **Paciente:** No y no tengo planes | **Paciente:** Después de mi segundo embarazo, hace tres años |
+| **Sofía:** ¿Está en período de lactancia actualmente…? | **Sofía:** *(ahora sí el tamizaje, y ya sabe que no hay lactancia reciente)* ¿Está en un proceso activo de pérdida o aumento de peso? |
+| **Paciente:** No | **Paciente:** No |
+| **Sofía:** ¿Está en un proceso activo de pérdida o aumento de peso? | **Sofía:** Le paso su caso al equipo para que coordinen la valoración. |
+| **Paciente:** No | |
+| **Sofía:** Le voy a pasar la información al equipo. | |
+| **6 turnos de interrogatorio** para una señora que había pedido una fecha | **3 turnos**, y uno de ellos sirvió para entender su caso |
+
+Lo que cambia por detrás, que es lo que de verdad importa:
+
+| | hoy | con la v1 |
+|---|---|---|
+| **lo que la paciente siente** | un formulario entre ella y la cita | una conversación; una pregunta menos |
+| **lo que se guarda** | si Sofía resuelve sola, se pierde el 77% de las respuestas | se guarda siempre (fase 1) |
+| **lo que ve el asesor** | "Motivo: agendar valoración de abdominoplastia" | "agendar valoración de abdominoplastia; flacidez abdominal desde el segundo embarazo, hace 3 años; sin lactancia ni cambio de peso" |
+| **lo que ve el médico** | lo que el asesor alcance a levantar por teléfono | eso mismo, ya escrito |
+
+### Ejemplo B — cuando los cirujanos aprueben un criterio
+
+Esto es lo que la v1 **habilita** y hoy no puede pasar, porque no hay criterios. El
+criterio de este ejemplo **no existe**: es una ilustración de la forma, no un criterio
+médico. Los umbrales van como `X` y `Y` justamente para que nadie los lea como reales.
+
+> *Criterio ilustrativo: en abdominoplastia, una pérdida de más de X kilos en los
+> últimos Y meses manda el caso a revisión médica antes de coordinar.*
+
+| | |
+|---|---|
+| **Paciente:** Quiero la cita para abdominoplastia | |
+| **Sofía** *(pide permiso al tema, no al número)* | Con gusto le coordino la valoración. ¿Le parece bien si antes le pregunto algo sobre su salud? Es para que el médico llegue a la cita conociendo su caso. Si prefiere no contestar, no hay ningún problema. |
+| **Paciente:** Sí, claro | |
+| **Sofía** *(una pregunta, con el porqué y con la salida ofrecida)* | ¿Su peso ha cambiado mucho en el último año? Lo pregunto porque si todavía se está moviendo, el resultado de la cirugía puede cambiar. Si prefiere dejarlo para la valoración, también está bien. |
+| **Paciente:** Bajé como 30 kilos el año pasado | |
+| **Sofía** *(no repite la cifra, no opina del cuerpo, no adelanta nada)* | Gracias por contármelo: un cambio así es justo lo que el médico necesita saber de antemano. Le paso su caso al equipo para que lo revisen antes de coordinar la cita. |
+
+Lo que queda guardado: `preclasificacion = B` (revisión médica),
+`senales = {cambio_peso}`, la versión del criterio aplicado. Y el motivo del traspaso:
+
+> agendar valoración de abdominoplastia; el equipo médico debe revisar una pérdida de
+> peso importante en el último año
+
+Tres cosas que **no** pasaron en ese diálogo y son el punto entero: Sofía no le pidió
+el peso, no le dijo que no era candidata, y no le adelantó ningún resultado.
+
+### Ejemplo C — la paciente no quiere contestar
+
+| | |
+|---|---|
+| **Sofía:** ¿Le parece bien si le pregunto algo sobre su salud…? | |
+| **Paciente:** Prefiero no hablar de eso | |
+| **Sofía** *(se cierra el tema y no se vuelve a abrir)* | Por supuesto, sin problema. Le coordino la valoración y lo que haga falta se lo pregunta el médico en la cita. |
+
+El caso va a **revisión médica**, nunca a "no cumple". Y el motivo lo dice con esas
+palabras: *"…prefirió no dar datos de salud; el equipo médico lo levanta en la
+llamada"*. Una negativa no puede costarle la cita a nadie.
+
+### Ejemplo D — pide hablar con una persona, o aparece una alarma
+
+| | |
+|---|---|
+| **Paciente:** ¿Me puede comunicar con alguien? | |
+| **Sofía** | Claro que sí. Le paso ahora mismo con un asesor. → `[ESCALAR]` en ese mismo mensaje |
+
+No termina la ronda de preguntas antes. Y si aparece una señal de alarma —dolor,
+fiebre, algo post-operatorio— no hay proceso comercial: el caso se pasa de inmediato.
+El texto de ese protocolo es lo único de este flujo que todavía espera a los cirujanos
+(`PENDIENTE_APROBACION_MEDICA`).
+
+### Qué entra en cada fase, y qué se nota
+
+| fase | qué hace | se nota en |
+|---|---|---|
+| **1. La captura** | lo que la paciente contesta se guarda aunque la conversación no escale | el asesor deja de recibir notas vacías; la cobertura sube del 23% al 81% |
+| **2. El interruptor y los criterios** | tres columnas de configuración; apagado = idéntico a hoy | nada todavía, y eso es a propósito |
+| **3. La conversación** | la pregunta de contexto, el permiso, el porqué, la salida ofrecida; **cero preguntas de cifras** | la paciente siente una conversación y no un formulario |
+| **4 a 9** | la clasificación, el motivo, el tope, las colas, el dashboard, las pruebas | se enciende con el primer criterio aprobado |
+
+**Para que quede claro qué se nota en la v1 y qué no.** Con la lista de criterios
+vacía —que es como arranca— la paciente casi no ve diferencia: una pregunta de
+contexto en vez de la frase hecha, y un turno menos. Lo que cambia de verdad en la v1
+es que **nada se pierde** y que el asesor recibe un caso escrito. El cambio visible
+para la paciente llega con los criterios, y para entonces la tubería ya está probada y
+el interruptor ya está puesto.
+
+---
+
 ## 1. Las cuatro decisiones que JP tomó para este diseño
 
 Las seis decisiones que quedaron abiertas en la auditoría se resolvieron así:
