@@ -413,6 +413,11 @@ se reescribe.
 8. **Lo que la paciente cuente de su historia se recoge.** Las preguntas por el origen
    —desde cuándo, después de qué— no son preguntas clínicas: son las que Sofía ya hace
    para orientar, y son el canal que funciona (2.2). Siguen siendo de ella.
+   **Requisito previo, encontrado el 2026-11-11:** esa misma pregunta es hoy el
+   disparador de 53 recomendaciones de esperar al mes sobre pacientes que solo estaban
+   contando la causa de su problema, y 23 de ellas terminaron aparcadas meses. Sin el
+   arreglo de [`06-arreglo-peso-pasado.md`](06-arreglo-peso-pasado.md) aplicado,
+   volverla regla multiplica ese error. **La fase 3 no arranca antes que ese arreglo.**
 9. **El IMC, si existe, no se le menciona nunca.** Ni el peso que la paciente dio. No
    se repite de vuelta, no se comenta, no se usa para justificar nada frente a ella.
 10. **Si pide hablar con una persona, se escala de inmediato**, en cualquier etapa.
@@ -439,7 +444,14 @@ Esta es la pieza que mantiene la regla de no inventar criterios médicos.
 
 | campo nuevo | qué es | valor por defecto |
 |---|---|---|
-| `senales_clinicas` | lista cerrada de categorías presentes en lo que dijo la paciente: `cambio_peso`, `embarazo_o_parto_reciente`, `cirugia_previa`, `condicion_cronica`, `anticoagulante`, `fuma`, `sintoma_de_alarma` | `[]` |
+| `senales_clinicas` | lista cerrada de categorías presentes en lo que dijo la paciente: `cambio_peso_pasado`, `proceso_de_peso_activo`, `embarazo_o_parto_reciente`, `cirugia_previa`, `condicion_cronica`, `anticoagulante`, `fuma`, `sintoma_de_alarma` | `[]` |
+
+**Las dos categorías del peso están separadas a propósito.** `cambio_peso_pasado` es un
+dato clínico útil y muchas veces el motivo de consulta —la piel sobrante de haber
+bajado 30 kilos es justo lo que la cirugía retira—; `proceso_de_peso_activo` es el
+único que puede frenar una cirugía. Una sola categoría para las dos cosas mete en la
+base la misma confusión que hoy aparca pacientes (`06`). Ante la duda, ninguna de las
+dos.
 | `peso_kg` / `estatura_cm` | solo si la paciente los dijo | `null` |
 | `respuestas_clinicas` | qué preguntas de los criterios quedaron contestadas | `[]` |
 | `permiso_clinico` | `true` / `false` / `null` según lo que respondió al permiso | `null` |
