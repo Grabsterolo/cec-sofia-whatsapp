@@ -1588,7 +1588,7 @@ async function processInboundMessage({ text, phone, prospectId, agentId, interac
   // SOFIA_USAGE.
   const tratamientos = indexarTratamientos(knowledge_base);
   const { fragmentos, nombradas } = sumarFichasNombradas(chunks, tratamientos, textoDeBusqueda(history));
-  const systemBlocks = buildSystemBlocks(system, knowledge_base, fragmentos, tratamientos);
+  const systemBlocks = buildSystemBlocks(system, knowledge_base, fragmentos, tratamientos, bloqueDeCriterios(sofiaConfig));
 
   // Only this turn's message needs the image block — everything else in
   // history is already plain text (never persisted as an image, see above).
@@ -2770,18 +2770,39 @@ async function elEquipoLaDescarto(env, phoneHash) {
 // RAG + Claude (mirrors functions/api/chat.js in cecmarketing)
 // ---------------------------------------------------------------------------
 
+const CONFIG_BASE =
+  "system_prompt,knowledge_base,whatsapp_enabled,followup_enabled,atencion_nocturna_enabled";
+const CONFIG_PRECLASIFICACION =
+  "preclasificacion_enabled,preclasificacion_procedimientos,preclasificacion_criterios";
+
 async function loadSofiaConfig(env) {
-  const res = await fetch(
-    `${env.SUPABASE_URL}/rest/v1/sofia_config?select=system_prompt,knowledge_base,whatsapp_enabled,followup_enabled,atencion_nocturna_enabled&limit=1`,
-    {
-      headers: {
-        apikey: env.SUPABASE_SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
-      },
-    }
-  );
-  if (!res.ok) return { system: "", knowledge_base: "", whatsapp_enabled: true, followup_enabled: false, atencion_nocturna_enabled: false };
-  const data = await res.json();
+  const leer = async (select) => {
+    const res = await fetch(
+      `${env.SUPABASE_URL}/rest/v1/sofia_config?select=${select}&limit=1`,
+      {
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+        },
+      }
+    );
+    return res.ok ? await res.json() : null;
+  };
+
+  // DOS INTENTOS, Y NO ES PARANOIA.
+  //
+  // Si las columnas de la preclasificación todavía no existen en la base,
+  // PostgREST no devuelve esas columnas vacías: rechaza el SELECT ENTERO con
+  // un 400. Y el camino de error de esta función devuelve `system: ""`, o sea
+  // que Sofía seguiría contestando SIN PROMPT a todas las pacientes.
+  //
+  // Con el segundo intento, el orden entre la migración y el despliegue deja
+  // de importar: si las columnas no están, se sigue con las de siempre y el
+  // flujo nuevo queda apagado, que es exactamente lo que corresponde. El costo
+  // es un request de más por mensaje mientras la migración no esté corrida.
+  let data = await leer(`${CONFIG_BASE},${CONFIG_PRECLASIFICACION}`);
+  if (data === null) data = await leer(CONFIG_BASE);
+  if (data === null) return { system: "", knowledge_base: "", whatsapp_enabled: true, followup_enabled: false, atencion_nocturna_enabled: false, preclasificacion_enabled: false, preclasificacion_procedimientos: [], preclasificacion_criterios: "" };
   return {
     system: data[0]?.system_prompt || "",
     knowledge_base: data[0]?.knowledge_base || "",
@@ -2794,7 +2815,44 @@ async function loadSofiaConfig(env) {
     // nocturna la necesita en CADA mensaje de la noche, no solo cuando Sofía ya
     // decidió escalar. Ver notaNocturna().
     atencion_nocturna_enabled: data[0]?.atencion_nocturna_enabled ?? false,
+    // Preclasificación quirúrgica. Los tres por defecto en "apagado": si la
+    // columna no existe todavía, o viene rara, lo seguro es que el flujo no
+    // exista para nadie. Ver bloqueDeCriterios().
+    preclasificacion_enabled: data[0]?.preclasificacion_enabled === true,
+    preclasificacion_procedimientos: Array.isArray(data[0]?.preclasificacion_procedimientos)
+      ? data[0].preclasificacion_procedimientos
+      : [],
+    preclasificacion_criterios: data[0]?.preclasificacion_criterios || "",
   };
+}
+
+// Los criterios médicos aprobados, listos para pegarse al final del bloque del
+// prompt. Devuelve null cuando el flujo no debe existir para nadie, que hoy es
+// siempre: la lista nace vacía a propósito.
+//
+// SON DOS FRENOS Y LOS DOS HACEN FALTA. El bloque del prompt se autodesactiva
+// solo si no ve un "CRITERIOS APROBADOS" más abajo — pero eso es una
+// instrucción, y un modelo puede aplicarla mal. Este es el otro freno, el que
+// no se equivoca: si no hay criterios cargados, el texto no se manda y no hay
+// nada que interpretar.
+function bloqueDeCriterios(cfg) {
+  if (!cfg?.preclasificacion_enabled) return null;
+
+  const procedimientos = (cfg.preclasificacion_procedimientos || [])
+    .map((p) => String(p || "").trim())
+    .filter(Boolean);
+  if (procedimientos.length === 0) return null;
+
+  const criterios = String(cfg.preclasificacion_criterios || "").trim();
+  if (!criterios) {
+    // Lista con procedimientos y sin criterios no es un estado válido: es
+    // alguien que cargó media configuración. No se inyecta nada y queda el
+    // aviso, porque en silencio nadie lo vería nunca.
+    console.warn("PRECLASIFICACION_SIN_CRITERIOS", JSON.stringify({ procedimientos }));
+    return null;
+  }
+
+  return `CRITERIOS APROBADOS\nProcedimientos con criterio aprobado: ${procedimientos.join(", ")}.\n\n${criterios}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -3360,11 +3418,17 @@ function sumarFichasNombradas(chunks, tratamientos, texto) {
   };
 }
 
-function buildSystemBlocks(system, knowledge_base, chunks, tratamientos) {
+function buildSystemBlocks(system, knowledge_base, chunks, tratamientos, criterios = null) {
   const systemBlocks = [
     {
       type: "text",
-      text: system,
+      // Los criterios de la preclasificación van PEGADOS al prompt, no en un
+      // bloque propio. La API acepta cuatro cache_control y en la rama del RAG
+      // ya se usan tres (prompt, catálogo, promociones); el cuarto conviene
+      // dejarlo libre. El costo de pegarlos acá es una reescritura de caché el
+      // día que los cirujanos cambien un criterio — pasa pocas veces al mes y
+      // el TTL es de una hora. El costo de un bloque nuevo sería permanente.
+      text: criterios ? `${system}\n\n${criterios}` : system,
       // 1h TTL instead of the 5min default: the median gap between
       // conversation starts (~169s) is well under 5min, but real gaps range
       // up to ~2.3h — with the default TTL, roughly a fifth of turns pay a
