@@ -2710,6 +2710,18 @@ const ESPERA_MESES = { lactancia: 6, embarazo: 6, peso: 3 };
 // que perderla por haberla archivado hasta el año entrante.
 const REVISAR_SI_NO_SABE_MESES = 3;
 
+// Cuando la situación termina AHORA la fecha no se escribe como año-mes, se
+// escribe "ya". Es la forma de sacarle al modelo la única aritmética que tenía
+// que hacer, porque la hacía mal: a una paciente que dijo "hoy mismo la
+// suspendo" le pasó 2027-05 —la fecha en la que YA PODRÍA operarse, no la de
+// hoy— y el código le volvió a sumar los seis meses encima. Quedó agendada
+// para noviembre de 2027 mientras Sofía le decía por chat, correctamente, que
+// eran seis meses a partir de hoy. El modelo sí convierte bien lo que es
+// absoluto ("en 5 años" → 2031-10, verificado); lo que falla es el presente,
+// que es además el caso más frecuente y el único en que la paciente está a seis
+// meses de comprar.
+const FECHA_ES_AHORA = /^(ya|ahora|hoy|este mes|ya termin[óo]|reci[ée]n)$/i;
+
 function sumarMeses(fecha, meses) {
   const d = new Date(fecha.getTime());
   const diaOriginal = d.getUTCDate();
@@ -2727,8 +2739,17 @@ function parseProgramacion(contenido) {
   const motivo = (motivoRaw || "").replace(/[^a-záéíóúñ]/g, "");
   if (!MOTIVOS_PROGRAMACION.has(motivo)) return null;
 
-  const m = (fechaRaw || "").match(/^(\d{4})-(\d{1,2})$/);
   const ahora = new Date();
+  if (FECHA_ES_AHORA.test(fechaRaw || "")) {
+    return {
+      motivo,
+      fechaFin: ahora,
+      esperarHasta: sumarMeses(ahora, ESPERA_MESES[motivo]),
+      sabeCuandoTermina: true,
+    };
+  }
+
+  const m = (fechaRaw || "").match(/^(\d{4})-(\d{1,2})$/);
   if (!m) {
     return {
       motivo,
